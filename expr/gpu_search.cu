@@ -19,6 +19,10 @@ int main() {
 
     gpu_mvr_index index("2097152_4_new.index", doclens);
 
+    // warmup with 5 queries to stabilize GPU performance
+    for (size_t i = 0; i < 5; ++i) {
+        index.search(&Q[i * Q_DOCLEN * d], k);
+    }
     Timer timer;
     timer.tick();
     int nq = 5;

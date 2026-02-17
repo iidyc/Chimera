@@ -257,6 +257,72 @@ __global__ void gather_token_ids_kernel(
 }
 
 /**
+ * Compute per-query expansion sizes for cluster ID expansion.
+ * Each thread handles one query and sums up cluster sizes.
+ */
+__global__ void compute_query_expansion_sizes_kernel(
+    const faiss::idx_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
+    const size_t*       __restrict__ d_cluster_pos,   // [n_clusters + 1]
+    int*                d_query_sizes,                // [Q_DOCLEN] output
+    int                 nprobe,
+    size_t              n_clusters,
+    size_t              num_queries                   // Q_DOCLEN
+) {
+    size_t query_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (query_idx >= num_queries) return;
+
+    int total_size = 0;
+    for (int p = 0; p < nprobe; ++p) {
+        faiss::idx_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
+        if (cluster_id < 0 || cluster_id >= n_clusters) continue;
+
+        size_t cluster_size = d_cluster_pos[cluster_id + 1] - d_cluster_pos[cluster_id];
+        total_size += cluster_size;
+    }
+
+    d_query_sizes[query_idx] = total_size;
+}
+
+/**
+ * Expand cluster IDs to embedding IDs on GPU.
+ * One block per query, threads cooperatively expand all clusters for that query.
+ */
+__global__ void expand_cluster_ids_kernel(
+    const faiss::idx_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
+    const int*          __restrict__ d_inv_list,      // [inv_list_size]
+    const size_t*       __restrict__ d_cluster_pos,   // [n_clusters + 1]
+    const int*          __restrict__ d_query_offsets, // [Q_DOCLEN + 1] prefix sum
+    size_t*             d_emb_ids,                    // [total_pairs] output
+    int                 nprobe,
+    size_t              n_clusters,
+    size_t              num_queries                   // Q_DOCLEN
+) {
+    size_t query_idx = blockIdx.x;
+    if (query_idx >= num_queries) return;
+
+    size_t out_start = d_query_offsets[query_idx];
+    size_t write_pos = 0;
+
+    // Process each probe for this query
+    for (int p = 0; p < nprobe; ++p) {
+        faiss::idx_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
+        if (cluster_id < 0 || cluster_id >= n_clusters) continue;
+
+        size_t cluster_start = d_cluster_pos[cluster_id];
+        size_t cluster_end = d_cluster_pos[cluster_id + 1];
+        size_t cluster_size = cluster_end - cluster_start;
+
+        // Cooperative copy: all threads in block write cluster embeddings
+        for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
+            d_emb_ids[out_start + write_pos + i] = d_inv_list[cluster_start + i];
+        }
+
+        write_pos += cluster_size;
+        __syncthreads();  // Ensure all threads finish before next cluster
+    }
+}
+
+/**
  * Gather document pointers for top-k docs to compute token counts.
  * Each thread handles one document.
  */
