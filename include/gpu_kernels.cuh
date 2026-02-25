@@ -72,7 +72,8 @@ __global__ void stage2_binary_ip_kernel_v2(
     const float* __restrict__ d_cb1_sumq,      // [Q_DOCLEN]
     const size_t* __restrict__ d_token_ids,    // [total_tokens]
     float* __restrict__ d_out_dists,           // [Q_DOCLEN * total_tokens]
-    size_t total_tokens
+    size_t total_tokens,
+    size_t batch_tokens
 ) {
     // Load ALL query vectors into shared memory (16 KB)
     __shared__ float smem_queries[Q_DOCLEN * PADDED_DIM];
@@ -91,7 +92,7 @@ __global__ void stage2_binary_ip_kernel_v2(
 
     // Grid-stride loop: each thread processes one token against all queries
     for (size_t tok_idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
-         tok_idx < total_tokens;
+         tok_idx < batch_tokens;
          tok_idx += (size_t)blockDim.x * gridDim.x)
     {
         // Load binary code and factor ONCE per token

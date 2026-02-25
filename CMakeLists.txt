@@ -39,3 +39,6 @@ target_link_libraries(build_cagra PRIVATE faiss OpenMP::OpenMP_CXX rmm::rmm)
 add_executable(gpu_search expr/gpu_search.cu)
 set_target_properties(gpu_search PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(gpu_search PRIVATE faiss OpenMP::OpenMP_CXX rmm::rmm)
+
+add_executable(build_ivfdockmeans expr/build_ivfdockmeans.cpp)
+target_link_libraries(build_ivfdockmeans PRIVATE OpenMP::OpenMP_CXX)

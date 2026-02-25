@@ -7,7 +7,7 @@
 
 int main() {
     int k = 100;
-    int nprobe = 128;
+    int nprobe = 18;
     size_t num_d, num_q, d, q_doclen, num_docs;
     std::vector<float> Q = load_query(q_doclen, num_q, d);
     std::vector<int> doclens = load_doclens();
@@ -29,7 +29,7 @@ int main() {
     std::vector<std::vector<size_t>> results(nq);
 // #pragma omp parallel for
     for (size_t i = 0; i < nq; ++i) {
-        results[i] = index.search(&Q[i * q_doclen * d], q_doclen, k, nprobe);
+        results[i] = index.search_dockmeans(&Q[i * q_doclen * d], q_doclen, k, nprobe);
     }
     timer.tuck("Search time for " + std::to_string(nq) + " queries.");
     auto ground_truth = read_gt_tsv(num_q, 1000);

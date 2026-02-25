@@ -14,8 +14,11 @@
 #include "estimator.hpp"
 #include "query.hpp"
 #include "ivf_pg.hpp"
+#include "ivf_dockmeans.hpp"
 
 using namespace rabitqlib;
+
+enum class IVFType { PG, DocKMeans };
 
 struct cpu_mvr_index {
     size_t n;           // number of vectors
@@ -25,7 +28,9 @@ struct cpu_mvr_index {
     size_t padded_dim_; // multiple of 64 dimension after padding
     Rotator<float>* rotator_;
 
-    IVF_PG* ivf;
+    IVFType ivf_type_ = IVFType::DocKMeans;
+    IVF_PG* ivf = nullptr;
+    IVF_DocKMeans* ivf_dk_ = nullptr;
 
     std::vector<char> one_bit_code_;
     std::vector<char> ex_code_;
@@ -47,8 +52,9 @@ struct cpu_mvr_index {
         size_t n,
         size_t d,
         size_t n_clusters,
-        size_t ex_bits
-    ): n(n), d(d), n_clusters(n_clusters), ex_bits(ex_bits) {
+        size_t ex_bits,
+        IVFType ivf_type = IVFType::PG
+    ): n(n), d(d), n_clusters(n_clusters), ex_bits(ex_bits), ivf_type_(ivf_type) {
         rotator_ = choose_rotator<float>(d, RotatorType::FhtKacRotator, round_up_to_multiple(d, 64));
         std::ifstream rot_in("rotator.bin", std::ios::binary);
         rotator_->load(rot_in);
@@ -62,12 +68,19 @@ struct cpu_mvr_index {
 
         ip_func_ = select_excode_ipfunc(ex_bits);
 
-        ivf = new IVF_PG(n_clusters, d);
+        if (ivf_type_ == IVFType::DocKMeans) {
+            ivf_dk_ = new IVF_DocKMeans(n_clusters, d);
+        } else {
+            ivf = new IVF_PG(n_clusters, d);
+        }
     }
 
-    void build_index(const float* data) {
+    void build_index(const float* data, size_t max_kmeans_iter = 20) {
         quantize(data);
-        // ivf->build_from_existing();
+        if (ivf_type_ == IVFType::DocKMeans) {
+            ivf_dk_->build(data, doc_ptrs_.data(), num_docs, n, max_kmeans_iter);
+        }
+        // else: IVF_PG, call ivf->build_from_existing() separately
     }
 
     /***
@@ -199,6 +212,95 @@ struct cpu_mvr_index {
         }
     }
 
+    void rank_cluster_dists_dockmeans(
+        const float* queries,       // raw unrotated query vectors (q_doclen * d)
+        size_t q_doclen,
+        size_t nprobe,
+        size_t k,
+        std::vector<size_t>& output_ids
+    ) {
+        const float* centroids = ivf_dk_->centroids.data();
+
+        // Score each centroid: SUM_i ||q_i - c_k||^2
+        std::vector<float> centroid_scores(n_clusters);
+#pragma omp parallel for
+        for (size_t c = 0; c < n_clusters; ++c) {
+            float score = 0.0f;
+            for (size_t i = 0; i < q_doclen; ++i) {
+                score += sqrt(l2_sqr(&queries[i * d], &centroids[c * d], d));
+            }
+            centroid_scores[c] = score;
+        }
+
+        // Find top nprobe centroids (smallest score)
+        std::vector<size_t> cluster_order(n_clusters);
+        std::iota(cluster_order.begin(), cluster_order.end(), 0);
+        size_t actual_nprobe = std::min(nprobe, n_clusters);
+        std::partial_sort(
+            cluster_order.begin(),
+            cluster_order.begin() + actual_nprobe,
+            cluster_order.end(),
+            [&](size_t a, size_t b) { return centroid_scores[a] < centroid_scores[b]; }
+        );
+
+        // Collect doc IDs from top nprobe clusters
+        for (size_t p = 0; p < actual_nprobe; ++p) {
+            size_t cid = cluster_order[p];
+            size_t start = ivf_dk_->cluster_pos[cid];
+            size_t end = ivf_dk_->cluster_pos[cid + 1];
+            for (size_t i = start; i < end; ++i) {
+                output_ids.push_back(static_cast<size_t>(ivf_dk_->inv_list[i]));
+            }
+        }
+    }
+
+    std::vector<size_t> search_dockmeans(const float* queries, size_t q_doclen, size_t k, size_t nprobe) {
+        int k_rank_cluster = 1800;
+        int k_rank_all_tokens = 1800;
+
+        // Stage 1: brute-force centroid scan using raw (unrotated) queries
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<size_t> rank_cluster_doc_ids;
+        rank_cluster_dists_dockmeans(queries, q_doclen, nprobe, k_rank_cluster, rank_cluster_doc_ids);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        // Rotate queries and build query objects for stages 2/3
+        std::vector<float> rotated_queries(q_doclen * padded_dim_);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+        }
+        std::vector<query_object> query_objs(q_doclen);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+        }
+
+        // Stage 2: rank all tokens with 1-bit distances (reused)
+        std::vector<size_t> rank_all_tokens_ids;
+        std::vector<float> one_bit_dists;
+        rank_all_tokens_1bit(query_objs.data(), q_doclen, rank_cluster_doc_ids, k_rank_all_tokens, rank_all_tokens_ids, one_bit_dists);
+        auto t2 = std::chrono::high_resolution_clock::now();
+
+        // Stage 3: refine with ex-bits (reused)
+        std::vector<size_t> result;
+        rank_all_tokens_exbits(
+            query_objs.data(),
+            q_doclen,
+            rank_all_tokens_ids,
+            one_bit_dists,
+            k,
+            result
+        );
+        auto t3 = std::chrono::high_resolution_clock::now();
+
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::cout << "[search_dockmeans] stage1_cluster: " << ms(t0, t1) << " ms, "
+                  << "stage1_doc_nums: " << rank_cluster_doc_ids.size() << ", "
+                  << "stage2_1bit: " << ms(t1, t2) << " ms, "
+                  << "stage3_exbits: " << ms(t2, t3) << " ms, "
+                  << "total: " << ms(t0, t3) << " ms\n";
+        return result;
+    }
+
     void rank_all_tokens_1bit(
         query_object* queries, 
         size_t q_doclen, 
@@ -295,6 +397,8 @@ struct cpu_mvr_index {
 
     void save(const std::string& filename) const {
         std::ofstream of(filename, std::ios::binary);
+        size_t type_tag = static_cast<size_t>(ivf_type_);
+        of.write((char*)&type_tag, sizeof(size_t));
         of.write((char*)&n, sizeof(size_t));
         of.write((char*)&d, sizeof(size_t));
         of.write((char*)&n_clusters, sizeof(size_t));
@@ -305,11 +409,17 @@ struct cpu_mvr_index {
         of.write((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
         of.write((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
         of.close();
-        // ivf->save(filename);
+        if (ivf_type_ == IVFType::DocKMeans && ivf_dk_) {
+            ivf_dk_->save(filename);
+        }
+        // else: ivf->save(filename);
     }
 
     void load(const std::string& filename) {
         std::ifstream inf(filename, std::ios::binary);
+        // size_t type_tag;
+        // inf.read((char*)&type_tag, sizeof(size_t));
+        // ivf_type_ = static_cast<IVFType>(type_tag);
         inf.read((char*)&n, sizeof(size_t));
         inf.read((char*)&d, sizeof(size_t));
         inf.read((char*)&n_clusters, sizeof(size_t));
@@ -328,12 +438,19 @@ struct cpu_mvr_index {
         rotator_->load(rot_in);
         rot_in.close();
         inf.close();
-        ivf = new IVF_PG(n_clusters, d);
-        ivf->load(filename);
+        if (ivf_type_ == IVFType::DocKMeans) {
+            ivf_dk_ = new IVF_DocKMeans(n_clusters, d);
+            ivf_dk_->load(filename);
+            n_clusters = ivf_dk_->n_clusters; // ensure consistency
+        } else {
+            ivf = new IVF_PG(n_clusters, d);
+            ivf->load(filename);
+        }
     }
 
     ~cpu_mvr_index() {
         delete rotator_;
         delete ivf;
+        delete ivf_dk_;
     }
 };

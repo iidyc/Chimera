@@ -13,6 +13,10 @@
 #define NUM_U64 (PADDED_DIM / 64)               // Number of 64-bit blocks: 2
 #define SMEM_QUERY_SIZE (PADDED_DIM * sizeof(float))  // Shared memory per query: 512 bytes
 
+// Persistent Stage 2+3 kernel configuration
+#define STAGE2_PERSISTENT_BLOCK 256                              // threads per block for persistent fused kernel
+#define STAGE2_PERSISTENT_MAX_WARPS (STAGE2_PERSISTENT_BLOCK / 32)  // = 8
+
 // Validation
 static_assert(PADDED_DIM % 64 == 0, "PADDED_DIM must be a multiple of 64");
 static_assert(PADDED_DIM > 0, "PADDED_DIM must be positive");
