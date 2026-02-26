@@ -16,6 +16,7 @@
 // Persistent Stage 2+3 kernel configuration
 #define STAGE2_PERSISTENT_BLOCK 256                              // threads per block for persistent fused kernel
 #define STAGE2_PERSISTENT_MAX_WARPS (STAGE2_PERSISTENT_BLOCK / 32)  // = 8
+#define PST_CHUNK_SIZE 2000                                       // candidates per chunk in persistent kernel
 
 // Validation
 static_assert(PADDED_DIM % 64 == 0, "PADDED_DIM must be a multiple of 64");

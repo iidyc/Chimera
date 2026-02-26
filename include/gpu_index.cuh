@@ -33,7 +33,6 @@
 #include <atomic>
 #include <chrono>
 #include <immintrin.h>
-
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
 #include "quantization.hpp"
@@ -152,26 +151,22 @@ struct gpu_mvr_index {
         size_t estimated_num_docs;
 
         // === Persistent Stage 2+3 workspace (GPU_MVR_OVERLAP_STAGE23) ===
-        // Single fused kernel writes directly to UVA-mapped pinned memory;
-        // CPU polling loop reads results via system fence without any D2H transfer.
+        // GPU computes binary IP + doc scores into HBM, then CPU sorts scores,
+        // selects top-k, GPU extracts top-k dists, and CPU refines with overlap.
         size_t* d_pst_candidate_offsets;   // [max_stage2_candidates+1] device side
         size_t* d_pst_token_ids;           // [max_stage2_tokens] device side
 
-        // Mapped pinned memory: host and device pointers to the same physical pages (UVA)
-        float*        h_mapped_token_dists;    // [max_stage2_tokens * Q_DOCLEN], query-major
-        float*        d_mapped_token_dists;    // device ptr for same allocation
-        float*        h_mapped_doc_scores;     // [max_stage2_candidates]
-        float*        d_mapped_doc_scores;
-        int*          h_mapped_complete_queue; // [max_stage2_candidates] ordered slot→cand_idx
-        int*          d_mapped_complete_queue;
-        int*          h_mapped_doc_ready;      // [max_stage2_candidates] per-slot ready flags
-        int*          d_mapped_doc_ready;
-        int*          h_mapped_queue_counter;  // [1] atomic slot counter
-        int*          d_mapped_queue_counter;
+        // Pinned host memory for D2H of doc scores
+        float*        h_mapped_doc_scores;     // [max_stage2_candidates] pinned
 
-        // CPU-side token offsets per candidate (pre-computed before kernel launch,
-        // reused by Stage 3 inline refinement without extra D2H)
+        // CPU-side token offsets per candidate (pre-computed before kernel launch)
         std::vector<size_t> v_pst_candidate_offsets; // [max_stage2_candidates+1]
+
+        // Pre-created events for overlap pipeline (avoid per-call create/destroy)
+        cudaEvent_t pst_compute_done;     // after doc_score kernel
+        cudaEvent_t pst_extract_done;     // after extract kernel
+        static constexpr int PST_NUM_D2H_CHUNKS = 8;
+        cudaEvent_t pst_d2h_chunk_done[PST_NUM_D2H_CHUNKS];  // per-chunk D2H events
 
         // === CUDA streams for async pipeline ===
         cudaStream_t stream_compute;
@@ -273,10 +268,6 @@ struct gpu_mvr_index {
         set_doc_mapping(doc_lens);
 
         // Allocate persistent GPU data
-#ifdef GPU_MVR_OVERLAP_STAGE23
-        // Must be called before the first CUDA context-creating call (first cudaMalloc below)
-        CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost));
-#endif
         size_t code_bytes = n * PADDED_DIM / 8;
         CUDA_CHECK(cudaMalloc(&d_one_bit_code_, code_bytes));
         CUDA_CHECK(cudaMalloc(&d_one_bit_factor_, n * sizeof(float)));
@@ -408,12 +399,12 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMalloc(&ws_.d_candidate_offsets, (ws_.max_stage2_candidates + 1) * sizeof(size_t)));
         CUDA_CHECK(cudaMalloc(&ws_.d_token_dists, ws_.max_stage2_tokens * Q_DOCLEN * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ws_.d_doc_scores, ws_.max_stage2_candidates * sizeof(float)));
+#endif
 
-        // Extract workspace
+        // Extract workspace (used by both paths)
         CUDA_CHECK(cudaMalloc(&ws_.d_selected_indices, ws_.max_stage2_k * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ws_.d_out_offsets, (ws_.max_stage2_k + 1) * sizeof(size_t)));
         CUDA_CHECK(cudaMalloc(&ws_.d_out_one_bit_dists, ws_.max_stage2_k_tokens * Q_DOCLEN * sizeof(float)));
-#endif
 
         // CAGRA batched search workspace
         CUDA_CHECK(cudaMalloc(&ws_.d_cagra_dists, Q_DOCLEN * nprobe * sizeof(float)));
@@ -422,8 +413,8 @@ struct gpu_mvr_index {
         // Pinned host memory
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_cb1_sumq, Q_DOCLEN * sizeof(float)));
-#ifndef GPU_MVR_OVERLAP_STAGE23
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_dists, ws_.max_stage2_k_tokens * Q_DOCLEN * sizeof(float)));
+#ifndef GPU_MVR_OVERLAP_STAGE23
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_batch_scores, ws_.max_stage2_candidates * sizeof(float)));
 #endif
 
@@ -434,20 +425,22 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMalloc(&ws_.d_pst_token_ids,
                               ws_.max_stage2_tokens * sizeof(size_t)));
 
-        // Mapped pinned memory: GPU writes directly, CPU reads via system fence (no D2H)
-        auto alloc_mapped = [](void** h_ptr, void** d_ptr, size_t bytes) {
-            CUDA_CHECK(cudaMallocHost(h_ptr, bytes, cudaHostAllocMapped));
-            CUDA_CHECK(cudaHostGetDevicePointer(d_ptr, *h_ptr, 0));
-        };
-        const size_t mapped_dists_bytes =
-            ws_.max_stage2_tokens * (size_t)Q_DOCLEN * sizeof(float);
-        alloc_mapped((void**)&ws_.h_mapped_token_dists,    (void**)&ws_.d_mapped_token_dists,    mapped_dists_bytes);
-        alloc_mapped((void**)&ws_.h_mapped_doc_scores,     (void**)&ws_.d_mapped_doc_scores,     ws_.max_stage2_candidates * sizeof(float));
-        alloc_mapped((void**)&ws_.h_mapped_complete_queue, (void**)&ws_.d_mapped_complete_queue, ws_.max_stage2_candidates * sizeof(int));
-        alloc_mapped((void**)&ws_.h_mapped_doc_ready,      (void**)&ws_.d_mapped_doc_ready,      ws_.max_stage2_candidates * sizeof(int));
-        alloc_mapped((void**)&ws_.h_mapped_queue_counter,  (void**)&ws_.d_mapped_queue_counter,  sizeof(int));
+        // Device HBM buffer for token distances and doc scores
+        CUDA_CHECK(cudaMalloc(&ws_.d_token_dists,
+                              ws_.max_stage2_tokens * (size_t)Q_DOCLEN * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_doc_scores, ws_.max_stage2_candidates * sizeof(float)));
+
+        // Pinned host memory for D2H of doc scores
+        CUDA_CHECK(cudaMallocHost(&ws_.h_mapped_doc_scores,
+                                  ws_.max_stage2_candidates * sizeof(float)));
 
         ws_.v_pst_candidate_offsets.resize(ws_.max_stage2_candidates + 1);
+
+        // Pre-create events for overlap pipeline
+        CUDA_CHECK(cudaEventCreateWithFlags(&ws_.pst_compute_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ws_.pst_extract_done, cudaEventDisableTiming));
+        for (int i = 0; i < Workspace::PST_NUM_D2H_CHUNKS; i++)
+            CUDA_CHECK(cudaEventCreateWithFlags(&ws_.pst_d2h_chunk_done[i], cudaEventDisableTiming));
 #endif
 
         // === Create CUDA streams ===
@@ -1411,6 +1404,11 @@ struct gpu_mvr_index {
         std::printf("  TOTAL:                           %.3f ms\n", time_total);
     }
 
+    // ======================== STAGE 2+3 OVERLAP ========================
+#ifdef GPU_MVR_OVERLAP_STAGE23
+#include "gpu_index_overlap.cuh"
+#endif
+
     // ======================== STAGE 3: CPU ========================
 
     inline void rank_all_tokens_exbits_cpu(
@@ -1481,10 +1479,12 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaFree(ws_.d_candidate_offsets));
         CUDA_CHECK(cudaFree(ws_.d_token_dists));
         CUDA_CHECK(cudaFree(ws_.d_doc_scores));
+#endif
+        // Extract workspace (both paths)
         CUDA_CHECK(cudaFree(ws_.d_selected_indices));
         CUDA_CHECK(cudaFree(ws_.d_out_offsets));
         CUDA_CHECK(cudaFree(ws_.d_out_one_bit_dists));
-#endif
+
         CUDA_CHECK(cudaFree(ws_.d_cagra_dists));
         CUDA_CHECK(cudaFree(ws_.d_cagra_labels));
 
@@ -1505,21 +1505,22 @@ struct gpu_mvr_index {
         // Free pinned memory
         CUDA_CHECK(cudaFreeHost(ws_.h_pinned_queries));
         CUDA_CHECK(cudaFreeHost(ws_.h_pinned_cb1_sumq));
-#ifndef GPU_MVR_OVERLAP_STAGE23
         CUDA_CHECK(cudaFreeHost(ws_.h_pinned_dists));
+#ifndef GPU_MVR_OVERLAP_STAGE23
         CUDA_CHECK(cudaFreeHost(ws_.h_pinned_batch_scores));
 #endif
 
 #ifdef GPU_MVR_OVERLAP_STAGE23
         // === Persistent Stage 2+3 workspace ===
+        CUDA_CHECK(cudaFree(ws_.d_token_dists));
         CUDA_CHECK(cudaFree(ws_.d_pst_candidate_offsets));
         CUDA_CHECK(cudaFree(ws_.d_pst_token_ids));
-        // Mapped pinned memory: cudaFreeHost releases both host and device mappings
-        CUDA_CHECK(cudaFreeHost(ws_.h_mapped_token_dists));
+        CUDA_CHECK(cudaFree(ws_.d_doc_scores));
         CUDA_CHECK(cudaFreeHost(ws_.h_mapped_doc_scores));
-        CUDA_CHECK(cudaFreeHost(ws_.h_mapped_complete_queue));
-        CUDA_CHECK(cudaFreeHost(ws_.h_mapped_doc_ready));
-        CUDA_CHECK(cudaFreeHost(ws_.h_mapped_queue_counter));
+        CUDA_CHECK(cudaEventDestroy(ws_.pst_compute_done));
+        CUDA_CHECK(cudaEventDestroy(ws_.pst_extract_done));
+        for (int i = 0; i < Workspace::PST_NUM_D2H_CHUNKS; i++)
+            CUDA_CHECK(cudaEventDestroy(ws_.pst_d2h_chunk_done[i]));
 #endif
 
         // === NEW: Destroy streams and events ===
