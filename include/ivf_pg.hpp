@@ -93,8 +93,8 @@ struct PG_CAGRA: PG {
     void search_batch_gpu(const float* d_queries, size_t n_queries, size_t k,
                           float* d_dists, faiss::idx_t* d_labels) {
         faiss::gpu::SearchParametersCagra search_params;
-        search_params.algo = faiss::gpu::search_algo::MULTI_CTA;
-        search_params.itopk_size = 256;
+        // search_params.algo = faiss::gpu::search_algo::MULTI_CTA;
+        search_params.itopk_size = 150;
         index_cagra->search(n_queries, d_queries, k, d_dists, d_labels, &search_params);
     }
 
