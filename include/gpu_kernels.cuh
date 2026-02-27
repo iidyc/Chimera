@@ -354,46 +354,62 @@ __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
 }
 
 /**
- * Atomic max-pooling and aggregation for Stage 1.
- * Each (emb_id, query_idx) → (doc_id, query_idx) → atomic max into doc_query_matrix
- * Then sum across queries for each doc.
+ * Atomic max-pooling and aggregation for Stage 1 with touched-doc tracking.
+ * Each (emb_id, query_idx) → (doc_id, query_idx) → atomic max into doc_query_matrix.
+ * Simultaneously builds a compact list of unique touched document IDs for sparse
+ * downstream processing (sum, sort, cleanup).
  */
-__global__ void aggregate_stage1_atomic_kernel_opt(
+__global__ void aggregate_stage1_tracked_kernel(
     const size_t* __restrict__ d_emb_ids,
     const float*  __restrict__ d_emb_dists,       // [Q_DOCLEN * max_embs_per_query] layout
     const int*    __restrict__ d_pair_offsets,
     const int*    __restrict__ d_doc_ids,
-    float*        d_doc_query_max,                 // [num_docs * Q_DOCLEN] matrix
+    float*        d_doc_query_max,                 // [Q_DOCLEN * num_docs] transposed matrix
+    int*          d_doc_touched,                   // [num_docs] per-doc flag
+    int*          d_touched_doc_list,              // [num_docs] compact output list
+    int*          d_num_touched_docs,              // [1] atomic counter
     size_t        num_docs,
     size_t        total_pairs,
-    size_t        max_embs_per_query               // for indexing into new layout
+    size_t        max_embs_per_query
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_pairs) return;
 
-    // Find which query this embedding belongs to
-    int q_idx = 0;
-    #pragma unroll
-    for (int q = 0; q < Q_DOCLEN; ++q) {
-        if (idx < d_pair_offsets[q + 1]) {
-            q_idx = q;
-            break;
+    // Binary search for query index (log2(Q_DOCLEN) iterations instead of linear scan)
+    int q_idx;
+    {
+        int lo = 0, hi = Q_DOCLEN;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if ((size_t)d_pair_offsets[mid + 1] <= idx) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
+        q_idx = lo;
     }
 
     size_t emb_id = d_emb_ids[idx];
     int doc_id = d_doc_ids[emb_id];
 
-    // Calculate local pair index within query and use new layout
-    int local_pair_idx = idx - d_pair_offsets[q_idx];
-    float dist = d_emb_dists[q_idx * max_embs_per_query + local_pair_idx];
+    int local_pair_idx = (int)(idx - (size_t)d_pair_offsets[q_idx]);
+    float dist = d_emb_dists[(size_t)q_idx * max_embs_per_query + local_pair_idx];
 
-    // Bounds check
-    if (doc_id >= num_docs) return;
+    if (doc_id >= (int)num_docs) return;
 
-    // Atomic max into doc_query_max[q_idx * num_docs + doc_id] (transposed layout)
+    // Atomic max into transposed matrix [q_idx * num_docs + doc_id]
     size_t matrix_idx = (size_t)q_idx * num_docs + doc_id;
     atomicMaxFloat(&d_doc_query_max[matrix_idx], dist);
+
+    // Track touched docs: read flag first (cheap L2 read), atomicExch only if unseen
+    if (d_doc_touched[doc_id] == 0) {
+        int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
+        if (was_touched == 0) {
+            int pos = atomicAdd(d_num_touched_docs, 1);
+            d_touched_doc_list[pos] = doc_id;
+        }
+    }
 }
 
 /**
@@ -415,4 +431,50 @@ __global__ void sum_doc_scores_kernel(
     d_doc_scores[doc_id] = score;
 }
 
+/**
+ * Sum max distances across queries for only the touched (active) documents.
+ * Writes compact score and doc_id arrays suitable for direct CUB sort.
+ */
+__global__ void sum_doc_scores_sparse_kernel(
+    const float* __restrict__ d_doc_query_max,    // [Q_DOCLEN * num_docs] transposed
+    const int*   __restrict__ d_touched_doc_list, // [num_touched] compact doc IDs
+    float*       d_scores_out,                     // [num_touched] compact scores
+    int*         d_doc_ids_out,                    // [num_touched] compact doc IDs for sort
+    int          num_touched,
+    size_t       num_docs
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_touched) return;
+
+    int doc_id = d_touched_doc_list[idx];
+    float score = 0.0f;
+    #pragma unroll
+    for (int q = 0; q < Q_DOCLEN; ++q) {
+        score += d_doc_query_max[(size_t)q * num_docs + doc_id];
+    }
+    d_scores_out[idx] = score;
+    d_doc_ids_out[idx] = doc_id;
+}
+
+/**
+ * Reset doc_query_max entries and touched flags for only the documents that were
+ * active in the current search.  This replaces the expensive full-matrix memset.
+ */
+__global__ void cleanup_touched_docs_kernel(
+    float*       d_doc_query_max,                  // [Q_DOCLEN * num_docs] transposed
+    int*         d_doc_touched,                    // [num_docs] per-doc flag
+    const int*   __restrict__ d_touched_doc_list,  // [num_touched] compact doc IDs
+    int          num_touched,
+    size_t       num_docs
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_touched) return;
+
+    int doc_id = d_touched_doc_list[idx];
+    #pragma unroll
+    for (int q = 0; q < Q_DOCLEN; ++q) {
+        d_doc_query_max[(size_t)q * num_docs + doc_id] = 0.0f;
+    }
+    d_doc_touched[doc_id] = 0;
+}
 

@@ -129,6 +129,7 @@ struct gpu_mvr_index {
         float*  d_stage1_doc_scores;     // [estimated_num_docs]
         float*  d_doc_query_max;         // [estimated_num_docs * max_q_doclen] matrix
         int*    d_num_unique_docs;       // [1] output count
+        int*    d_doc_touched;            // [estimated_num_docs] per-doc flag for sparse tracking
         void*   d_cub_temp_storage;      // CUB temporary buffer
         size_t  cub_temp_storage_bytes;  // Size of CUB buffer
 
@@ -150,6 +151,7 @@ struct gpu_mvr_index {
         size_t max_stage2_k;
         size_t max_stage2_k_tokens;
         size_t estimated_num_docs;
+        int    max_embs_per_query_bound;  // precomputed upper bound: nprobe * max_cluster_size
 
         // === Persistent Stage 2+3 workspace (GPU_MVR_OVERLAP_STAGE23) ===
         // GPU computes binary IP + doc scores into HBM, then CPU sorts scores,
@@ -347,6 +349,7 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMalloc(&ws_.d_stage1_doc_scores, ws_.estimated_num_docs * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, ws_.estimated_num_docs * Q_DOCLEN * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ws_.d_num_unique_docs, sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_doc_touched, ws_.estimated_num_docs * sizeof(int)));
         
         // Query CUB temporary storage size for ALL operations (dry runs)
         ws_.d_cub_temp_storage = nullptr;
@@ -443,6 +446,12 @@ struct gpu_mvr_index {
         for (int i = 0; i < Workspace::PST_NUM_D2H_CHUNKS; i++)
             CUDA_CHECK(cudaEventCreateWithFlags(&ws_.pst_d2h_chunk_done[i], cudaEventDisableTiming));
 #endif
+
+        // Initialize persistent matrices (cleaned per-search with sparse cleanup)
+        ws_.max_embs_per_query_bound = nprobe * max_cluster_size;
+        CUDA_CHECK(cudaMemset(ws_.d_doc_query_max, 0, ws_.estimated_num_docs * Q_DOCLEN * sizeof(float)));
+        CUDA_CHECK(cudaMemset(ws_.d_doc_touched, 0, ws_.estimated_num_docs * sizeof(int)));
+        CUDA_CHECK(cudaMemset(ws_.d_num_unique_docs, 0, sizeof(int)));
 
         // === Create CUDA streams ===
         CUDA_CHECK(cudaStreamCreate(&ws_.stream_compute));
@@ -580,12 +589,12 @@ struct gpu_mvr_index {
         std::cout << "[PROFILE]   1. CAGRA search            : " << s1_cagra << " ms\n";
         std::cout << "[PROFILE]   2. GPU IVF expansion       : " << s1_expansion << " ms\n";
         std::cout << "[PROFILE]   3. Binary IP kernel        : " << s1_binary_ip << " ms\n";
-        std::cout << "[PROFILE]   4. Memset doc_query_max    : " << s1_memset << " ms\n";
-        std::cout << "[PROFILE]   5. Atomic aggregation      : " << s1_atomic_agg << " ms\n";
-        std::cout << "[PROFILE]   6. Sum doc scores          : " << s1_sum_scores << " ms\n";
-        std::cout << "[PROFILE]   7. Top-k sort              : " << s1_topk_sort << " ms\n";
-        std::cout << "[PROFILE]   8. D2D copy top-k doc IDs  : " << s1_d2d << " ms\n";
-        float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_memset + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
+        std::cout << "[PROFILE]   4. Aggregation + tracking  : " << s1_atomic_agg << " ms\n";
+        std::cout << "[PROFILE]   5. Sum doc scores (sparse) : " << s1_sum_scores << " ms\n";
+        std::cout << "[PROFILE]   6. Top-k sort (sparse)     : " << s1_topk_sort << " ms\n";
+        std::cout << "[PROFILE]   7. D2D copy top-k doc IDs  : " << s1_d2d << " ms\n";
+        std::cout << "[PROFILE]   8. Memset (overlapped 1-3) : " << s1_memset << " ms (not in critical path)\n";
+        float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
         std::cout << "[PROFILE]   Sum accounted              : " << s1_sum << " ms\n";
         std::cout << "[PROFILE] Total search time           : " << total_time << " ms\n";
 #endif
@@ -641,12 +650,12 @@ struct gpu_mvr_index {
         std::cout << "[PROFILE]   1. CAGRA search            : " << s1_cagra << " ms\n";
         std::cout << "[PROFILE]   2. GPU IVF expansion       : " << s1_expansion << " ms\n";
         std::cout << "[PROFILE]   3. Binary IP kernel        : " << s1_binary_ip << " ms\n";
-        std::cout << "[PROFILE]   4. Memset doc_query_max    : " << s1_memset << " ms\n";
-        std::cout << "[PROFILE]   5. Atomic aggregation      : " << s1_atomic_agg << " ms\n";
-        std::cout << "[PROFILE]   6. Sum doc scores          : " << s1_sum_scores << " ms\n";
-        std::cout << "[PROFILE]   7. Top-k sort              : " << s1_topk_sort << " ms\n";
-        std::cout << "[PROFILE]   8. D2D copy top-k doc IDs  : " << s1_d2d << " ms\n";
-        float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_memset + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
+        std::cout << "[PROFILE]   4. Aggregation + tracking  : " << s1_atomic_agg << " ms\n";
+        std::cout << "[PROFILE]   5. Sum doc scores (sparse) : " << s1_sum_scores << " ms\n";
+        std::cout << "[PROFILE]   6. Top-k sort (sparse)     : " << s1_topk_sort << " ms\n";
+        std::cout << "[PROFILE]   7. D2D copy top-k doc IDs  : " << s1_d2d << " ms\n";
+        std::cout << "[PROFILE]   8. Memset (overlapped 1-3) : " << s1_memset << " ms (not in critical path)\n";
+        float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
         std::cout << "[PROFILE]   Sum accounted              : " << s1_sum << " ms\n";
         std::cout << "[PROFILE] Stage 2 time: " << stage2_time << " ms\n";
         std::cout << "[PROFILE] Stage 3 time: " << stage3_time_ms << " ms"
@@ -668,6 +677,19 @@ struct gpu_mvr_index {
         int& actual_k_out,
         cudaStream_t stream = 0
     ) {
+        // Launch memset on d2h stream (overlaps with CAGRA + expansion + binary IP)
+        size_t matrix_size = (size_t)num_docs * Q_DOCLEN;
+#ifdef GPU_MVR_PROFILE
+        CUDA_CHECK(cudaEventRecord(ws_.s1_memset_start, ws_.stream_d2h));
+#endif
+        CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_query_max, 0, matrix_size * sizeof(float), ws_.stream_d2h));
+        CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_touched, 0, ws_.estimated_num_docs * sizeof(int), ws_.stream_d2h));
+        CUDA_CHECK(cudaMemsetAsync(ws_.d_num_unique_docs, 0, sizeof(int), ws_.stream_d2h));
+#ifdef GPU_MVR_PROFILE
+        CUDA_CHECK(cudaEventRecord(ws_.s1_memset_end, ws_.stream_d2h));
+#endif
+        CUDA_CHECK(cudaEventRecord(ws_.event_h2d_done, ws_.stream_d2h));  // reuse for memset sync
+
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_cagra_start, stream));
 #endif
@@ -734,17 +756,10 @@ struct gpu_mvr_index {
         // Note: ws_.d_emb_ids and ws_.d_pair_offsets are now ready for Stage 1 kernel
 
         // 2. Compute 1-bit distances using optimized shared-memory kernel
-        // Compute max_embs_per_query from pair_offsets on GPU
-        thrust::device_ptr<int> d_offsets(ws_.d_pair_offsets);
-        thrust::device_vector<int> d_sizes(Q_DOCLEN);
-        thrust::adjacent_difference(thrust::cuda::par.on(stream),
-                                    d_offsets + 1, d_offsets + Q_DOCLEN + 1,
-                                    d_sizes.begin());
-        int max_embs_per_query = thrust::reduce(thrust::cuda::par.on(stream),
-                                                 d_sizes.begin(), d_sizes.end(),
-                                                 0, thrust::maximum<int>());
+        // Use precomputed upper bound for max_embs_per_query
+        // (eliminates thrust::device_vector alloc + adjacent_difference + reduce per search)
+        int max_embs_per_query = ws_.max_embs_per_query_bound;
 
-        // Thread-level parallelism: each thread processes one embedding independently
         int threads_per_block = 256;
         int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
 
@@ -762,27 +777,21 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
 #endif
 
-        // === NEW: GPU-only aggregation using atomic operations ===
-        // 3. Initialize doc_query_max matrix to 0 (matches original CPU logic)
-        size_t matrix_size = num_docs * Q_DOCLEN;
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s1_memset_start, stream));
-#endif
-        CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_query_max, 0, matrix_size * sizeof(float), stream));
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s1_memset_end, stream));
-#endif
+        // === Sparse aggregation: only process documents actually hit ===
+        // Wait for overlapped memset (on stream_d2h) to complete before aggregation
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ws_.event_h2d_done));
 
-        // 4. Atomic aggregation: max per (doc, query) - using optimized version
+        // 4. Atomic aggregation with touched-doc tracking
         int thread_count = 256;
         int block_count = (total_pairs + thread_count - 1) / thread_count;
 
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
 #endif
-        aggregate_stage1_atomic_kernel_opt<<<block_count, thread_count, 0, stream>>>(
+        aggregate_stage1_tracked_kernel<<<block_count, thread_count, 0, stream>>>(
             ws_.d_emb_ids, ws_.d_emb_dists, ws_.d_pair_offsets, d_doc_ids_,
-            ws_.d_doc_query_max,  // doc_query_max matrix
+            ws_.d_doc_query_max,
+            ws_.d_doc_touched, ws_.d_unique_doc_ids, ws_.d_num_unique_docs,
             num_docs, total_pairs, max_embs_per_query
         );
         CUDA_CHECK(cudaGetLastError());
@@ -790,47 +799,51 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
 #endif
 
-        // 5. Sum across queries for each doc
-        int doc_blocks = (num_docs + thread_count - 1) / thread_count;
+        // 5. Get number of touched docs (single int D2H)
+        int h_num_touched = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_num_touched, ws_.d_num_unique_docs,
+                                   sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        if (h_num_touched == 0) {
+            actual_k_out = 0;
+            return;
+        }
+        actual_k_out = std::min((int)k, h_num_touched);
+
+        // 6. Sum across queries only for touched docs (sparse)
+        int sparse_blocks = (h_num_touched + thread_count - 1) / thread_count;
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_sum_scores_start, stream));
 #endif
-        sum_doc_scores_kernel<<<doc_blocks, thread_count, 0, stream>>>(
-            ws_.d_doc_query_max,  // doc_query_max matrix
-            ws_.d_stage1_doc_scores,
-            num_docs
+        sum_doc_scores_sparse_kernel<<<sparse_blocks, thread_count, 0, stream>>>(
+            ws_.d_doc_query_max,
+            ws_.d_unique_doc_ids,
+            ws_.d_stage1_doc_scores,   // compact scores [num_touched]
+            ws_.d_topk_doc_ids,        // compact doc IDs [num_touched]
+            h_num_touched, num_docs
         );
         CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_sum_scores_end, stream));
 #endif
 
-        // 6. Top-k selection: sort all docs by score descending
-        // Docs with no hits will have -inf score and sort to the bottom
-        actual_k_out = std::min((int)k, (int)num_docs);
-
-        // Initialize indices 0..num_docs-1
-        thrust::device_ptr<int> indices_ptr(ws_.d_topk_indices);
-        thrust::sequence(thrust::cuda::par.on(stream),
-                        indices_ptr, indices_ptr + num_docs);
-
-        // Sort (score, index) pairs in descending order
+        // 7. Top-k: sort only touched docs by score descending
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_topk_sort_start, stream));
 #endif
         cub::DeviceRadixSort::SortPairsDescending(
             ws_.d_cub_temp_storage, ws_.cub_temp_storage_bytes,
             ws_.d_stage1_doc_scores, ws_.d_topk_scores,
-            ws_.d_topk_indices, ws_.d_sorted_doc_ids,  // reuse as temp indices out
-            num_docs, 0, 32, stream
+            ws_.d_topk_doc_ids, ws_.d_sorted_doc_ids,
+            h_num_touched, 0, 32, stream
         );
         CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_topk_sort_end, stream));
 #endif
 
-        // Top-k doc IDs are just the top-k indices (since doc_id == index in [0..num_docs-1])
-        // Copy to d_topk_doc_ids
+        // Top-k doc IDs are in d_sorted_doc_ids[0..actual_k_out-1]
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_d2d_start, stream));
 #endif
