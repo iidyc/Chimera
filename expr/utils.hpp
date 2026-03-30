@@ -58,7 +58,7 @@ std::vector<std::vector<size_t>> read_gt_tsv(int num_queries, int top_k) {
     return ground_truth;
 }
 
-void compute_recall(
+double compute_recall(
     const std::vector<std::vector<size_t>>& ground_truth,
     const std::vector<std::vector<size_t>>& retrieved,
     int top_k
@@ -68,10 +68,10 @@ void compute_recall(
     for (int i = 0; i < num_queries; ++i) {
         const auto& gt = ground_truth[i];
         const auto& ret = retrieved[i];
-        std::unordered_set<size_t> gt_set(gt.begin(), gt.begin() + top_k);
+        std::unordered_set<size_t> ret_set(ret.begin(), ret.end());
         int correct = 0;
         for (int j = 0; j < top_k; ++j) {
-            if (gt_set.find(ret[j]) != gt_set.end()) {
+            if (ret_set.find(gt[j]) != ret_set.end()) {
                 correct++;
             }
         }
@@ -79,4 +79,5 @@ void compute_recall(
     }
     double recall = static_cast<double>(total_recall) / (num_queries * top_k);
     std::cout << "Recall@" + std::to_string(top_k) + ": " << recall << std::endl;
+    return recall;
 }

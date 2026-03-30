@@ -52,6 +52,23 @@ using namespace rabitqlib;
     } \
 } while(0)
 
+// === Transfer profiling macros ===
+#ifdef GPU_MVR_PROFILE
+#define XFER_RECORD_BEGIN(stream) \
+    do { if (ws_.xfer_count < Workspace::MAX_XFER_RECORDS) \
+        CUDA_CHECK(cudaEventRecord(ws_.xfer_records[ws_.xfer_count].start, (stream))); } while(0)
+
+#define XFER_RECORD_END(stream, nbytes, h2d_flag) \
+    do { if (ws_.xfer_count < Workspace::MAX_XFER_RECORDS) { \
+        CUDA_CHECK(cudaEventRecord(ws_.xfer_records[ws_.xfer_count].end, (stream))); \
+        ws_.xfer_records[ws_.xfer_count].bytes = (size_t)(nbytes); \
+        ws_.xfer_records[ws_.xfer_count].is_h2d = (h2d_flag); \
+        ws_.xfer_count++; } } while(0)
+#else
+#define XFER_RECORD_BEGIN(stream)
+#define XFER_RECORD_END(stream, nbytes, h2d_flag)
+#endif
+
 struct cast_int_size_t {
     __host__ __device__ size_t operator()(int x) const { return (size_t)x; }
 };
@@ -89,8 +106,8 @@ struct gpu_mvr_index {
 
     // Search parameters
     int nprobe = 128;
-    int k_rank_cluster = 15000;    
-    int k_rank_all_tokens = 500;
+    int k_rank_cluster = 1800;    
+    int k_rank_all_tokens = 300;
 
     // Pre-allocated GPU workspace (sized for worst-case per search)
     struct Workspace {
@@ -222,6 +239,16 @@ struct gpu_mvr_index {
         float s23_cpu_total_us   = 0;  // total CPU Stage 3 time (microseconds)
         float s23_heap_total_us  = 0;  // total heap update time (microseconds)
         int   s23_total_refined  = 0;  // total docs refined in Stage 3
+
+        // === Transfer profiling ===
+        static constexpr int MAX_XFER_RECORDS = 48;
+        struct XferRecord {
+            cudaEvent_t start, end;
+            size_t bytes;
+            bool is_h2d;  // true=H2D, false=D2H
+        };
+        XferRecord xfer_records[MAX_XFER_RECORDS];
+        int xfer_count = 0;
 #endif
     } ws_;
 
@@ -504,6 +531,13 @@ struct gpu_mvr_index {
         // Persistent Stage 2+3 profiling events
         CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_kernel_start));
         CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_kernel_end));
+
+        // Transfer profiling events
+        for (int i = 0; i < Workspace::MAX_XFER_RECORDS; i++) {
+            CUDA_CHECK(cudaEventCreate(&ws_.xfer_records[i].start));
+            CUDA_CHECK(cudaEventCreate(&ws_.xfer_records[i].end));
+        }
+        ws_.xfer_count = 0;
 #endif
     }
 
@@ -516,6 +550,7 @@ struct gpu_mvr_index {
     inline std::vector<size_t> search(const float* queries, size_t k) {
 #ifdef GPU_MVR_PROFILE
         auto search_start = std::chrono::high_resolution_clock::now();
+        ws_.xfer_count = 0;  // reset transfer profiling counters
 #endif
 
 #ifdef GPU_MVR_PROFILE
@@ -535,12 +570,14 @@ struct gpu_mvr_index {
         }
 
         // Upload from pinned memory using async stream
+        XFER_RECORD_BEGIN(ws_.stream_h2d);
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_queries, ws_.h_pinned_queries,
                                    Q_DOCLEN * PADDED_DIM * sizeof(float),
                                    cudaMemcpyHostToDevice, ws_.stream_h2d));
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_cb1_sumq, ws_.h_pinned_cb1_sumq,
                                    Q_DOCLEN * sizeof(float),
                                    cudaMemcpyHostToDevice, ws_.stream_h2d));
+        XFER_RECORD_END(ws_.stream_h2d, Q_DOCLEN * PADDED_DIM * sizeof(float) + Q_DOCLEN * sizeof(float), true);
 
         // Wait for H2D transfer before compute
         CUDA_CHECK(cudaEventRecord(ws_.event_h2d_done, ws_.stream_h2d));
@@ -563,7 +600,6 @@ struct gpu_mvr_index {
         std::vector<size_t> result;
 
 #ifdef GPU_MVR_OVERLAP_STAGE23
-        // === Persistent kernel + streaming top-k + system fence ===
         rank_stage23_persistent(actual_k_stage1, k, k_rank_all_tokens, query_objs.data(), result);
 
 #ifdef GPU_MVR_PROFILE
@@ -597,6 +633,31 @@ struct gpu_mvr_index {
         float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
         std::cout << "[PROFILE]   Sum accounted              : " << s1_sum << " ms\n";
         std::cout << "[PROFILE] Total search time           : " << total_time << " ms\n";
+
+        // === Transfer profiling summary ===
+        {
+            float total_h2d_ms = 0, total_d2h_ms = 0;
+            size_t total_h2d_bytes = 0, total_d2h_bytes = 0;
+            for (int i = 0; i < ws_.xfer_count; i++) {
+                float ms;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, ws_.xfer_records[i].start, ws_.xfer_records[i].end));
+                if (ws_.xfer_records[i].is_h2d) {
+                    total_h2d_ms += ms;
+                    total_h2d_bytes += ws_.xfer_records[i].bytes;
+                } else {
+                    total_d2h_ms += ms;
+                    total_d2h_bytes += ws_.xfer_records[i].bytes;
+                }
+            }
+            std::cout << "[PROFILE] Data transfer summary (" << ws_.xfer_count << " transfers):\n";
+            std::cout << "[PROFILE]   H2D: " << total_h2d_ms << " ms, "
+                      << total_h2d_bytes << " bytes (" << (total_h2d_bytes / 1024.0) << " KB)\n";
+            std::cout << "[PROFILE]   D2H: " << total_d2h_ms << " ms, "
+                      << total_d2h_bytes << " bytes (" << (total_d2h_bytes / 1024.0) << " KB)\n";
+            std::cout << "[PROFILE]   Total transfer: " << (total_h2d_ms + total_d2h_ms) << " ms, "
+                      << (total_h2d_bytes + total_d2h_bytes) << " bytes ("
+                      << ((total_h2d_bytes + total_d2h_bytes) / 1024.0) << " KB)\n";
+        }
 #endif
 
 #else  // !GPU_MVR_OVERLAP_STAGE23
@@ -660,6 +721,31 @@ struct gpu_mvr_index {
         std::cout << "[PROFILE] Stage 2 time: " << stage2_time << " ms\n";
         std::cout << "[PROFILE] Stage 3 time: " << stage3_time_ms << " ms"
                   << " (" << stage2_doc_ids.size() << " docs)\n";
+
+        // === Transfer profiling summary ===
+        {
+            float total_h2d_ms = 0, total_d2h_ms = 0;
+            size_t total_h2d_bytes = 0, total_d2h_bytes = 0;
+            for (int i = 0; i < ws_.xfer_count; i++) {
+                float ms;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, ws_.xfer_records[i].start, ws_.xfer_records[i].end));
+                if (ws_.xfer_records[i].is_h2d) {
+                    total_h2d_ms += ms;
+                    total_h2d_bytes += ws_.xfer_records[i].bytes;
+                } else {
+                    total_d2h_ms += ms;
+                    total_d2h_bytes += ws_.xfer_records[i].bytes;
+                }
+            }
+            std::cout << "[PROFILE] Data transfer summary (" << ws_.xfer_count << " transfers):\n";
+            std::cout << "[PROFILE]   H2D: " << total_h2d_ms << " ms, "
+                      << total_h2d_bytes << " bytes (" << (total_h2d_bytes / 1024.0) << " KB)\n";
+            std::cout << "[PROFILE]   D2H: " << total_d2h_ms << " ms, "
+                      << total_d2h_bytes << " bytes (" << (total_d2h_bytes / 1024.0) << " KB)\n";
+            std::cout << "[PROFILE]   Total transfer: " << (total_h2d_ms + total_d2h_ms) << " ms, "
+                      << (total_h2d_bytes + total_d2h_bytes) << " bytes ("
+                      << ((total_h2d_bytes + total_d2h_bytes) / 1024.0) << " KB)\n";
+        }
 #endif
 
 #endif  // GPU_MVR_OVERLAP_STAGE23
@@ -728,8 +814,10 @@ struct gpu_mvr_index {
 
         // Step 4: Get total pairs count
         int total_pairs;
+        XFER_RECORD_BEGIN(stream);
         CUDA_CHECK(cudaMemcpyAsync(&total_pairs, ws_.d_pair_offsets + Q_DOCLEN,
                                    sizeof(int), cudaMemcpyDeviceToHost, stream));
+        XFER_RECORD_END(stream, sizeof(int), false);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         if (total_pairs == 0) {
@@ -801,8 +889,10 @@ struct gpu_mvr_index {
 
         // 5. Get number of touched docs (single int D2H)
         int h_num_touched = 0;
+        XFER_RECORD_BEGIN(stream);
         CUDA_CHECK(cudaMemcpyAsync(&h_num_touched, ws_.d_num_unique_docs,
                                    sizeof(int), cudaMemcpyDeviceToHost, stream));
+        XFER_RECORD_END(stream, sizeof(int), false);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         if (h_num_touched == 0) {
@@ -910,8 +1000,10 @@ struct gpu_mvr_index {
 
         // Get total tokens
         size_t total_tokens;
+        XFER_RECORD_BEGIN(stream);
         CUDA_CHECK(cudaMemcpyAsync(&total_tokens, ws_.d_candidate_offsets + num_candidates,
                                    sizeof(size_t), cudaMemcpyDeviceToHost, stream));
+        XFER_RECORD_END(stream, sizeof(size_t), false);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s2_prefix_end, stream));
@@ -1001,11 +1093,13 @@ struct gpu_mvr_index {
 #endif
         std::vector<int> h_top_k_indices(actual_k);
         std::vector<size_t> candidate_offsets_cpu(num_candidates + 1);
+        XFER_RECORD_BEGIN(stream);
         CUDA_CHECK(cudaMemcpyAsync(h_top_k_indices.data(), ws_.d_topk_indices,
                                    actual_k * sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(candidate_offsets_cpu.data(), ws_.d_candidate_offsets,
                              (num_candidates + 1) * sizeof(size_t),
                              cudaMemcpyDeviceToHost, stream));
+        XFER_RECORD_END(stream, actual_k * sizeof(int) + (num_candidates + 1) * sizeof(size_t), false);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(s2_d2h_offsets_end, stream));
@@ -1020,10 +1114,12 @@ struct gpu_mvr_index {
         size_t total_selected_tokens = out_offsets[actual_k];
 
         // Upload selection metadata to GPU
+        XFER_RECORD_BEGIN(stream);
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_selected_indices, h_top_k_indices.data(),
                                    actual_k * sizeof(int), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_out_offsets, out_offsets.data(),
                                    (actual_k + 1) * sizeof(size_t), cudaMemcpyHostToDevice, stream));
+        XFER_RECORD_END(stream, actual_k * sizeof(int) + (actual_k + 1) * sizeof(size_t), true);
 
         // 8. Extract on GPU
 #ifdef GPU_MVR_PROFILE
@@ -1047,6 +1143,7 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaEventRecord(s2_d2h_dists_start, stream));
 #endif
         size_t copy_size = total_selected_tokens * Q_DOCLEN;
+        XFER_RECORD_BEGIN(stream);
         CUDA_CHECK(cudaMemcpyAsync(ws_.h_pinned_dists, ws_.d_out_one_bit_dists,
                                    copy_size * sizeof(float), cudaMemcpyDeviceToHost, stream));
 
@@ -1055,6 +1152,7 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMemcpyAsync(h_candidate_doc_ids.data(), ws_.d_topk_doc_ids,
                              num_candidates * sizeof(int),
                              cudaMemcpyDeviceToHost, stream));
+        XFER_RECORD_END(stream, copy_size * sizeof(float) + num_candidates * sizeof(int), false);
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
 #ifdef GPU_MVR_PROFILE
@@ -1120,7 +1218,7 @@ struct gpu_mvr_index {
     }
 
     static constexpr int N_OVERLAP_CHUNKS = 4;   // Number of GPU scoring chunks
-static constexpr int PRELIM_PER_CHUNK = 125;  // Max docs to CPU-refine per chunk
+    int PRELIM_PER_CHUNK = k_rank_all_tokens / N_OVERLAP_CHUNKS;  // Max docs to CPU-refine per chunk
 
 // ============================================================
 // rank_stage23_persistent: fused Stage 2 + Stage 3 with streaming overlap
@@ -1174,6 +1272,7 @@ static constexpr int PRELIM_PER_CHUNK = 125;  // Max docs to CPU-refine per chun
 
         // 4. Copy total_tokens, candidate offsets, and doc IDs to CPU
         size_t total_tokens;
+        XFER_RECORD_BEGIN(stream);
         CUDA_CHECK(cudaMemcpyAsync(&total_tokens, ws_.d_pst_candidate_offsets + num_candidates,
                                     sizeof(size_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(ws_.v_pst_candidate_offsets.data(), ws_.d_pst_candidate_offsets,
@@ -1184,6 +1283,7 @@ static constexpr int PRELIM_PER_CHUNK = 125;  // Max docs to CPU-refine per chun
         CUDA_CHECK(cudaMemcpyAsync(h_candidate_doc_ids.data(), ws_.d_topk_doc_ids,
                                     num_candidates * sizeof(int),
                                     cudaMemcpyDeviceToHost, stream));
+        XFER_RECORD_END(stream, sizeof(size_t) + (num_candidates + 1) * sizeof(size_t) + num_candidates * sizeof(int), false);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // ========================================
@@ -1277,11 +1377,13 @@ static constexpr int PRELIM_PER_CHUNK = 125;  // Max docs to CPU-refine per chun
             int c_end = std::min(c_start + cand_chunk_size, num_candidates);
             int c_count = c_end - c_start;
             CUDA_CHECK(cudaStreamWaitEvent(stream_d2h, chunk_compute_done[c], 0));
+            XFER_RECORD_BEGIN(stream_d2h);
             CUDA_CHECK(cudaMemcpyAsync(
                 ws_.h_mapped_doc_scores + c_start,
                 ws_.d_doc_scores + c_start,
                 c_count * sizeof(float),
                 cudaMemcpyDeviceToHost, stream_d2h));
+            XFER_RECORD_END(stream_d2h, c_count * sizeof(float), false);
             CUDA_CHECK(cudaStreamSynchronize(stream_d2h));
             auto t1 = std::chrono::high_resolution_clock::now();
             time_wait_d2h += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1331,12 +1433,14 @@ static constexpr int PRELIM_PER_CHUNK = 125;  // Max docs to CPU-refine per chun
 
             // --- Launch GPU extract + D2H (async on stream_d2h) ---
             // H2D of metadata (tiny, synchronous due to pageable memory — negligible)
+            XFER_RECORD_BEGIN(stream_d2h);
             CUDA_CHECK(cudaMemcpyAsync(ws_.d_selected_indices, h_sel_indices.data(),
                                         to_refine * sizeof(int),
                                         cudaMemcpyHostToDevice, stream_d2h));
             CUDA_CHECK(cudaMemcpyAsync(ws_.d_out_offsets, h_out_offsets.data(),
                                         (to_refine + 1) * sizeof(size_t),
                                         cudaMemcpyHostToDevice, stream_d2h));
+            XFER_RECORD_END(stream_d2h, to_refine * sizeof(int) + (to_refine + 1) * sizeof(size_t), true);
             // Extract kernel: compacts scattered 1-bit dists into contiguous output
             extract_one_bit_dists_kernel<<<to_refine, 256, 0, stream_d2h>>>(
                 ws_.d_token_dists, ws_.d_pst_candidate_offsets,
@@ -1345,9 +1449,11 @@ static constexpr int PRELIM_PER_CHUNK = 125;  // Max docs to CPU-refine per chun
             );
             CUDA_CHECK(cudaGetLastError());
             // D2H extracted dists (contiguous, async — pinned target)
+            XFER_RECORD_BEGIN(stream_d2h);
             CUDA_CHECK(cudaMemcpyAsync(ws_.h_pinned_dists, ws_.d_out_one_bit_dists,
                                         total_sel_tokens * Q_DOCLEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, stream_d2h));
+            XFER_RECORD_END(stream_d2h, total_sel_tokens * Q_DOCLEN * sizeof(float), false);
             auto t4 = std::chrono::high_resolution_clock::now();
             time_gpu_extract += std::chrono::duration<double, std::milli>(t4 - t3).count();
 
@@ -1603,6 +1709,12 @@ static constexpr int PRELIM_PER_CHUNK = 125;  // Max docs to CPU-refine per chun
         // Persistent Stage 2+3 profiling events
         CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_kernel_start));
         CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_kernel_end));
+
+        // Transfer profiling events
+        for (int i = 0; i < Workspace::MAX_XFER_RECORDS; i++) {
+            CUDA_CHECK(cudaEventDestroy(ws_.xfer_records[i].start));
+            CUDA_CHECK(cudaEventDestroy(ws_.xfer_records[i].end));
+        }
 #endif
 
         delete rotator_;

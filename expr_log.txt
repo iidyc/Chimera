@@ -13,9 +13,67 @@ V100
 [33.1667 s] GPU search time for 2931 queries. (11.3 ms/q)
 Recall@100: 0.951539
 
+--------NEW--------
+[PROFILE] Phase C: wait_d2h=0.090 ms, topk=0.063 ms, identify=0.071 ms, gpu_extract=0.060 ms, cpu_ip_ex=1.346 ms, wait_extract=0.008 ms, combine=0.258 ms (total=2.006 ms, 300 docs)
+[PROFILE] Mode: Persistent Stage 2+3 (streaming top-k + system fence)
+[PROFILE] Stage 1 time: 1.81965 ms
+[PROFILE]   1. CAGRA search            : 0.769024 ms
+[PROFILE]   2. GPU IVF expansion       : 0.155648 ms
+[PROFILE]   3. Binary IP kernel        : 0.17408 ms
+[PROFILE]   4. Aggregation + tracking  : 0.247808 ms
+[PROFILE]   5. Sum doc scores (sparse) : 0.245312 ms
+[PROFILE]   6. Top-k sort (sparse)     : 0.164864 ms
+[PROFILE]   7. D2D copy top-k doc IDs  : 0.004096 ms
+[PROFILE]   8. Memset (overlapped 1-3) : 0.685888 ms (not in critical path)
+[PROFILE]   Sum accounted              : 1.76083 ms
+[PROFILE] Total search time           : 4.02022 ms
+Recall@100: 0.95
+
+[PROFILE] Data transfer summary (16 transfers):
+[PROFILE]   H2D: 0.042784 ms, 20144 bytes (19.6719 KB)
+[PROFILE]   D2H: 0.567424 ms, 3848088 bytes (3757.9 KB)
+[PROFILE]   Total transfer: 0.610208 ms, 3868232 bytes (3777.57 KB)
+
+[PROFILE] Phase C: wait_d2h=0.066 ms, topk=0.017 ms, identify=0.049 ms, gpu_extract=0.055 ms, cpu_ip_ex=0.902 ms, wait_extract=0.007 ms, combine=0.127 ms (total=1.297 ms, 200 docs)
+[PROFILE] Mode: Persistent Stage 2+3 (streaming top-k + system fence)
+[PROFILE] Stage 1 time: 1.74387 ms
+[PROFILE]   1. CAGRA search            : 0.869376 ms
+[PROFILE]   2. GPU IVF expansion       : 0.13312 ms
+[PROFILE]   3. Binary IP kernel        : 0.130048 ms
+[PROFILE]   4. Aggregation + tracking  : 0.196608 ms
+[PROFILE]   5. Sum doc scores (sparse) : 0.192672 ms
+[PROFILE]   6. Top-k sort (sparse)     : 0.16384 ms
+[PROFILE]   7. D2D copy top-k doc IDs  : 0.004096 ms
+[PROFILE]   8. Memset (overlapped 1-3) : 0.385696 ms (not in critical path)
+[PROFILE]   Sum accounted              : 1.68976 ms
+[PROFILE] Total search time           : 3.21638 ms
+[0.0182818 s] GPU search time for 5 queries.
+Recall@100: 0.89
+
+---------------PLAID------------------
 
 Total search time for 2931 queries: 106.72 seconds (36.4 ms/q)
 Recall@100: 95.0720
+
+Total search time for 2931 queries: 77.06 seconds
+Recall@100: 89.9799
+
+Total search time for 2931 queries: 172.63 seconds
+Recall@100: 95.8130
+
+Total search time for 2931 queries: 113.05 seconds
+Recall@100: 95.0720
+
+Time (%)  Total Time (ns)  Num Calls   Avg (ns)     Med (ns)    Min (ns)    Max (ns)   StdDev (ns)                Name               
+ --------  ---------------  ---------  -----------  -----------  ---------  ----------  -----------  ---------------------------------
+     75.6   50,428,888,666    193,451    260,680.4     11,308.0      4,778  30,505,545  1,180,314.6  cudaMemcpyAsync
+
+Total (MB)   Count   Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)            Operation           
+ -----------  ------  --------  --------  --------  --------  -----------  ------------------------------
+ 203,890.001  85,004     2.399     0.016     0.000    91.230        7.945  [CUDA memcpy Host-to-Device]
+(17.2 ms, 69 MB / query)
+
+---------------------------------------
 
 [PROFILE] Persistent Stage 2+3 (multi-chunk streaming overlap):
 [PROFILE]   True GPU kernel time      : 3.11523 ms

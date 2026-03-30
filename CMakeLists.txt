@@ -33,6 +33,12 @@ target_link_libraries(build PRIVATE faiss OpenMP::OpenMP_CXX rmm::rmm)
 add_executable(search expr/search.cpp)
 target_link_libraries(search PRIVATE faiss OpenMP::OpenMP_CXX rmm::rmm)
 
+add_executable(test_gather expr/test_gather.cpp)
+target_link_libraries(test_gather PRIVATE faiss OpenMP::OpenMP_CXX rmm::rmm)
+
+add_executable(test_dist_decomp expr/test_dist_decomp.cpp)
+target_link_libraries(test_dist_decomp PRIVATE faiss OpenMP::OpenMP_CXX rmm::rmm)
+
 add_executable(build_cagra expr/build_cagra.cpp)
 target_link_libraries(build_cagra PRIVATE faiss OpenMP::OpenMP_CXX rmm::rmm)
 

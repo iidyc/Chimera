@@ -28,7 +28,7 @@ struct cpu_mvr_index {
     size_t padded_dim_; // multiple of 64 dimension after padding
     Rotator<float>* rotator_;
 
-    IVFType ivf_type_ = IVFType::DocKMeans;
+    IVFType ivf_type_ = IVFType::PG;
     IVF_PG* ivf = nullptr;
     IVF_DocKMeans* ivf_dk_ = nullptr;
 
@@ -142,9 +142,114 @@ struct cpu_mvr_index {
         return doc_ptrs_[doc_id + 1] - doc_ptrs_[doc_id];
     }
 
+    void gather_ids(const float* queries, size_t q_doclen, size_t nprobe, std::vector<size_t>& output_ids) {
+        std::vector<float> rotated_queries(q_doclen * padded_dim_);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+        }
+        std::vector<query_object> query_objs(q_doclen);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+        }
+
+        std::vector<bool> doc_found(num_docs, false);
+#pragma omp parallel for
+        for (int j = 0; j < q_doclen; ++j) {
+            std::vector<size_t> ids;
+            ivf->search(query_objs[j].rotated_query, nprobe, ids);
+            for (size_t idx = 0; idx < ids.size(); ++idx) {
+                size_t emb_id = ids[idx];
+                int doc_id = doc_ids_[emb_id];
+                doc_found[doc_id] = true;
+            }
+        }
+        for (int doc_id = 0; doc_id < num_docs; ++doc_id) {
+            if (doc_found[doc_id]) {
+                output_ids.push_back(doc_id);
+            }
+        }
+    }
+
+    void gather_ids_rank_dists(const float* queries, size_t q_doclen, size_t nprobe, std::vector<size_t>& output_ids, int k) {
+        std::vector<float> rotated_queries(q_doclen * padded_dim_);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+        }
+        std::vector<query_object> query_objs(q_doclen);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+        }
+
+        std::vector<bool> doc_found(num_docs, false);
+        std::vector<float> doc_dists(q_doclen * num_docs);
+#pragma omp parallel for
+        for (int j = 0; j < q_doclen; ++j) {
+            std::vector<size_t> ids;
+            ivf->search(query_objs[j].rotated_query, nprobe, ids);
+            for (size_t idx = 0; idx < ids.size(); ++idx) {
+                size_t emb_id = ids[idx];
+                float dist = distance_one_bit(&query_objs[j], &one_bit_code_[emb_id * padded_dim_ / 8], one_bit_factor_[emb_id], padded_dim_);
+                int doc_id = doc_ids_[emb_id];
+                doc_found[doc_id] = true;
+                doc_dists[j * num_docs + doc_id] = std::max(doc_dists[j * num_docs + doc_id], dist);
+            }
+        }
+        std::priority_queue<std::pair<float, int>> max_heap;
+        for (int doc_id = 0; doc_id < num_docs; ++doc_id) {
+            if (doc_found[doc_id]) {
+                float score = 0.0F;
+                for (int j = 0; j < q_doclen; ++j) {
+                    score += doc_dists[j * num_docs + doc_id];
+                }
+                max_heap.emplace(score, doc_id);
+            }
+        }
+        for (int i = 0; i < k && !max_heap.empty(); ++i) {
+            output_ids.push_back(max_heap.top().second);
+            max_heap.pop();
+        }
+    }
+
+    void gather_dists(const float* data, const float* queries, size_t q_doclen, size_t nprobe, std::vector<size_t>& output_ids, std::vector<float>& output_dists) {
+        std::vector<float> rotated_queries(q_doclen * padded_dim_);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+        }
+        std::vector<query_object> query_objs(q_doclen);
+        for (size_t i = 0; i < q_doclen; ++i) {
+            query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+        }
+
+        std::vector<bool> doc_found(num_docs, false);
+        std::vector<float> doc_dists(q_doclen * num_docs);
+#pragma omp parallel for
+        for (int j = 0; j < q_doclen; ++j) {
+            std::vector<size_t> ids;
+            ivf->search(query_objs[j].rotated_query, nprobe, ids);
+            for (size_t idx = 0; idx < ids.size(); ++idx) {
+                size_t emb_id = ids[idx];
+                // float dist = distance_one_bit(&query_objs[j], &one_bit_code_[emb_id * padded_dim_ / 8], one_bit_factor_[emb_id], padded_dim_);
+                float dist = dot_product(data + emb_id * d, queries + j * d, d);
+                int doc_id = doc_ids_[emb_id];
+                doc_found[doc_id] = true;
+                doc_dists[j * num_docs + doc_id] = std::max(doc_dists[j * num_docs + doc_id], dist);
+            }
+        }
+        for (int doc_id = 0; doc_id < num_docs; ++doc_id) {
+            if (doc_found[doc_id]) {
+                float score = 0.0F;
+                for (int j = 0; j < q_doclen; ++j) {
+                    score += doc_dists[j * num_docs + doc_id];
+                }
+                output_ids.push_back(doc_id);
+                output_dists.push_back(score);
+            }
+        }
+    }
+
     std::vector<size_t> search(const float* queries, size_t q_doclen, size_t k, size_t nprobe) {
         int k_rank_cluster = 1800;
-        int k_rank_all_tokens = 1800;
+        int k_rank_all_tokens = 300;
 
         std::vector<float> rotated_queries(q_doclen * padded_dim_);
         for (size_t i = 0; i < q_doclen; ++i) {
@@ -210,95 +315,6 @@ struct cpu_mvr_index {
             output_ids.push_back(max_heap.top().second);
             max_heap.pop();
         }
-    }
-
-    void rank_cluster_dists_dockmeans(
-        const float* queries,       // raw unrotated query vectors (q_doclen * d)
-        size_t q_doclen,
-        size_t nprobe,
-        size_t k,
-        std::vector<size_t>& output_ids
-    ) {
-        const float* centroids = ivf_dk_->centroids.data();
-
-        // Score each centroid: SUM_i ||q_i - c_k||^2
-        std::vector<float> centroid_scores(n_clusters);
-#pragma omp parallel for
-        for (size_t c = 0; c < n_clusters; ++c) {
-            float score = 0.0f;
-            for (size_t i = 0; i < q_doclen; ++i) {
-                score += sqrt(l2_sqr(&queries[i * d], &centroids[c * d], d));
-            }
-            centroid_scores[c] = score;
-        }
-
-        // Find top nprobe centroids (smallest score)
-        std::vector<size_t> cluster_order(n_clusters);
-        std::iota(cluster_order.begin(), cluster_order.end(), 0);
-        size_t actual_nprobe = std::min(nprobe, n_clusters);
-        std::partial_sort(
-            cluster_order.begin(),
-            cluster_order.begin() + actual_nprobe,
-            cluster_order.end(),
-            [&](size_t a, size_t b) { return centroid_scores[a] < centroid_scores[b]; }
-        );
-
-        // Collect doc IDs from top nprobe clusters
-        for (size_t p = 0; p < actual_nprobe; ++p) {
-            size_t cid = cluster_order[p];
-            size_t start = ivf_dk_->cluster_pos[cid];
-            size_t end = ivf_dk_->cluster_pos[cid + 1];
-            for (size_t i = start; i < end; ++i) {
-                output_ids.push_back(static_cast<size_t>(ivf_dk_->inv_list[i]));
-            }
-        }
-    }
-
-    std::vector<size_t> search_dockmeans(const float* queries, size_t q_doclen, size_t k, size_t nprobe) {
-        int k_rank_cluster = 1800;
-        int k_rank_all_tokens = 1800;
-
-        // Stage 1: brute-force centroid scan using raw (unrotated) queries
-        auto t0 = std::chrono::high_resolution_clock::now();
-        std::vector<size_t> rank_cluster_doc_ids;
-        rank_cluster_dists_dockmeans(queries, q_doclen, nprobe, k_rank_cluster, rank_cluster_doc_ids);
-        auto t1 = std::chrono::high_resolution_clock::now();
-
-        // Rotate queries and build query objects for stages 2/3
-        std::vector<float> rotated_queries(q_doclen * padded_dim_);
-        for (size_t i = 0; i < q_doclen; ++i) {
-            rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
-        }
-        std::vector<query_object> query_objs(q_doclen);
-        for (size_t i = 0; i < q_doclen; ++i) {
-            query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
-        }
-
-        // Stage 2: rank all tokens with 1-bit distances (reused)
-        std::vector<size_t> rank_all_tokens_ids;
-        std::vector<float> one_bit_dists;
-        rank_all_tokens_1bit(query_objs.data(), q_doclen, rank_cluster_doc_ids, k_rank_all_tokens, rank_all_tokens_ids, one_bit_dists);
-        auto t2 = std::chrono::high_resolution_clock::now();
-
-        // Stage 3: refine with ex-bits (reused)
-        std::vector<size_t> result;
-        rank_all_tokens_exbits(
-            query_objs.data(),
-            q_doclen,
-            rank_all_tokens_ids,
-            one_bit_dists,
-            k,
-            result
-        );
-        auto t3 = std::chrono::high_resolution_clock::now();
-
-        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        std::cout << "[search_dockmeans] stage1_cluster: " << ms(t0, t1) << " ms, "
-                  << "stage1_doc_nums: " << rank_cluster_doc_ids.size() << ", "
-                  << "stage2_1bit: " << ms(t1, t2) << " ms, "
-                  << "stage3_exbits: " << ms(t2, t3) << " ms, "
-                  << "total: " << ms(t0, t3) << " ms\n";
-        return result;
     }
 
     void rank_all_tokens_1bit(
