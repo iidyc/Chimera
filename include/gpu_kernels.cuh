@@ -133,6 +133,190 @@ __global__ void stage2_binary_ip_kernel_v2(
     }
 }
 
+// ============================================================
+// LUT-based binary IP kernels
+// ============================================================
+
+__global__ void precompute_lut_kernel(
+    const float* __restrict__ d_queries,  // [Q_DOCLEN * PADDED_DIM]
+    float* __restrict__ d_lut             // [Q_DOCLEN * LUT_ENTRIES_PER_QUERY]
+) {
+    const int query_idx = blockIdx.x;
+    if (query_idx >= Q_DOCLEN) return;
+
+    const float* q_ptr = d_queries + query_idx * PADDED_DIM;
+    float* lut_ptr = d_lut + query_idx * LUT_ENTRIES_PER_QUERY;
+
+    // 512 entries total, 256 threads → 2 iterations
+    for (int idx = threadIdx.x; idx < LUT_ENTRIES_PER_QUERY; idx += blockDim.x) {
+        int chunk_idx = idx / LUT_SIZE;     // 0..31
+        int lut_entry = idx % LUT_SIZE;     // 0..15 (the 4-bit pattern)
+
+        int dim_start = chunk_idx * BITS_PER_CHUNK;
+        float sum = 0.0f;
+
+        #pragma unroll
+        for (int bit_idx = 0; bit_idx < BITS_PER_CHUNK; bit_idx++) {
+            if ((lut_entry >> bit_idx) & 1) {
+                sum += q_ptr[dim_start + bit_idx];
+            }
+        }
+
+        lut_ptr[idx] = sum;
+    }
+}
+
+__global__ void stage1_binary_ip_lut_kernel(
+    const float* __restrict__ d_lut,           // [Q_DOCLEN * LUT_ENTRIES_PER_QUERY]
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_emb_ids,
+    const int*   __restrict__ d_pair_offsets,
+    float* __restrict__ d_out_dists,
+    size_t max_embs_per_query
+) {
+    __shared__ float smem_lut[LUT_ENTRIES_PER_QUERY];  // 512 floats = 2048 bytes
+
+    const int query_idx = blockIdx.y;
+    if (query_idx >= Q_DOCLEN) return;
+
+    // Cooperative load of this query's LUT into shared memory
+    const float* lut_ptr = d_lut + query_idx * LUT_ENTRIES_PER_QUERY;
+    #pragma unroll
+    for (int i = threadIdx.x; i < LUT_ENTRIES_PER_QUERY; i += blockDim.x) {
+        smem_lut[i] = lut_ptr[i];
+    }
+    __syncthreads();
+
+    const float cb1_sumq = d_cb1_sumq[query_idx];
+    const size_t pair_start = d_pair_offsets[query_idx];
+    const size_t pair_end   = d_pair_offsets[query_idx + 1];
+    const size_t num_embs   = pair_end - pair_start;
+
+    for (size_t idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+         idx < num_embs;
+         idx += (size_t)blockDim.x * gridDim.x)
+    {
+        const size_t emb_id = d_emb_ids[pair_start + idx];
+        const uint64_t* code_ptr =
+            (const uint64_t*)(d_one_bit_code + emb_id * CODE_BYTES);
+        uint64_t code_regs[NUM_U64];
+        code_regs[0] = code_ptr[0];
+        code_regs[1] = code_ptr[1];
+
+        float ip = 0.0f;
+        #pragma unroll
+        for (int blk = 0; blk < NUM_U64; blk++) {
+            uint64_t code = code_regs[blk];
+            #pragma unroll
+            for (int n = 0; n < 16; n++) {
+                int nibble = (code >> (n * 4)) & 0xF;
+                int chunk_idx = blk * 16 + n;
+                ip += smem_lut[chunk_idx * LUT_SIZE + nibble];
+            }
+        }
+
+        float dist = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
+        d_out_dists[query_idx * max_embs_per_query + idx] = dist;
+    }
+}
+
+// Query-tiled stage2 LUT kernel: processes TILE_Q queries per pass
+// to keep shared memory small (16KB) for high occupancy.
+// Code is loaded once per token, nibbles extracted once, reused across all tiles.
+#define STAGE2_LUT_TILE_Q 8
+#define STAGE2_LUT_NUM_TILES (Q_DOCLEN / STAGE2_LUT_TILE_Q)  // 4 tiles
+#define STAGE2_LUT_SMEM_FLOATS (STAGE2_LUT_TILE_Q * LUT_ENTRIES_PER_QUERY)  // 4096
+
+__global__ void stage2_binary_ip_lut_kernel(
+    const float* __restrict__ d_lut,           // [Q_DOCLEN * LUT_ENTRIES_PER_QUERY]
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_token_ids,
+    float* __restrict__ d_out_dists,
+    size_t total_tokens,
+    size_t batch_tokens
+) {
+    // Shared memory: TILE_Q query LUTs (16 KB) + cb1_sumq tile (32 B)
+    extern __shared__ float smem[];
+    float* smem_lut = smem;                              // [TILE_Q * 512]
+    float* smem_cb1_sumq = smem + STAGE2_LUT_SMEM_FLOATS;  // [TILE_Q]
+
+    // Process tokens in a block-cooperative grid-stride pattern.
+    // For each batch of tokens, iterate over query tiles.
+    // All threads must participate in __syncthreads even if they have no valid token.
+    size_t tok_base = (size_t)blockIdx.x * blockDim.x;
+
+    for (size_t tok_batch_start = tok_base;
+         tok_batch_start < batch_tokens;
+         tok_batch_start += (size_t)blockDim.x * gridDim.x)
+    {
+        size_t tok_idx = tok_batch_start + threadIdx.x;
+        bool valid = tok_idx < batch_tokens;
+
+        // Load code and extract nibbles once per token (reused across all query tiles)
+        size_t token_id = 0;
+        float factor = 0.0f;
+        int nibbles[NUM_CHUNKS];
+
+        if (valid) {
+            token_id = d_token_ids[tok_idx];
+            factor = d_one_bit_factor[token_id];
+
+            const uint64_t* code_ptr =
+                (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
+            uint64_t code_regs[NUM_U64];
+            code_regs[0] = code_ptr[0];
+            code_regs[1] = code_ptr[1];
+
+            #pragma unroll
+            for (int blk = 0; blk < NUM_U64; blk++) {
+                uint64_t code = code_regs[blk];
+                #pragma unroll
+                for (int n = 0; n < 16; n++) {
+                    nibbles[blk * 16 + n] = (code >> (n * 4)) & 0xF;
+                }
+            }
+        }
+
+        // Iterate over query tiles
+        #pragma unroll
+        for (int tile = 0; tile < STAGE2_LUT_NUM_TILES; tile++) {
+            int q_start = tile * STAGE2_LUT_TILE_Q;
+
+            // Cooperative load of this tile's LUTs into shared memory
+            __syncthreads();
+            const float* tile_lut_src = d_lut + q_start * LUT_ENTRIES_PER_QUERY;
+            for (int i = threadIdx.x; i < STAGE2_LUT_SMEM_FLOATS; i += blockDim.x) {
+                smem_lut[i] = tile_lut_src[i];
+            }
+            if (threadIdx.x < STAGE2_LUT_TILE_Q) {
+                smem_cb1_sumq[threadIdx.x] = d_cb1_sumq[q_start + threadIdx.x];
+            }
+            __syncthreads();
+
+            if (valid) {
+                #pragma unroll
+                for (int tq = 0; tq < STAGE2_LUT_TILE_Q; tq++) {
+                    const float* q_lut = smem_lut + tq * LUT_ENTRIES_PER_QUERY;
+                    float ip = 0.0f;
+
+                    #pragma unroll
+                    for (int c = 0; c < NUM_CHUNKS; c++) {
+                        ip += q_lut[c * LUT_SIZE + nibbles[c]];
+                    }
+
+                    int q = q_start + tq;
+                    d_out_dists[q * total_tokens + tok_idx] =
+                        (ip - smem_cb1_sumq[tq]) * factor;
+                }
+            }
+        }
+    }
+}
+
 __global__ void doc_score_kernel(
     const float*  __restrict__ d_token_dists,  // [Q_DOCLEN][total_tokens]
     const size_t* __restrict__ d_candidate_offsets,

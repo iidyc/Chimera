@@ -134,12 +134,24 @@ inline void rank_stage23_persistent(
         // binary_ip for this chunk's tokens
         if (tok_count > 0) {
             int bip_blocks = (tok_count + 255) / 256;
+#ifdef GPU_MVR_USE_LUT
+            {
+                size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
+                stage2_binary_ip_lut_kernel<<<bip_blocks, 256, stage2_lut_smem, stream>>>(
+                    ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                    ws_.d_pst_token_ids + tok_start,
+                    ws_.d_token_dists + tok_start,
+                    total_tokens, tok_count
+                );
+            }
+#else
             stage2_binary_ip_kernel_v2<<<bip_blocks, 256, 0, stream>>>(
                 ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
                 ws_.d_pst_token_ids + tok_start,
                 ws_.d_token_dists + tok_start,
                 total_tokens, tok_count
             );
+#endif
             CUDA_CHECK(cudaGetLastError());
         }
 

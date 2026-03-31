@@ -133,6 +133,10 @@ struct gpu_mvr_index {
         size_t* d_out_offsets;       // [max_stage2_k + 1]
         float*  d_out_one_bit_dists; // [max_stage2_k_tokens * max_q_doclen]
 
+#ifdef GPU_MVR_USE_LUT
+        float* d_lut;  // [Q_DOCLEN * LUT_ENTRIES_PER_QUERY] = 16384 floats = 64 KB
+#endif
+
         // Stage 1 CAGRA batched search workspace
         float*        d_cagra_dists;     // [max_q_doclen * nprobe]
         faiss::idx_t* d_cagra_labels;    // [max_q_doclen * nprobe]
@@ -437,6 +441,17 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMalloc(&ws_.d_out_offsets, (ws_.max_stage2_k + 1) * sizeof(size_t)));
         CUDA_CHECK(cudaMalloc(&ws_.d_out_one_bit_dists, ws_.max_stage2_k_tokens * Q_DOCLEN * sizeof(float)));
 
+#ifdef GPU_MVR_USE_LUT
+        // LUT workspace for binary IP
+        CUDA_CHECK(cudaMalloc(&ws_.d_lut, LUT_TOTAL_FLOATS * sizeof(float)));
+        // Stage 2 LUT kernel needs extended shared memory (64 KB + 128 B)
+        size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
+        CUDA_CHECK(cudaFuncSetAttribute(
+            stage2_binary_ip_lut_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            stage2_lut_smem));
+#endif
+
         // CAGRA batched search workspace
         CUDA_CHECK(cudaMalloc(&ws_.d_cagra_dists, Q_DOCLEN * nprobe * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ws_.d_cagra_labels, Q_DOCLEN * nprobe * sizeof(faiss::idx_t)));
@@ -582,6 +597,13 @@ struct gpu_mvr_index {
         // Wait for H2D transfer before compute
         CUDA_CHECK(cudaEventRecord(ws_.event_h2d_done, ws_.stream_h2d));
         CUDA_CHECK(cudaStreamWaitEvent(ws_.stream_compute, ws_.event_h2d_done));
+
+#ifdef GPU_MVR_USE_LUT
+        // Precompute LUT for all queries (must happen after H2D of d_queries)
+        precompute_lut_kernel<<<Q_DOCLEN, 256, 0, ws_.stream_compute>>>(
+            ws_.d_queries, ws_.d_lut);
+        CUDA_CHECK(cudaGetLastError());
+#endif
 
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.event_stage1_start, ws_.stream_compute));
@@ -855,11 +877,19 @@ struct gpu_mvr_index {
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_start, stream));
 #endif
+#ifdef GPU_MVR_USE_LUT
+        stage1_binary_ip_lut_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+            ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
+            max_embs_per_query
+        );
+#else
         stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
             max_embs_per_query
         );
+#endif
         CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
@@ -1032,11 +1062,22 @@ struct gpu_mvr_index {
         int threads_per_block = 256;
         int blocks_x = (total_tokens + threads_per_block - 1) / threads_per_block;
 
+#ifdef GPU_MVR_USE_LUT
+        {
+            size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
+            stage2_binary_ip_lut_kernel<<<blocks_x, threads_per_block, stage2_lut_smem, stream>>>(
+                ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                ws_.d_token_ids, ws_.d_token_dists,
+                total_tokens, total_tokens
+            );
+        }
+#else
         stage2_binary_ip_kernel_v2<<<blocks_x, threads_per_block, 0, stream>>>(
             ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_token_ids, ws_.d_token_dists,
             total_tokens, total_tokens
         );
+#endif
         CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.s2_binaryip_end, stream));
@@ -1316,12 +1357,24 @@ struct gpu_mvr_index {
             // binary_ip for this chunk's tokens
             if (tok_count > 0) {
                 int bip_blocks = (tok_count + 255) / 256;
+#ifdef GPU_MVR_USE_LUT
+                {
+                    size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
+                    stage2_binary_ip_lut_kernel<<<bip_blocks, 256, stage2_lut_smem, stream>>>(
+                        ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                        ws_.d_pst_token_ids + tok_start,
+                        ws_.d_token_dists + tok_start,
+                        total_tokens, tok_count
+                    );
+                }
+#else
                 stage2_binary_ip_kernel_v2<<<bip_blocks, 256, 0, stream>>>(
                     ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
                     ws_.d_pst_token_ids + tok_start,
                     ws_.d_token_dists + tok_start,
                     total_tokens, tok_count
                 );
+#endif
                 CUDA_CHECK(cudaGetLastError());
             }
 
@@ -1391,7 +1444,7 @@ struct gpu_mvr_index {
             // --- CPU: running top-k from all scores seen so far [0, c_end) ---
             running_indices.resize(c_end);
             std::iota(running_indices.begin(), running_indices.end(), 0);
-            int run_k = std::min(actual_k, c_end);
+            int run_k = std::min(actual_k * (c + 1) / actual_chunks, c_end);
             std::nth_element(running_indices.begin(), running_indices.begin() + run_k,
                             running_indices.end(),
                             [this](int a, int b) {
@@ -1413,7 +1466,7 @@ struct gpu_mvr_index {
 
             if (new_docs.empty()) continue;
             std::sort(new_docs.begin(), new_docs.end(), std::greater<>());
-            int to_refine = std::min((int)PRELIM_PER_CHUNK, (int)new_docs.size());
+            int to_refine = new_docs.size();
             new_docs.resize(to_refine);
             for (const auto& p : new_docs) {
                 seen_doc_ids.insert(h_candidate_doc_ids[p.second]);
@@ -1605,6 +1658,9 @@ struct gpu_mvr_index {
         // Free workspace
         CUDA_CHECK(cudaFree(ws_.d_queries));
         CUDA_CHECK(cudaFree(ws_.d_cb1_sumq));
+#ifdef GPU_MVR_USE_LUT
+        CUDA_CHECK(cudaFree(ws_.d_lut));
+#endif
         CUDA_CHECK(cudaFree(ws_.d_emb_ids));
         CUDA_CHECK(cudaFree(ws_.d_pair_offsets));
         CUDA_CHECK(cudaFree(ws_.d_emb_dists));

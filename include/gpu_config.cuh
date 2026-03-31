@@ -13,6 +13,15 @@
 #define NUM_U64 (PADDED_DIM / 64)               // Number of 64-bit blocks: 2
 #define SMEM_QUERY_SIZE (PADDED_DIM * sizeof(float))  // Shared memory per query: 512 bytes
 
+// LUT-based binary IP configuration
+#define BITS_PER_CHUNK 4
+#define LUT_SIZE (1 << BITS_PER_CHUNK)                        // 16
+#define NUM_CHUNKS (PADDED_DIM / BITS_PER_CHUNK)              // 32
+#define LUT_ENTRIES_PER_QUERY (NUM_CHUNKS * LUT_SIZE)         // 512
+#define LUT_BYTES_PER_QUERY (LUT_ENTRIES_PER_QUERY * sizeof(float))  // 2048
+#define LUT_TOTAL_FLOATS (Q_DOCLEN * LUT_ENTRIES_PER_QUERY)   // 16384
+#define LUT_TOTAL_BYTES (LUT_TOTAL_FLOATS * sizeof(float))    // 65536 = 64 KB
+
 // Persistent Stage 2+3 kernel configuration
 #define STAGE2_PERSISTENT_BLOCK 256                              // threads per block for persistent fused kernel
 #define STAGE2_PERSISTENT_MAX_WARPS (STAGE2_PERSISTENT_BLOCK / 32)  // = 8
