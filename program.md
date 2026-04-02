@@ -9,7 +9,7 @@ To set up a new experiment, work with the user to:
 1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `/include/*` — implementation. The files of interest are `gpu_index.cuh` and `gpu_kernels.cuh`. Modify the implementation in these two files if needed.
+   - `/include/*` — implementation. The files of interest are `gpu_index.cuh` and `gpu_kernels.cuh`. Specifically you need to look into `stage2_binary_ip_lut_kernel` and try to optimize it. Modify the implementation in these two files if needed.
    - `/expr/*` — main experiment files, the only one that will be used is `expr/gpu_search.cu`. Do not modify files under this folder.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
@@ -21,7 +21,7 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs the executable `build/gpu_search`. To luanch the experiment, enter `build` folder, compile using `make -j` if you modified the code, then simply run `./gpu_search`.
 
 **What you CAN do:**
-- Modify `gpu_index.cuh` and `gpu_kernels.cuh` (and `gpu_config.cuh` if needed) — this is the only three files you edit. Everything is fair game: optimize the implementation while keeping the logic unchanged to obtain better performance.
+- Modify `gpu_index.cuh` and `gpu_kernels.cuh` (and `gpu_config.cuh` if needed) — this is the only three files you edit. Everything is fair game: optimize the implementation of `stage2_binary_ip_lut_kernel` while keeping the logic unchanged to obtain better performance.
 - Add printed profiling statistics to help you understand the behavior of the code.
 
 **What you CANNOT do:**
@@ -29,9 +29,9 @@ Each experiment runs the executable `build/gpu_search`. To luanch the experiment
 - Modify `CMakeLists.txt` and invoke `cmake`.
 - Try to use sudo related operations. The machine does not have super user permission.
 - Modify the search procedure logic and search hyper-parameters, i.e., `nprobe = 128`, `k_rank_cluster = 1800` and `k_rank_all_tokens = 300`. You have to make sure every experiment run has the same recall within random perturbation (in the current setting, 0.952 +- 0.002).
-- Switch to the usage of `stage1_binary_ip_kernel_v2` and `stage2_binary_ip_kernel_v2` kernels. You should stick to using LUT-based binary IP approach and try to improve its performance.
+- Switch to the usage of `stage2_binary_ip_kernel_v2` kernel. You should stick to using LUT-based binary IP approach and try to improve its performance.
 
-**The goal is simple: get the lowest query time.** Since the search logic is fixed, you don't need to worry about recall — it's always 0.95. Everything is fair game: look into the implementation and try to propose approaches to optimize the performance.
+**The goal is simple: get the lowest query time.** Since the search logic is fixed, you don't need to worry about recall — it's always 0.95. Everything is fair game: look into the implementation of `stage2_binary_ip_kernel_v2` and try to propose approaches to optimize the performance.
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the `gpu_search` as is.
 
