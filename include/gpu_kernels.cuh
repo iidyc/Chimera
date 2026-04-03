@@ -6,132 +6,132 @@
 #include <cfloat>
 #include "gpu_config.cuh"
 
-// __global__ void stage1_binary_ip_kernel_v2(
-//     const float* __restrict__ d_queries,
-//     const char*  __restrict__ d_one_bit_code,
-//     const float* __restrict__ d_one_bit_factor,
-//     const float* __restrict__ d_cb1_sumq,
-//     const size_t* __restrict__ d_emb_ids,
-//     const int*   __restrict__ d_pair_offsets,
-//     float* __restrict__ d_out_dists,
-//     size_t max_embs_per_query
-// ) {
-//     __shared__ float smem_query[PADDED_DIM];  // 512 bytes
+__global__ void stage1_binary_ip_kernel_v2(
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_emb_ids,
+    const int*   __restrict__ d_pair_offsets,
+    float* __restrict__ d_out_dists,
+    size_t max_embs_per_query
+) {
+    __shared__ float smem_query[PADDED_DIM];  // 512 bytes
 
-//     const int query_idx = blockIdx.y;
-//     if (query_idx >= Q_DOCLEN) return;
+    const int query_idx = blockIdx.y;
+    if (query_idx >= Q_DOCLEN) return;
 
-//     // Coalesced load of query vector into shared memory
-//     const float* q_ptr = d_queries + query_idx * PADDED_DIM;
-//     #pragma unroll
-//     for (int i = threadIdx.x; i < PADDED_DIM; i += blockDim.x) {
-//         smem_query[i] = q_ptr[i];
-//     }
-//     __syncthreads();
+    // Coalesced load of query vector into shared memory
+    const float* q_ptr = d_queries + query_idx * PADDED_DIM;
+    #pragma unroll
+    for (int i = threadIdx.x; i < PADDED_DIM; i += blockDim.x) {
+        smem_query[i] = q_ptr[i];
+    }
+    __syncthreads();
 
-//     const float cb1_sumq = d_cb1_sumq[query_idx];
-//     const size_t pair_start = d_pair_offsets[query_idx];
-//     const size_t pair_end   = d_pair_offsets[query_idx + 1];
-//     const size_t num_embs   = pair_end - pair_start;
+    const float cb1_sumq = d_cb1_sumq[query_idx];
+    const size_t pair_start = d_pair_offsets[query_idx];
+    const size_t pair_end   = d_pair_offsets[query_idx + 1];
+    const size_t num_embs   = pair_end - pair_start;
 
-//     // Grid-stride loop: each thread handles one embedding per iteration
-//     for (size_t idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
-//          idx < num_embs;
-//          idx += (size_t)blockDim.x * gridDim.x)
-//     {
-//         const size_t emb_id = d_emb_ids[pair_start + idx];
-//         // Vectorized 128-bit load of binary code (2 x uint64_t)
-//         const uint64_t* code_ptr =
-//             (const uint64_t*)(d_one_bit_code + emb_id * CODE_BYTES);
-//         uint64_t code_regs[NUM_U64];
-//         code_regs[0] = code_ptr[0];
-//         code_regs[1] = code_ptr[1];
+    // Grid-stride loop: each thread handles one embedding per iteration
+    for (size_t idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+         idx < num_embs;
+         idx += (size_t)blockDim.x * gridDim.x)
+    {
+        const size_t emb_id = d_emb_ids[pair_start + idx];
+        // Vectorized 128-bit load of binary code (2 x uint64_t)
+        const uint64_t* code_ptr =
+            (const uint64_t*)(d_one_bit_code + emb_id * CODE_BYTES);
+        uint64_t code_regs[NUM_U64];
+        code_regs[0] = code_ptr[0];
+        code_regs[1] = code_ptr[1];
 
-//         float ip = 0.0f;
-//         #pragma unroll
-//         for (int blk = 0; blk < NUM_U64; blk++) {
-//             uint64_t bits = code_regs[blk];
-//             int base = blk * 64;
-//             // Skip zero bits using __ffsll intrinsic
-//             while (bits) {
-//                 int pos = __ffsll(bits) - 1;
-//                 ip += smem_query[base + pos];
-//                 bits &= bits - 1;  // clear lowest set bit
-//             }
-//         }
-//         float dist = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
+        float ip = 0.0f;
+        #pragma unroll
+        for (int blk = 0; blk < NUM_U64; blk++) {
+            uint64_t bits = code_regs[blk];
+            int base = blk * 64;
+            // Skip zero bits using __ffsll intrinsic
+            while (bits) {
+                int pos = __ffsll(bits) - 1;
+                ip += smem_query[base + pos];
+                bits &= bits - 1;  // clear lowest set bit
+            }
+        }
+        float dist = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
 
-//         d_out_dists[query_idx * max_embs_per_query + idx] = dist;
-//     }
-// }
+        d_out_dists[query_idx * max_embs_per_query + idx] = dist;
+    }
+}
 
-// __global__ void stage2_binary_ip_kernel_v2(
-//     const float* __restrict__ d_queries,       // [Q_DOCLEN * PADDED_DIM]
-//     const char*  __restrict__ d_one_bit_code,  // [n * CODE_BYTES]
-//     const float* __restrict__ d_one_bit_factor,// [n]
-//     const float* __restrict__ d_cb1_sumq,      // [Q_DOCLEN]
-//     const size_t* __restrict__ d_token_ids,    // [total_tokens]
-//     float* __restrict__ d_out_dists,           // [Q_DOCLEN * total_tokens]
-//     size_t total_tokens,
-//     size_t batch_tokens
-// ) {
-//     // Load ALL query vectors into shared memory (16 KB)
-//     __shared__ float smem_queries[Q_DOCLEN * PADDED_DIM];
-//     // Cache cb1_sumq in shared memory to avoid repeated global reads (128 B)
-//     __shared__ float smem_cb1_sumq[Q_DOCLEN];
+__global__ void stage2_binary_ip_kernel_v2(
+    const float* __restrict__ d_queries,       // [Q_DOCLEN * PADDED_DIM]
+    const char*  __restrict__ d_one_bit_code,  // [n * CODE_BYTES]
+    const float* __restrict__ d_one_bit_factor,// [n]
+    const float* __restrict__ d_cb1_sumq,      // [Q_DOCLEN]
+    const size_t* __restrict__ d_token_ids,    // [total_tokens]
+    float* __restrict__ d_out_dists,           // [Q_DOCLEN * total_tokens]
+    size_t total_tokens,
+    size_t batch_tokens
+) {
+    // Load ALL query vectors into shared memory (16 KB)
+    __shared__ float smem_queries[Q_DOCLEN * PADDED_DIM];
+    // Cache cb1_sumq in shared memory to avoid repeated global reads (128 B)
+    __shared__ float smem_cb1_sumq[Q_DOCLEN];
 
-//     // Cooperative load: 256 threads load 32*128 = 4096 floats → 16 iterations
-//     const int total_query_floats = Q_DOCLEN * PADDED_DIM;
-//     for (int i = threadIdx.x; i < total_query_floats; i += blockDim.x) {
-//         smem_queries[i] = d_queries[i];
-//     }
-//     if (threadIdx.x < Q_DOCLEN) {
-//         smem_cb1_sumq[threadIdx.x] = d_cb1_sumq[threadIdx.x];
-//     }
-//     __syncthreads();
+    // Cooperative load: 256 threads load 32*128 = 4096 floats → 16 iterations
+    const int total_query_floats = Q_DOCLEN * PADDED_DIM;
+    for (int i = threadIdx.x; i < total_query_floats; i += blockDim.x) {
+        smem_queries[i] = d_queries[i];
+    }
+    if (threadIdx.x < Q_DOCLEN) {
+        smem_cb1_sumq[threadIdx.x] = d_cb1_sumq[threadIdx.x];
+    }
+    __syncthreads();
 
-//     // Grid-stride loop: each thread processes one token against all queries
-//     for (size_t tok_idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
-//          tok_idx < batch_tokens;
-//          tok_idx += (size_t)blockDim.x * gridDim.x)
-//     {
-//         // Load binary code and factor ONCE per token
-//         const size_t token_id = d_token_ids[tok_idx];
-//         const float factor = d_one_bit_factor[token_id];
+    // Grid-stride loop: each thread processes one token against all queries
+    for (size_t tok_idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+         tok_idx < batch_tokens;
+         tok_idx += (size_t)blockDim.x * gridDim.x)
+    {
+        // Load binary code and factor ONCE per token
+        const size_t token_id = d_token_ids[tok_idx];
+        const float factor = d_one_bit_factor[token_id];
 
-//         // Load binary code into registers (2 x uint64_t)
-//         const uint64_t* code_ptr =
-//             (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
-//         uint64_t code_regs[NUM_U64];
-//         code_regs[0] = code_ptr[0];
-//         code_regs[1] = code_ptr[1];
+        // Load binary code into registers (2 x uint64_t)
+        const uint64_t* code_ptr =
+            (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
+        uint64_t code_regs[NUM_U64];
+        code_regs[0] = code_ptr[0];
+        code_regs[1] = code_ptr[1];
 
-//         // Score against all Q_DOCLEN queries
-//         #pragma unroll
-//         for (int q = 0; q < Q_DOCLEN; q++) {
-//             const float* q_smem = smem_queries + q * PADDED_DIM;
-//             const float cb1_sumq = smem_cb1_sumq[q];
+        // Score against all Q_DOCLEN queries
+        #pragma unroll
+        for (int q = 0; q < Q_DOCLEN; q++) {
+            const float* q_smem = smem_queries + q * PADDED_DIM;
+            const float cb1_sumq = smem_cb1_sumq[q];
 
-//             float ip = 0.0f;
-//             #pragma unroll
-//             for (int blk = 0; blk < NUM_U64; blk++) {
-//                 uint64_t bits = code_regs[blk];
-//                 int base = blk * 64;
-//                 // Fully unrolled loop — compiler emits predicated FADD with zero branching.
-//                 // Do NOT replace with __ffsll: data-dependent branching causes warp divergence
-//                 // multiplied 32x across queries, resulting in 3.6x slowdown.
-//                 #pragma unroll
-//                 for (int i = 0; i < 64; i++) {
-//                     if ((bits >> i) & 1ULL)
-//                         ip += q_smem[base + i];
-//                 }
-//             }
+            float ip = 0.0f;
+            #pragma unroll
+            for (int blk = 0; blk < NUM_U64; blk++) {
+                uint64_t bits = code_regs[blk];
+                int base = blk * 64;
+                // Fully unrolled loop — compiler emits predicated FADD with zero branching.
+                // Do NOT replace with __ffsll: data-dependent branching causes warp divergence
+                // multiplied 32x across queries, resulting in 3.6x slowdown.
+                #pragma unroll
+                for (int i = 0; i < 64; i++) {
+                    if ((bits >> i) & 1ULL)
+                        ip += q_smem[base + i];
+                }
+            }
 
-//             d_out_dists[q * total_tokens + tok_idx] =
-//                 (ip - cb1_sumq) * factor;
-//         }
-//     }
-// }
+            d_out_dists[q * total_tokens + tok_idx] =
+                (ip - cb1_sumq) * factor;
+        }
+    }
+}
 
 // ============================================================
 // LUT-based binary IP kernels

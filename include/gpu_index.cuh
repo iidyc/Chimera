@@ -238,8 +238,10 @@ struct gpu_mvr_index {
 
         // Persistent Stage 2+3 profiling events
         cudaEvent_t s23_pst_kernel_start, s23_pst_kernel_end;
+        cudaEvent_t s23_pst_bip_start, s23_pst_bip_end;
         // Accumulated timings for persistent path
         float s23_pst_kernel_ms  = 0;  // GPU persistent kernel wall time
+        float s23_pst_bip_ms    = 0;  // GPU stage2_binary_ip_lut_kernel total time
         float s23_cpu_total_us   = 0;  // total CPU Stage 3 time (microseconds)
         float s23_heap_total_us  = 0;  // total heap update time (microseconds)
         int   s23_total_refined  = 0;  // total docs refined in Stage 3
@@ -546,6 +548,8 @@ struct gpu_mvr_index {
         // Persistent Stage 2+3 profiling events
         CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_kernel_start));
         CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_kernel_end));
+        CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_bip_start));
+        CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_bip_end));
 
         // Transfer profiling events
         for (int i = 0; i < Workspace::MAX_XFER_RECORDS; i++) {
@@ -654,6 +658,7 @@ struct gpu_mvr_index {
         std::cout << "[PROFILE]   8. Memset (overlapped 1-3) : " << s1_memset << " ms (not in critical path)\n";
         float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
         std::cout << "[PROFILE]   Sum accounted              : " << s1_sum << " ms\n";
+        std::cout << "[PROFILE] Stage 2 binary_ip_lut total : " << ws_.s23_pst_bip_ms << " ms\n";
         std::cout << "[PROFILE] Total search time           : " << total_time << " ms\n";
 
         // === Transfer profiling summary ===
@@ -1345,6 +1350,9 @@ struct gpu_mvr_index {
         for (int c = 0; c < actual_chunks; c++)
             CUDA_CHECK(cudaEventCreateWithFlags(&chunk_compute_done[c], cudaEventDisableTiming));
 
+#ifdef GPU_MVR_PROFILE
+        ws_.s23_pst_bip_ms = 0;
+#endif
         // Launch all chunks: binary_ip + doc_score → record compute event
         for (int c = 0; c < actual_chunks; c++) {
             int c_start = c * cand_chunk_size;
@@ -1357,6 +1365,9 @@ struct gpu_mvr_index {
             // binary_ip for this chunk's tokens
             if (tok_count > 0) {
                 int bip_blocks = (tok_count + 255) / 256;
+#ifdef GPU_MVR_PROFILE
+                CUDA_CHECK(cudaEventRecord(ws_.s23_pst_bip_start, stream));
+#endif
 #ifdef GPU_MVR_USE_LUT
                 {
                     size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
@@ -1374,6 +1385,15 @@ struct gpu_mvr_index {
                     ws_.d_token_dists + tok_start,
                     total_tokens, tok_count
                 );
+#endif
+#ifdef GPU_MVR_PROFILE
+                CUDA_CHECK(cudaEventRecord(ws_.s23_pst_bip_end, stream));
+                CUDA_CHECK(cudaEventSynchronize(ws_.s23_pst_bip_end));
+                {
+                    float chunk_bip_ms = 0;
+                    CUDA_CHECK(cudaEventElapsedTime(&chunk_bip_ms, ws_.s23_pst_bip_start, ws_.s23_pst_bip_end));
+                    ws_.s23_pst_bip_ms += chunk_bip_ms;
+                }
 #endif
                 CUDA_CHECK(cudaGetLastError());
             }
@@ -1765,6 +1785,8 @@ struct gpu_mvr_index {
         // Persistent Stage 2+3 profiling events
         CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_kernel_start));
         CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_kernel_end));
+        CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_bip_start));
+        CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_bip_end));
 
         // Transfer profiling events
         for (int i = 0; i < Workspace::MAX_XFER_RECORDS; i++) {
