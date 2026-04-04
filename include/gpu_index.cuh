@@ -97,6 +97,7 @@ struct gpu_mvr_index {
     std::vector<int> doc_ids_;           // CPU copy
     std::vector<int> doc_ptrs_;          // CPU copy for stage 3
     float (*ip_func_)(const float*, const uint8_t*, size_t);
+    void (*unpack_func_)(const uint8_t*, float*, size_t);
 
     // GPU persistent data (copied once at construction)
     char*  d_one_bit_code_;     // [n * padded_dim_ / 8]
@@ -313,6 +314,7 @@ struct gpu_mvr_index {
         rot_in.close();
 
         ip_func_ = select_excode_ipfunc(ex_bits);
+        unpack_func_ = select_excode_unpackfunc(ex_bits);
 
         ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
         ivf->load(filename);
@@ -1341,6 +1343,8 @@ struct gpu_mvr_index {
     ) {
         if (num_candidates == 0) return;
 
+        auto cpu_ms = [](auto a, auto b) { return std::chrono::duration<float, std::milli>(b - a).count(); };
+
         cudaStream_t stream = ws_.stream_compute;
         cudaStream_t stream_d2h = ws_.stream_d2h;
         int actual_k = (int)std::min(k_stage2, (size_t)num_candidates);
@@ -1467,18 +1471,6 @@ struct gpu_mvr_index {
         auto t_cpu6 = std::chrono::high_resolution_clock::now();
         float time_phase_a = std::chrono::duration<float, std::milli>(t_cpu6 - t_start_phase_a).count();
 
-        auto cpu_ms = [](auto a, auto b) { return std::chrono::duration<float, std::milli>(b - a).count(); };
-        std::cout << "[PROFILE] Phase A (Data Preparation) wall: " << time_phase_a << " ms, GPU total: " << time_phase_a_gpu << " ms\n";
-        std::cout << "[PROFILE]   1. Gather doc lengths      : " << time_phase_a_gather << " ms (CPU launch: " << cpu_ms(t_cpu0, t_cpu1) << " ms)\n";
-        std::cout << "[PROFILE]   2. Prefix sum offsets      : " << time_phase_a_prefix << " ms (CPU launch: " << cpu_ms(t_cpu1, t_cpu2) << " ms)\n";
-        std::cout << "[PROFILE]   3. Gather token IDs        : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
-        std::cout << "[PROFILE]   4. D2H metadata + sync     : " << time_phase_a_d2h << " ms (CPU launch: " << cpu_ms(t_cpu3, t_cpu4) << " ms)\n";
-        std::cout << "[PROFILE]   5. cudaStreamSynchronize   : " << cpu_ms(t_cpu4, t_cpu5) << " ms\n";
-        std::cout << "[PROFILE]   6. cudaEventElapsedTime x5 : " << cpu_ms(t_cpu5, t_cpu6) << " ms\n";
-        std::cout << "[PROFILE]   GPU sum accounted           : "
-                  << (time_phase_a_gather + time_phase_a_prefix + time_phase_a_token_ids + time_phase_a_d2h)
-                  << " ms\n";
-
         // ========================================
         // Phase B: Launch ALL GPU chunk kernels on stream_compute
         //          D2H managed per-chunk in Phase C on stream_d2h
@@ -1583,7 +1575,6 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaEventRecord(ws_.pst_extract_done, stream));
         auto t_end_phase_b = std::chrono::high_resolution_clock::now();
         float time_phase_b = std::chrono::duration<float, std::milli>(t_end_phase_b - t_start_phase_b).count();
-        std::cout << "[PROFILE] Phase B wall time: " << time_phase_b << " ms\n";
 
         // ========================================
         // Phase C: Streaming CPU processing with GPU-extracted 1-bit dists
@@ -1649,7 +1640,7 @@ struct gpu_mvr_index {
             auto t1 = std::chrono::high_resolution_clock::now();
             time_wait_d2h += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #ifdef GPU_MVR_TIMELINE
-            tl_cpu.push_back({tl_cpu_us(t0), tl_cpu_us(t1), "wait_d2h_c" + std::to_string(c), "wait"});
+            tl_cpu.push_back({tl_cpu_us(t0), tl_cpu_us(t1), "wait_d2h_c" + std::to_string(c), "async"});
 #endif
 
             // --- CPU: running top-k from all scores seen so far [0, c_end) ---
@@ -1663,7 +1654,7 @@ struct gpu_mvr_index {
             auto t2 = std::chrono::high_resolution_clock::now();
             time_running_topk += std::chrono::duration<double, std::milli>(t2 - t1).count();
 #ifdef GPU_MVR_TIMELINE
-            tl_cpu.push_back({tl_cpu_us(t1), tl_cpu_us(t2), "topk_c" + std::to_string(c), "compute"});
+            tl_cpu.push_back({tl_cpu_us(t1), tl_cpu_us(t2), "topk_c" + std::to_string(c), "async"});
 #endif
 
             // --- Identify NEW docs in running top-k (not yet refined) ---
@@ -1680,7 +1671,7 @@ struct gpu_mvr_index {
             if (new_docs.empty()) {
 #ifdef GPU_MVR_TIMELINE
                 auto t_skip = std::chrono::high_resolution_clock::now();
-                tl_cpu.push_back({tl_cpu_us(t2), tl_cpu_us(t_skip), "identify_c" + std::to_string(c), "compute"});
+                tl_cpu.push_back({tl_cpu_us(t2), tl_cpu_us(t_skip), "identify_c" + std::to_string(c), "async"});
 #endif
                 continue;
             }
@@ -1693,7 +1684,7 @@ struct gpu_mvr_index {
             auto t3 = std::chrono::high_resolution_clock::now();
             time_identify_new += std::chrono::duration<double, std::milli>(t3 - t2).count();
 #ifdef GPU_MVR_TIMELINE
-            tl_cpu.push_back({tl_cpu_us(t2), tl_cpu_us(t3), "identify_c" + std::to_string(c), "compute"});
+            tl_cpu.push_back({tl_cpu_us(t2), tl_cpu_us(t3), "identify_c" + std::to_string(c), "async"});
 #endif
 
             // --- Prepare selected indices + output offsets for GPU extract ---
@@ -1739,33 +1730,40 @@ struct gpu_mvr_index {
             auto t4 = std::chrono::high_resolution_clock::now();
             time_gpu_extract += std::chrono::duration<double, std::milli>(t4 - t3).count();
 #ifdef GPU_MVR_TIMELINE
-            tl_cpu.push_back({tl_cpu_us(t3), tl_cpu_us(t4), "launch_extract_c" + std::to_string(c), "compute"});
+            tl_cpu.push_back({tl_cpu_us(t3), tl_cpu_us(t4), "launch_extract_c" + std::to_string(c), "async"});
 #endif
 
             // --- CPU: compute ip_ex_bits (OVERLAPPED with GPU extract + D2H) ---
-            // This is the only CPU-intensive part of Stage 3 refinement.
-            // It runs in parallel with the GPU extract kernel on stream_d2h.
-    #pragma omp parallel for schedule(dynamic)
+            // Decode each token's compact ex-code once, then batch 32 dot products
+            // using register-blocked GEMV (8 queries per batch, decoded data stays
+            // in ZMM registers across queries within a batch).
+            {
+            const size_t ex_code_stride = PADDED_DIM * ex_bits / 8;
+            const float* queries_flat = ws_.h_pinned_queries;
+    #pragma omp parallel for schedule(dynamic, 4)
             for (int i = 0; i < to_refine; i++) {
                 int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
                 size_t doc_start = doc_ptrs_[doc_id];
                 size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
-                for (size_t j = 0; j < Q_DOCLEN; j++) {
-                    for (size_t t = 0; t < n_tok; t++) {
-                        size_t tid = doc_start + t;
-                        ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN + j] = ip_ex_bits(
-                            queries + j,
-                            &ex_code_[tid * PADDED_DIM * ex_bits / 8],
-                            ip_func_,
-                            PADDED_DIM
-                        );
-                    }
+                alignas(64) float decoded[PADDED_DIM];
+                for (size_t t = 0; t < n_tok; t++) {
+                    size_t tid = doc_start + t;
+                    unpack_func_(
+                        reinterpret_cast<const uint8_t*>(&ex_code_[tid * ex_code_stride]),
+                        decoded, PADDED_DIM);
+                    if (t + 1 < n_tok)
+                        __builtin_prefetch(&ex_code_[(tid + 1) * ex_code_stride], 0, 3);
+                    rabitqlib::gemv_batch8_avx512(
+                        queries_flat, decoded,
+                        &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN],
+                        Q_DOCLEN, PADDED_DIM);
                 }
+            }
             }
             auto t5 = std::chrono::high_resolution_clock::now();
             time_cpu_ip_ex += std::chrono::duration<double, std::milli>(t5 - t4).count();
 #ifdef GPU_MVR_TIMELINE
-            tl_cpu.push_back({tl_cpu_us(t4), tl_cpu_us(t5), "cpu_ip_ex_c" + std::to_string(c), "compute"});
+            tl_cpu.push_back({tl_cpu_us(t4), tl_cpu_us(t5), "cpu_ip_ex_c" + std::to_string(c), "static"});
 #endif
 
             // --- Wait for GPU extract D2H to complete ---
@@ -1773,33 +1771,62 @@ struct gpu_mvr_index {
             auto t6 = std::chrono::high_resolution_clock::now();
             time_wait_extract += std::chrono::duration<double, std::milli>(t6 - t5).count();
 #ifdef GPU_MVR_TIMELINE
-            tl_cpu.push_back({tl_cpu_us(t5), tl_cpu_us(t6), "wait_extract_c" + std::to_string(c), "wait"});
+            tl_cpu.push_back({tl_cpu_us(t5), tl_cpu_us(t6), "wait_extract_c" + std::to_string(c), "async"});
 #endif
 
             // --- Combine: GPU 1-bit dists + CPU ip_ex_bits → final scores ---
-    #pragma omp parallel for schedule(dynamic)
+            // Vectorized across Q_DOCLEN=32 queries (2 × 16-wide AVX-512).
+            // Loop order: t (tokens) outer, j (queries) inner.
+            // Precompute query_bias[j] = scale*cb1_sumq[j] - cbex_sumq[j] once,
+            // then per token: combined = (tok_scale*one_bit_dist + query_bias + ex_dist) * tok_exf
+            {
+            const float scale = static_cast<float>(1 << ex_bits);
+            // Precompute per-query bias: scale * cb1_sumq[j] - cbex_sumq[j]
+            alignas(64) float query_bias[Q_DOCLEN];
+            for (size_t j = 0; j < Q_DOCLEN; j++)
+                query_bias[j] = scale * queries[j].cb1_sumq - queries[j].cbex_sumq;
+
+    #pragma omp parallel for schedule(dynamic, 4)
             for (int i = 0; i < to_refine; i++) {
                 int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
                 size_t doc_start = doc_ptrs_[doc_id];
                 size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
-                float doc_score = 0.0f;
-                for (size_t j = 0; j < Q_DOCLEN; j++) {
-                    float max_ts = -std::numeric_limits<float>::infinity();
-                    for (size_t t = 0; t < n_tok; t++) {
-                        size_t tid = doc_start + t;
-                        float combined = combine_dists(
-                            queries + j,
-                            ws_.h_pinned_dists[(h_out_offsets[i] + t) * Q_DOCLEN + j],
-                            ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN + j],
-                            one_bit_factor_[tid],
-                            ex_factor_[tid],
-                            ex_bits
-                        );
-                        max_ts = std::max(max_ts, combined);
+
+                // Per-query running max, initialized to -inf
+                alignas(64) float max_ts[Q_DOCLEN];
+                __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+                for (size_t j = 0; j < Q_DOCLEN; j += 16)
+                    _mm512_store_ps(&max_ts[j], neg_inf);
+
+                for (size_t t = 0; t < n_tok; t++) {
+                    size_t tid = doc_start + t;
+                    float tok_scale = scale / one_bit_factor_[tid];
+                    float tok_exf   = ex_factor_[tid];
+                    __m512 v_tok_scale = _mm512_set1_ps(tok_scale);
+                    __m512 v_tok_exf   = _mm512_set1_ps(tok_exf);
+
+                    const float* ob_base = &ws_.h_pinned_dists[(h_out_offsets[i] + t) * Q_DOCLEN];
+                    const float* ex_base = &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN];
+
+                    for (size_t j = 0; j < Q_DOCLEN; j += 16) {
+                        __m512 ob  = _mm512_loadu_ps(&ob_base[j]);
+                        __m512 exd = _mm512_loadu_ps(&ex_base[j]);
+                        __m512 qb  = _mm512_load_ps(&query_bias[j]);
+                        // combined = (tok_scale * ob + qb + exd) * tok_exf
+                        __m512 combined = _mm512_mul_ps(
+                            _mm512_add_ps(_mm512_fmadd_ps(v_tok_scale, ob, qb), exd),
+                            v_tok_exf);
+                        _mm512_store_ps(&max_ts[j],
+                            _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
                     }
-                    doc_score += max_ts;
                 }
-                refined_scores[i] = {doc_score, doc_id};
+
+                // Sum per-query maxes → doc_score
+                __m512 sum = _mm512_load_ps(&max_ts[0]);
+                for (size_t j = 16; j < Q_DOCLEN; j += 16)
+                    sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
+                refined_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
+            }
             }
 
             // Add refined results to heap
@@ -1809,7 +1836,7 @@ struct gpu_mvr_index {
             auto t7 = std::chrono::high_resolution_clock::now();
             time_combine += std::chrono::duration<double, std::milli>(t7 - t6).count();
 #ifdef GPU_MVR_TIMELINE
-            tl_cpu.push_back({tl_cpu_us(t6), tl_cpu_us(t7), "combine_c" + std::to_string(c), "compute"});
+            tl_cpu.push_back({tl_cpu_us(t6), tl_cpu_us(t7), "combine_c" + std::to_string(c), "subflow"});
 #endif
 
             total_refined += to_refine;
@@ -1835,14 +1862,6 @@ struct gpu_mvr_index {
                 }
 #endif
 
-        printf("[PROFILE] Phase C: wait_d2h=%.3f ms, topk=%.3f ms, identify=%.3f ms, "
-            "gpu_extract=%.3f ms, cpu_ip_ex=%.3f ms, wait_extract=%.3f ms, "
-            "combine=%.3f ms (total=%.3f ms, %d docs)\n",
-            time_wait_d2h, time_running_topk, time_identify_new,
-            time_gpu_extract, time_cpu_ip_ex, time_wait_extract,
-            time_combine, time_phase_c, total_refined);
-        std::cout << "[PROFILE] Total wall time for Phase A + B + C: " << total_wall_time << " ms\n";
-
         // ========================================
         // Phase D: Extract final top-k results (trivial)
         // ========================================
@@ -1865,20 +1884,20 @@ struct gpu_mvr_index {
             CUDA_CHECK(cudaStreamSynchronize(stream_d2h));
 
             // --- Build GPU compute spans (Phase A on stream_compute) ---
-            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_start_event), tl_gpu_us(ws_.phase_a_gather_done_event), "gather_doc_lengths", "kernel"});
-            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_gather_done_event), tl_gpu_us(ws_.phase_a_prefix_done_event), "prefix_sum", "kernel"});
-            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_prefix_done_event), tl_gpu_us(ws_.phase_a_token_ids_done_event), "gather_token_ids", "kernel"});
-            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_token_ids_done_event), tl_gpu_us(ws_.phase_a_d2h_done_event), "d2h_metadata", "transfer"});
+            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_start_event), tl_gpu_us(ws_.phase_a_gather_done_event), "gather_doc_lengths", "async"});
+            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_gather_done_event), tl_gpu_us(ws_.phase_a_prefix_done_event), "prefix_sum", "async"});
+            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_prefix_done_event), tl_gpu_us(ws_.phase_a_token_ids_done_event), "gather_token_ids", "async"});
+            tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_token_ids_done_event), tl_gpu_us(ws_.phase_a_d2h_done_event), "d2h_metadata", "async"});
 
             // --- Build GPU compute spans (Phase B on stream_compute) ---
 #ifdef GPU_MVR_PROFILE
             for (int c = 0; c < tl_actual_chunks; c++) {
                 if (chunk_has_bip[c]) {
                     tl_gpu_compute.push_back({tl_gpu_us(chunk_bip_start[c]), tl_gpu_us(chunk_bip_end[c]),
-                        "binary_ip_c" + std::to_string(c), "kernel"});
+                        "binary_ip_c" + std::to_string(c), "static"});
                 }
                 tl_gpu_compute.push_back({tl_gpu_us(chunk_docscore_start[c]), tl_gpu_us(chunk_docscore_end[c]),
-                    "docscore_c" + std::to_string(c), "kernel"});
+                    "docscore_c" + std::to_string(c), "subflow"});
             }
 #endif
 
@@ -1886,24 +1905,24 @@ struct gpu_mvr_index {
             for (int c = 0; c < tl_actual_chunks; c++) {
                 if (tl_c_has_scores[c]) {
                     tl_gpu_d2h.push_back({tl_gpu_us(tl_c_wait_ev[c]), tl_gpu_us(tl_c_scores_s[c]),
-                        "wait_compute_c" + std::to_string(c), "wait"});
+                        "wait_compute_c" + std::to_string(c), "async"});
                     tl_gpu_d2h.push_back({tl_gpu_us(tl_c_scores_s[c]), tl_gpu_us(tl_c_scores_e[c]),
-                        "d2h_scores_c" + std::to_string(c), "transfer"});
+                        "d2h_scores_c" + std::to_string(c), "condition"});
                 }
                 if (tl_c_has_extract[c]) {
                     tl_gpu_d2h.push_back({tl_gpu_us(tl_c_extract_s[c]), tl_gpu_us(tl_c_extract_e[c]),
-                        "extract_c" + std::to_string(c), "kernel"});
+                        "extract_c" + std::to_string(c), "module"});
                 }
             }
 
             // --- Build CPU spans (Phase A + B) ---
-            tl_cpu.push_back({tl_cpu_us(t_cpu0), tl_cpu_us(t_cpu1), "launch_gather", "compute"});
-            tl_cpu.push_back({tl_cpu_us(t_cpu1), tl_cpu_us(t_cpu2), "launch_prefix", "compute"});
-            tl_cpu.push_back({tl_cpu_us(t_cpu2), tl_cpu_us(t_cpu3), "launch_token_ids", "compute"});
-            tl_cpu.push_back({tl_cpu_us(t_cpu3), tl_cpu_us(t_cpu4), "launch_d2h", "compute"});
-            tl_cpu.push_back({tl_cpu_us(t_cpu4), tl_cpu_us(t_cpu5), "sync_stream", "wait"});
-            tl_cpu.push_back({tl_cpu_us(t_cpu5), tl_cpu_us(t_cpu6), "event_elapsed", "compute"});
-            tl_cpu.push_back({tl_cpu_us(t_start_phase_b), tl_cpu_us(t_end_phase_b), "launch_phase_b", "compute"});
+            tl_cpu.push_back({tl_cpu_us(t_cpu0), tl_cpu_us(t_cpu1), "launch_gather", "async"});
+            tl_cpu.push_back({tl_cpu_us(t_cpu1), tl_cpu_us(t_cpu2), "launch_prefix", "async"});
+            tl_cpu.push_back({tl_cpu_us(t_cpu2), tl_cpu_us(t_cpu3), "launch_token_ids", "async"});
+            tl_cpu.push_back({tl_cpu_us(t_cpu3), tl_cpu_us(t_cpu4), "launch_d2h", "async"});
+            tl_cpu.push_back({tl_cpu_us(t_cpu4), tl_cpu_us(t_cpu5), "sync_stream", "async"});
+            tl_cpu.push_back({tl_cpu_us(t_cpu5), tl_cpu_us(t_cpu6), "event_elapsed", "async"});
+            tl_cpu.push_back({tl_cpu_us(t_start_phase_b), tl_cpu_us(t_end_phase_b), "launch_phase_b", "async"});
             // Phase C CPU spans were already pushed inline in the loop
 
             // Sort all span lists by start time
@@ -1956,6 +1975,24 @@ struct gpu_mvr_index {
 #endif
 
 #ifdef GPU_MVR_PROFILE
+        std::cout << "[PROFILE] Phase A (Data Preparation) wall: " << time_phase_a << " ms, GPU total: " << time_phase_a_gpu << " ms\n";
+        std::cout << "[PROFILE]   1. Gather doc lengths      : " << time_phase_a_gather << " ms (CPU launch: " << cpu_ms(t_cpu0, t_cpu1) << " ms)\n";
+        std::cout << "[PROFILE]   2. Prefix sum offsets      : " << time_phase_a_prefix << " ms (CPU launch: " << cpu_ms(t_cpu1, t_cpu2) << " ms)\n";
+        std::cout << "[PROFILE]   3. Gather token IDs        : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
+        std::cout << "[PROFILE]   4. D2H metadata + sync     : " << time_phase_a_d2h << " ms (CPU launch: " << cpu_ms(t_cpu3, t_cpu4) << " ms)\n";
+        std::cout << "[PROFILE]   5. cudaStreamSynchronize   : " << cpu_ms(t_cpu4, t_cpu5) << " ms\n";
+        std::cout << "[PROFILE]   6. cudaEventElapsedTime x5 : " << cpu_ms(t_cpu5, t_cpu6) << " ms\n";
+        std::cout << "[PROFILE]   GPU sum accounted           : "
+                  << (time_phase_a_gather + time_phase_a_prefix + time_phase_a_token_ids + time_phase_a_d2h)
+                  << " ms\n";
+        std::cout << "[PROFILE] Phase B wall time: " << time_phase_b << " ms\n";
+        printf("[PROFILE] Phase C: wait_d2h=%.3f ms, topk=%.3f ms, identify=%.3f ms, "
+            "gpu_extract=%.3f ms, cpu_ip_ex=%.3f ms, wait_extract=%.3f ms, "
+            "combine=%.3f ms (total=%.3f ms, %d docs)\n",
+            time_wait_d2h, time_running_topk, time_identify_new,
+            time_gpu_extract, time_cpu_ip_ex, time_wait_extract,
+            time_combine, time_phase_c, total_refined);
+        std::cout << "[PROFILE] Total wall time for Phase A + B + C: " << total_wall_time << " ms\n";
         for (int c = 0; c < actual_chunks; c++) {
             CUDA_CHECK(cudaEventDestroy(chunk_bip_start[c]));
             CUDA_CHECK(cudaEventDestroy(chunk_bip_end[c]));

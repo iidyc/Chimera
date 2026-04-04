@@ -596,6 +596,258 @@ inline ex_ipfunc select_excode_ipfunc(size_t ex_bits) {
     exit(1);
 }
 
+// ============================================================
+// Unpack functions: decode compact ex-codes into float[dim] buffers.
+// Mirror the bit-manipulation of the ip16_fxu*/ip64_fxu* functions
+// but store decoded floats instead of computing a dot product.
+// ============================================================
+namespace excode_unpackimpl {
+
+inline void unpack_fxu1_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    const __m512 ones = _mm512_set1_ps(1.0f);
+    for (size_t i = 0; i < dim; i += 16) {
+        __mmask16 mask = *reinterpret_cast<const __mmask16*>(compact_code);
+        _mm512_storeu_ps(&out[i], _mm512_maskz_mov_ps(mask, ones));
+        compact_code += 2;
+    }
+}
+
+inline void unpack_fxu2_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    const __m128i mask = _mm_set1_epi8(0b00000011);
+    for (size_t i = 0; i < dim; i += 16) {
+        int32_t compact = *reinterpret_cast<const int32_t*>(compact_code);
+        __m128i code = _mm_set_epi32(compact >> 6, compact >> 4, compact >> 2, compact);
+        code = _mm_and_si128(code, mask);
+        _mm512_storeu_ps(&out[i], _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(code)));
+        compact_code += 4;
+    }
+}
+
+inline void unpack_fxu3_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    const __m128i mask = _mm_set1_epi8(0b11);
+    const __m128i top_mask = _mm_set1_epi8(0b100);
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i compact2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+        compact_code += 16;
+        int64_t top_bit = *reinterpret_cast<const int64_t*>(compact_code);
+        compact_code += 8;
+
+        __m128i vec_00_to_15 = _mm_or_si128(
+            _mm_and_si128(compact2, mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit << 1, top_bit << 2), top_mask));
+        __m128i vec_16_to_31 = _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(compact2, 2), mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit >> 1, top_bit >> 0), top_mask));
+        __m128i vec_32_to_47 = _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(compact2, 4), mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit >> 3, top_bit >> 2), top_mask));
+        __m128i vec_48_to_63 = _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(compact2, 6), mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit >> 5, top_bit >> 4), top_mask));
+
+        _mm512_storeu_ps(&out[i],      _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_00_to_15)));
+        _mm512_storeu_ps(&out[i + 16], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_16_to_31)));
+        _mm512_storeu_ps(&out[i + 32], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_32_to_47)));
+        _mm512_storeu_ps(&out[i + 48], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63)));
+    }
+}
+
+inline void unpack_fxu4_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    constexpr int64_t kMask = 0x0f0f0f0f0f0f0f0f;
+    for (size_t i = 0; i < dim; i += 16) {
+        int64_t compact = *reinterpret_cast<const int64_t*>(compact_code);
+        int64_t code0 = compact & kMask;
+        int64_t code1 = (compact >> 4) & kMask;
+        __m128i c8 = _mm_set_epi64x(code1, code0);
+        _mm512_storeu_ps(&out[i], _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(c8)));
+        compact_code += 8;
+    }
+}
+
+inline void unpack_fxu5_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    const __m128i mask = _mm_set1_epi8(0b1111);
+    const __m128i top_mask = _mm_set1_epi8(0b10000);
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i compact4_1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+        __m128i compact4_2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
+        compact_code += 32;
+        int64_t top_bit = *reinterpret_cast<const int64_t*>(compact_code);
+        compact_code += 8;
+
+        __m128i vec_00_to_15 = _mm_or_si128(
+            _mm_and_si128(compact4_1, mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit << 3, top_bit << 4), top_mask));
+        __m128i vec_16_to_31 = _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(compact4_1, 4), mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit << 1, top_bit << 2), top_mask));
+        __m128i vec_32_to_47 = _mm_or_si128(
+            _mm_and_si128(compact4_2, mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit >> 1, top_bit >> 0), top_mask));
+        __m128i vec_48_to_63 = _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(compact4_2, 4), mask),
+            _mm_and_si128(_mm_set_epi64x(top_bit >> 3, top_bit >> 2), top_mask));
+
+        _mm512_storeu_ps(&out[i],      _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_00_to_15)));
+        _mm512_storeu_ps(&out[i + 16], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_16_to_31)));
+        _mm512_storeu_ps(&out[i + 32], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_32_to_47)));
+        _mm512_storeu_ps(&out[i + 48], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63)));
+    }
+}
+
+inline void unpack_fxu6_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    constexpr int64_t kMask4 = 0x0f0f0f0f0f0f0f0f;
+    const __m128i mask2 = _mm_set1_epi8(0b00110000);
+    for (size_t i = 0; i < dim; i += 16) {
+        int64_t compact4 = *reinterpret_cast<const int64_t*>(compact_code);
+        int64_t code4_0 = compact4 & kMask4;
+        int64_t code4_1 = (compact4 >> 4) & kMask4;
+        __m128i c4 = _mm_set_epi64x(code4_1, code4_0);
+        compact_code += 8;
+
+        int32_t compact2 = *reinterpret_cast<const int32_t*>(compact_code);
+        __m128i c2 = _mm_set_epi32(compact2 >> 2, compact2, compact2 << 2, compact2 << 4);
+        c2 = _mm_and_si128(c2, mask2);
+        __m128i c6 = _mm_or_si128(c2, c4);
+        _mm512_storeu_ps(&out[i], _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(c6)));
+        compact_code += 4;
+    }
+}
+
+inline void unpack_fxu7_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    const __m128i mask6 = _mm_set1_epi8(0b00111111);
+    const __m128i mask2 = _mm_set1_epi8(0b11000000);
+    const __m128i top_mask = _mm_set1_epi8(0b1000000);
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+        __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
+        __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 32));
+        compact_code += 48;
+
+        __m128i vec_00_to_15 = _mm_and_si128(cpt1, mask6);
+        __m128i vec_16_to_31 = _mm_and_si128(cpt2, mask6);
+        __m128i vec_32_to_47 = _mm_and_si128(cpt3, mask6);
+        __m128i vec_48_to_63 = _mm_or_si128(
+            _mm_or_si128(
+                _mm_srli_epi16(_mm_and_si128(cpt1, mask2), 6),
+                _mm_srli_epi16(_mm_and_si128(cpt2, mask2), 4)),
+            _mm_srli_epi16(_mm_and_si128(cpt3, mask2), 2));
+
+        int64_t top_bit = *reinterpret_cast<const int64_t*>(compact_code);
+        compact_code += 8;
+
+        vec_00_to_15 = _mm_or_si128(vec_00_to_15,
+            _mm_and_si128(_mm_set_epi64x(top_bit << 5, top_bit << 6), top_mask));
+        vec_16_to_31 = _mm_or_si128(vec_16_to_31,
+            _mm_and_si128(_mm_set_epi64x(top_bit << 3, top_bit << 4), top_mask));
+        vec_32_to_47 = _mm_or_si128(vec_32_to_47,
+            _mm_and_si128(_mm_set_epi64x(top_bit << 1, top_bit << 2), top_mask));
+        vec_48_to_63 = _mm_or_si128(vec_48_to_63,
+            _mm_and_si128(_mm_set_epi64x(top_bit >> 1, top_bit << 0), top_mask));
+
+        _mm512_storeu_ps(&out[i],      _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_00_to_15)));
+        _mm512_storeu_ps(&out[i + 16], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_16_to_31)));
+        _mm512_storeu_ps(&out[i + 32], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_32_to_47)));
+        _mm512_storeu_ps(&out[i + 48], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vec_48_to_63)));
+    }
+}
+
+inline void unpack_fxu8_avx512(
+    const uint8_t* __restrict__ compact_code, float* __restrict__ out, size_t dim
+) {
+    for (size_t i = 0; i < dim; i += 16) {
+        __m128i c8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&compact_code[i]));
+        _mm512_storeu_ps(&out[i], _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c8)));
+    }
+}
+
+}  // namespace excode_unpackimpl
+
+// Float-float AVX-512 dot product (for use after unpacking)
+inline float dot_f32_avx512(const float* __restrict__ a, const float* __restrict__ b, size_t dim) {
+    __m512 sum = _mm512_setzero_ps();
+    for (size_t i = 0; i < dim; i += 16) {
+        sum = _mm512_fmadd_ps(_mm512_loadu_ps(&a[i]), _mm512_loadu_ps(&b[i]), sum);
+    }
+    return _mm512_reduce_add_ps(sum);
+}
+
+using ex_unpackfunc = void (*)(const uint8_t*, float*, size_t);
+
+inline ex_unpackfunc select_excode_unpackfunc(size_t ex_bits) {
+    if (ex_bits <= 1) return excode_unpackimpl::unpack_fxu1_avx512;
+    if (ex_bits == 2) return excode_unpackimpl::unpack_fxu2_avx512;
+    if (ex_bits == 3) return excode_unpackimpl::unpack_fxu3_avx512;
+    if (ex_bits == 4) return excode_unpackimpl::unpack_fxu4_avx512;
+    if (ex_bits == 5) return excode_unpackimpl::unpack_fxu5_avx512;
+    if (ex_bits == 6) return excode_unpackimpl::unpack_fxu6_avx512;
+    if (ex_bits == 7) return excode_unpackimpl::unpack_fxu7_avx512;
+    if (ex_bits == 8) return excode_unpackimpl::unpack_fxu8_avx512;
+    std::cerr << "Bad unpack function for IVF\n";
+    exit(1);
+}
+
+// Register-blocked GEMV: compute results[j] = dot(queries_flat + j*dim, decoded, dim)
+// for j in [0, n_queries).  Processes 8 queries per batch, keeping decoded chunks in
+// ZMM registers to eliminate 87% of decoded-buffer L1 loads vs individual dot products.
+inline void gemv_batch8_avx512(
+    const float* __restrict__ queries_flat,   // [n_queries * dim], row-major
+    const float* __restrict__ decoded,        // [dim], 64-byte aligned
+    float* __restrict__ results,              // [n_queries]
+    size_t n_queries,
+    size_t dim
+) {
+    size_t j = 0;
+    for (; j + 8 <= n_queries; j += 8) {
+        const float* q0 = queries_flat + (j+0) * dim;
+        const float* q1 = queries_flat + (j+1) * dim;
+        const float* q2 = queries_flat + (j+2) * dim;
+        const float* q3 = queries_flat + (j+3) * dim;
+        const float* q4 = queries_flat + (j+4) * dim;
+        const float* q5 = queries_flat + (j+5) * dim;
+        const float* q6 = queries_flat + (j+6) * dim;
+        const float* q7 = queries_flat + (j+7) * dim;
+        __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps(),
+               s2 = _mm512_setzero_ps(), s3 = _mm512_setzero_ps(),
+               s4 = _mm512_setzero_ps(), s5 = _mm512_setzero_ps(),
+               s6 = _mm512_setzero_ps(), s7 = _mm512_setzero_ps();
+        for (size_t d = 0; d < dim; d += 16) {
+            __m512 v = _mm512_load_ps(&decoded[d]);
+            s0 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q0[d]), s0);
+            s1 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q1[d]), s1);
+            s2 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q2[d]), s2);
+            s3 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q3[d]), s3);
+            s4 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q4[d]), s4);
+            s5 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q5[d]), s5);
+            s6 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q6[d]), s6);
+            s7 = _mm512_fmadd_ps(v, _mm512_loadu_ps(&q7[d]), s7);
+        }
+        results[j+0] = _mm512_reduce_add_ps(s0);
+        results[j+1] = _mm512_reduce_add_ps(s1);
+        results[j+2] = _mm512_reduce_add_ps(s2);
+        results[j+3] = _mm512_reduce_add_ps(s3);
+        results[j+4] = _mm512_reduce_add_ps(s4);
+        results[j+5] = _mm512_reduce_add_ps(s5);
+        results[j+6] = _mm512_reduce_add_ps(s6);
+        results[j+7] = _mm512_reduce_add_ps(s7);
+    }
+    for (; j < n_queries; j++) {
+        results[j] = dot_f32_avx512(queries_flat + j * dim, decoded, dim);
+    }
+}
 
 
 inline void transpose_bin(
