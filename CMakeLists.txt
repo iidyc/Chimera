@@ -23,6 +23,7 @@ add_compile_options(
 )
 
 add_compile_definitions(GPU_MVR_PROFILE)
+add_compile_definitions(GPU_MVR_TIMELINE)
 add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
 add_compile_definitions(GPU_MVR_USE_LUT)
 
