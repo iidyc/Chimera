@@ -18,6 +18,7 @@ int main() {
     }
 
     gpu_mvr_index index("2097152_4_new.index", doclens);
+    // gpu_mvr_index index("524288_4_new.index", doclens);
 
     // warmup with 5 queries to stabilize GPU performance
     for (size_t i = 0; i < 5; ++i) {

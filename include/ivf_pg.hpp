@@ -95,6 +95,8 @@ struct PG_CAGRA: PG {
         faiss::gpu::SearchParametersCagra search_params;
         // search_params.algo = faiss::gpu::search_algo::MULTI_CTA;
         search_params.itopk_size = 150;
+        // search_params.max_iterations = 15;
+        // search_params.search_width = 4;
         index_cagra->search(n_queries, d_queries, k, d_dists, d_labels, &search_params);
     }
 
@@ -157,6 +159,25 @@ struct IVF_PG {
 
     void build_index(const float* data) {
 
+    }
+
+    // Populate inv_list and cluster_pos from in-memory cluster assignments.
+    // list_nos[i] is the cluster ID for embedding i, i in [0, n_vectors).
+    void build_from_assignments(const faiss::idx_t* list_nos, size_t n_vectors) {
+        std::vector<std::vector<int>> clusters(n_clusters);
+        for (size_t i = 0; i < n_vectors; ++i) {
+            clusters[list_nos[i]].push_back(static_cast<int>(i));
+        }
+        inv_list.clear();
+        cluster_pos.clear();
+        cluster_pos.reserve(n_clusters + 1);
+        size_t cumu_size = 0;
+        for (size_t i = 0; i < n_clusters; ++i) {
+            cluster_pos.push_back(cumu_size);
+            cumu_size += clusters[i].size();
+            inv_list.insert(inv_list.end(), clusters[i].begin(), clusters[i].end());
+        }
+        cluster_pos.push_back(cumu_size);
     }
 
     void build_from_existing() {

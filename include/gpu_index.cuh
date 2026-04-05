@@ -610,11 +610,10 @@ struct gpu_mvr_index {
 #endif
         // Pre-allocate Phase C reusable CPU buffers
         ws_.running_indices.resize(ws_.max_stage2_candidates);
-        size_t prelim_per_chunk = ws_.max_stage2_k / N_OVERLAP_CHUNKS;
-        ws_.h_sel_indices.resize(prelim_per_chunk);
-        ws_.h_out_offsets.resize(prelim_per_chunk + 1);
-        ws_.ip_ex_buf.resize(prelim_per_chunk * (size_t)max_doc_len * Q_DOCLEN);
-        ws_.refined_scores.resize(prelim_per_chunk);
+        ws_.h_sel_indices.resize(ws_.max_stage2_k);
+        ws_.h_out_offsets.resize(ws_.max_stage2_k + 1);
+        ws_.ip_ex_buf.resize(ws_.max_stage2_k * (size_t)max_doc_len * Q_DOCLEN);
+        ws_.refined_scores.resize(ws_.max_stage2_k);
     }
 
     inline size_t doc_len(size_t doc_id) const {
