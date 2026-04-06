@@ -9,6 +9,8 @@
 #include <numeric>
 #include <cfloat>
 #include <limits>
+#include <random>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -48,28 +50,37 @@ inline void build_index(
     const std::string& filename)
 {
     // ------------------------------------------------------------------
-    // Step 1: Faiss GPU IVF — train centroids and assign embeddings
+    // Step 1: Randomly sample centroids and assign embeddings
     // ------------------------------------------------------------------
-    std::cout << "[build_index] Step 1: Training IVF with " << n_clusters
-              << " clusters on " << n << " vectors (d=" << d << ") ..." << std::endl;
+    std::cout << "[build_index] Step 1: Randomly sampling " << n_clusters
+              << " centroids from " << n << " vectors (d=" << d << ") ..." << std::endl;
 
+    // Randomly sample n_clusters indices without replacement
+    std::vector<size_t> indices(n);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::mt19937 rng(42);
+    std::shuffle(indices.begin(), indices.end(), rng);
+    indices.resize(n_clusters);
+
+    // Copy sampled centroids into a contiguous buffer
+    std::vector<float> centroids(n_clusters * d);
+    for (size_t i = 0; i < n_clusters; ++i) {
+        std::memcpy(&centroids[i * d], &data[indices[i] * d], d * sizeof(float));
+    }
+
+    // Add centroids to a GPU index flat for nearest-centroid assignment
     faiss::gpu::StandardGpuResources gpu_res;
     faiss::gpu::GpuIndexFlatConfig config;
     config.use_cuvs = true;
     faiss::gpu::GpuIndexFlat index(&gpu_res, d, faiss::METRIC_INNER_PRODUCT, config);
-    faiss::ClusteringParameters cp;
-    cp.niter = 10;
-    cp.verbose = true; // print out per-iteration stats
-    cp.max_points_per_centroid = 128;
-    faiss::Clustering kMeans(d, n_clusters, cp);
-    kMeans.train(n, data, index);
+    index.add(n_clusters, centroids.data());
 
     // Assign each embedding to its nearest centroid
     std::vector<float> assign_dists(n);
     std::vector<faiss::idx_t> list_nos(n);
     index.search(n, data, 1, assign_dists.data(), list_nos.data());
 
-    std::cout << "[build_index] Step 1 done. Centroids trained, embeddings assigned." << std::endl;
+    std::cout << "[build_index] Step 1 done. Centroids sampled, embeddings assigned." << std::endl;
 
     faiss::IndexFlat cpu_index(d, faiss::METRIC_INNER_PRODUCT);
     index.copyTo(&cpu_index);

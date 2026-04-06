@@ -1,0 +1,1 @@
+./gpu_build /scratch3/workspace/yanqichen_umass_edu-dataset/data_prep/msmarco/index/4194304.index /scratch3/workspace/yanqichen_umass_edu-dataset/data_prep/msmarco/msmarco_emb.bin /scratch3/workspace/yanqichen_umass_edu-dataset/data_prep/msmarco/msmarco_doclens.bin 4194304

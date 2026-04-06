@@ -16,6 +16,8 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <cub/cub.cuh>
 
+#include <oneapi/tbb.h>
+
 // Prevent Eigen from adding __host__ __device__ annotations to its functions.
 // Eigen is only used on the CPU side; without this, nvcc flags warning #20014-D
 // for Eigen internals that call host-only STL functions.
@@ -46,6 +48,8 @@
 
 using namespace rabitqlib;
 
+#ifndef GPU_MVR_CUDA_CHECK_DEFINED
+#define GPU_MVR_CUDA_CHECK_DEFINED
 #define CUDA_CHECK(call) do { \
     cudaError_t err = (call); \
     if (err != cudaSuccess) { \
@@ -53,6 +57,7 @@ using namespace rabitqlib;
         exit(EXIT_FAILURE); \
     } \
 } while(0)
+#endif
 
 // === Transfer profiling macros ===
 #ifdef GPU_MVR_PROFILE
@@ -1733,32 +1738,9 @@ struct gpu_mvr_index {
 #endif
 
             // --- CPU: compute ip_ex_bits (OVERLAPPED with GPU extract + D2H) ---
-            // Decode each token's compact ex-code once, then batch 32 dot products
-            // using register-blocked GEMV (8 queries per batch, decoded data stays
-            // in ZMM registers across queries within a batch).
-            {
-            const size_t ex_code_stride = PADDED_DIM * ex_bits / 8;
-            const float* queries_flat = ws_.h_pinned_queries;
-    #pragma omp parallel for schedule(dynamic, 4)
-            for (int i = 0; i < to_refine; i++) {
-                int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
-                size_t doc_start = doc_ptrs_[doc_id];
-                size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
-                alignas(64) float decoded[PADDED_DIM];
-                for (size_t t = 0; t < n_tok; t++) {
-                    size_t tid = doc_start + t;
-                    unpack_func_(
-                        reinterpret_cast<const uint8_t*>(&ex_code_[tid * ex_code_stride]),
-                        decoded, PADDED_DIM);
-                    if (t + 1 < n_tok)
-                        __builtin_prefetch(&ex_code_[(tid + 1) * ex_code_stride], 0, 3);
-                    rabitqlib::gemv_batch8_avx512(
-                        queries_flat, decoded,
-                        &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN],
-                        Q_DOCLEN, PADDED_DIM);
-                }
-            }
-            }
+            cpu_compute_ip_ex(
+                h_candidate_doc_ids, h_sel_indices.data(), h_out_offsets.data(),
+                to_refine, ws_.h_pinned_queries, ip_ex_buf.data());
             auto t5 = std::chrono::high_resolution_clock::now();
             time_cpu_ip_ex += std::chrono::duration<double, std::milli>(t5 - t4).count();
 #ifdef GPU_MVR_TIMELINE
@@ -1774,59 +1756,10 @@ struct gpu_mvr_index {
 #endif
 
             // --- Combine: GPU 1-bit dists + CPU ip_ex_bits → final scores ---
-            // Vectorized across Q_DOCLEN=32 queries (2 × 16-wide AVX-512).
-            // Loop order: t (tokens) outer, j (queries) inner.
-            // Precompute query_bias[j] = scale*cb1_sumq[j] - cbex_sumq[j] once,
-            // then per token: combined = (tok_scale*one_bit_dist + query_bias + ex_dist) * tok_exf
-            {
-            const float scale = static_cast<float>(1 << ex_bits);
-            // Precompute per-query bias: scale * cb1_sumq[j] - cbex_sumq[j]
-            alignas(64) float query_bias[Q_DOCLEN];
-            for (size_t j = 0; j < Q_DOCLEN; j++)
-                query_bias[j] = scale * queries[j].cb1_sumq - queries[j].cbex_sumq;
-
-    #pragma omp parallel for schedule(dynamic, 4)
-            for (int i = 0; i < to_refine; i++) {
-                int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
-                size_t doc_start = doc_ptrs_[doc_id];
-                size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
-
-                // Per-query running max, initialized to -inf
-                alignas(64) float max_ts[Q_DOCLEN];
-                __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
-                for (size_t j = 0; j < Q_DOCLEN; j += 16)
-                    _mm512_store_ps(&max_ts[j], neg_inf);
-
-                for (size_t t = 0; t < n_tok; t++) {
-                    size_t tid = doc_start + t;
-                    float tok_scale = scale / one_bit_factor_[tid];
-                    float tok_exf   = ex_factor_[tid];
-                    __m512 v_tok_scale = _mm512_set1_ps(tok_scale);
-                    __m512 v_tok_exf   = _mm512_set1_ps(tok_exf);
-
-                    const float* ob_base = &ws_.h_pinned_dists[(h_out_offsets[i] + t) * Q_DOCLEN];
-                    const float* ex_base = &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN];
-
-                    for (size_t j = 0; j < Q_DOCLEN; j += 16) {
-                        __m512 ob  = _mm512_loadu_ps(&ob_base[j]);
-                        __m512 exd = _mm512_loadu_ps(&ex_base[j]);
-                        __m512 qb  = _mm512_load_ps(&query_bias[j]);
-                        // combined = (tok_scale * ob + qb + exd) * tok_exf
-                        __m512 combined = _mm512_mul_ps(
-                            _mm512_add_ps(_mm512_fmadd_ps(v_tok_scale, ob, qb), exd),
-                            v_tok_exf);
-                        _mm512_store_ps(&max_ts[j],
-                            _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
-                    }
-                }
-
-                // Sum per-query maxes → doc_score
-                __m512 sum = _mm512_load_ps(&max_ts[0]);
-                for (size_t j = 16; j < Q_DOCLEN; j += 16)
-                    sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
-                refined_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
-            }
-            }
+            cpu_combine_scores(
+                h_candidate_doc_ids, h_sel_indices.data(), h_out_offsets.data(),
+                to_refine, queries, ws_.h_pinned_dists, ip_ex_buf.data(),
+                refined_scores.data());
 
             // Add refined results to heap
             for (int i = 0; i < to_refine; i++) {
@@ -2002,6 +1935,229 @@ struct gpu_mvr_index {
     }
 
     // ======================== STAGE 3: CPU ========================
+
+    // Compute ex-bits inner products for a batch of documents.
+    // For each doc's tokens, unpacks the compact ex-code and computes dot products
+    // against all queries via batched GEMV (AVX-512).
+    //
+    // h_sel_indices[0..to_refine): candidate indices into h_candidate_doc_ids
+    // h_out_offsets[0..to_refine]: prefix-sum of token counts per doc
+    // ip_ex_buf: output buffer indexed as [(h_out_offsets[i] + t) * Q_DOCLEN + q]
+    inline void cpu_compute_ip_ex(
+        const int* h_candidate_doc_ids,
+        const int* h_sel_indices,
+        const size_t* h_out_offsets,
+        int to_refine,
+        const float* queries_flat,
+        float* ip_ex_buf
+    ) {
+        const size_t ex_code_stride = PADDED_DIM * ex_bits / 8;
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < to_refine; i++) {
+            int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
+            size_t doc_start = doc_ptrs_[doc_id];
+            size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+            alignas(64) float decoded[PADDED_DIM];
+            for (size_t t = 0; t < n_tok; t++) {
+                size_t tid = doc_start + t;
+                unpack_func_(
+                    reinterpret_cast<const uint8_t*>(&ex_code_[tid * ex_code_stride]),
+                    decoded, PADDED_DIM);
+                if (t + 1 < n_tok)
+                    __builtin_prefetch(&ex_code_[(tid + 1) * ex_code_stride], 0, 3);
+                rabitqlib::gemv_batch8_avx512(
+                    queries_flat, decoded,
+                    &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN],
+                    Q_DOCLEN, PADDED_DIM);
+            }
+        }
+    }
+
+    // Combine GPU 1-bit dists + CPU ex-bits IPs → final doc scores.
+    // For each doc, computes per-query max-over-tokens of the combined distance,
+    // then sums across queries to get the final doc score.
+    //
+    // h_pinned_dists: GPU-extracted 1-bit dists [(h_out_offsets[i]+t)*Q_DOCLEN + q]
+    // ip_ex_buf:      CPU-computed ex-bits IPs, same layout
+    // refined_scores: output pairs (score, doc_id) for each doc
+    inline void cpu_combine_scores(
+        const int* h_candidate_doc_ids,
+        const int* h_sel_indices,
+        const size_t* h_out_offsets,
+        int to_refine,
+        const query_object* queries,
+        const float* h_pinned_dists,
+        const float* ip_ex_buf,
+        std::pair<float, int>* refined_scores
+    ) {
+        const float scale = static_cast<float>(1 << ex_bits);
+        // Precompute per-query bias: scale * cb1_sumq[j] - cbex_sumq[j]
+        alignas(64) float query_bias[Q_DOCLEN];
+        for (size_t j = 0; j < Q_DOCLEN; j++)
+            query_bias[j] = scale * queries[j].cb1_sumq - queries[j].cbex_sumq;
+
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < to_refine; i++) {
+            int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
+            size_t doc_start = doc_ptrs_[doc_id];
+            size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+
+            // Per-query running max, initialized to -inf
+            alignas(64) float max_ts[Q_DOCLEN];
+            __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+            for (size_t j = 0; j < Q_DOCLEN; j += 16)
+                _mm512_store_ps(&max_ts[j], neg_inf);
+
+            for (size_t t = 0; t < n_tok; t++) {
+                size_t tid = doc_start + t;
+                float tok_scale = scale / one_bit_factor_[tid];
+                float tok_exf   = ex_factor_[tid];
+                __m512 v_tok_scale = _mm512_set1_ps(tok_scale);
+                __m512 v_tok_exf   = _mm512_set1_ps(tok_exf);
+
+                const float* ob_base = &h_pinned_dists[(h_out_offsets[i] + t) * Q_DOCLEN];
+                const float* ex_base = &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN];
+
+                for (size_t j = 0; j < Q_DOCLEN; j += 16) {
+                    __m512 ob  = _mm512_loadu_ps(&ob_base[j]);
+                    __m512 exd = _mm512_loadu_ps(&ex_base[j]);
+                    __m512 qb  = _mm512_load_ps(&query_bias[j]);
+                    // combined = (tok_scale * ob + qb + exd) * tok_exf
+                    __m512 combined = _mm512_mul_ps(
+                        _mm512_add_ps(_mm512_fmadd_ps(v_tok_scale, ob, qb), exd),
+                        v_tok_exf);
+                    _mm512_store_ps(&max_ts[j],
+                        _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
+                }
+            }
+
+            // Sum per-query maxes → doc_score
+            __m512 sum = _mm512_load_ps(&max_ts[0]);
+            for (size_t j = 16; j < Q_DOCLEN; j += 16)
+                sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
+            refined_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
+        }
+    }
+
+    inline void cpu_compute_ip_ex_tbb(
+        const int* h_candidate_doc_ids,
+        const int* h_sel_indices,
+        const size_t* h_out_offsets,
+        int to_refine,
+        const float* queries_flat,
+        float* ip_ex_buf
+    ) {
+        const size_t ex_code_stride = PADDED_DIM * ex_bits / 8;
+
+        // Grain sizes: tune these!
+        const int GRAIN_I = 1;     // small because to_refine is small
+        const int GRAIN_T = 32;    // key: creates enough parallelism
+
+        oneapi::tbb::parallel_for(
+            oneapi::tbb::blocked_range2d<int, int>(
+                0, to_refine, GRAIN_I,
+                0, max_doc_len, GRAIN_T
+            ),
+            [&](const oneapi::tbb::blocked_range2d<int, int>& r) {
+
+                for (int i = r.rows().begin(); i < r.rows().end(); ++i) {
+
+                    int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
+                    size_t doc_start = doc_ptrs_[doc_id];
+                    size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+
+                    // clamp token range per doc
+                    int t_begin = std::min<int>(r.cols().begin(), n_tok);
+                    int t_end   = std::min<int>(r.cols().end(),   n_tok);
+
+                    alignas(64) float decoded[PADDED_DIM];
+
+                    for (int t = t_begin; t < t_end; ++t) {
+                        size_t tid = doc_start + t;
+
+                        unpack_func_(
+                            reinterpret_cast<const uint8_t*>(&ex_code_[tid * ex_code_stride]),
+                            decoded, PADDED_DIM);
+
+                        if (t + 1 < n_tok)
+                            __builtin_prefetch(&ex_code_[(tid + 1) * ex_code_stride], 0, 3);
+
+                        rabitqlib::gemv_batch8_avx512(
+                            queries_flat,
+                            decoded,
+                            &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN],
+                            Q_DOCLEN,
+                            PADDED_DIM);
+                    }
+                }
+            }
+        );
+    }
+
+    inline void cpu_combine_scores_tbb(
+        const int* h_candidate_doc_ids,
+        const int* h_sel_indices,
+        const size_t* h_out_offsets,
+        int to_refine,
+        const query_object* queries,
+        const float* h_pinned_dists,
+        const float* ip_ex_buf,
+        std::pair<float, int>* refined_scores
+    ) {
+        const float scale = static_cast<float>(1 << ex_bits);
+
+        alignas(64) float query_bias[Q_DOCLEN];
+        for (size_t j = 0; j < Q_DOCLEN; j++)
+            query_bias[j] = scale * queries[j].cb1_sumq - queries[j].cbex_sumq;
+
+        const int GRAIN_I = 1;
+        const int GRAIN_T = 32;
+
+        oneapi::tbb::parallel_for(0, to_refine, GRAIN_I, [&](int i) {
+
+            int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
+            size_t doc_start = doc_ptrs_[doc_id];
+            size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+
+            alignas(64) float max_ts[Q_DOCLEN];
+
+            __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+            for (size_t j = 0; j < Q_DOCLEN; j += 16)
+                _mm512_store_ps(&max_ts[j], neg_inf);
+
+            for (size_t t = 0; t < n_tok; t++) {
+                size_t tid = doc_start + t;
+
+                float tok_scale = scale / one_bit_factor_[tid];
+                float tok_exf   = ex_factor_[tid];
+
+                __m512 v_tok_scale = _mm512_set1_ps(tok_scale);
+                __m512 v_tok_exf   = _mm512_set1_ps(tok_exf);
+
+                const float* ob_base = &h_pinned_dists[(h_out_offsets[i] + t) * Q_DOCLEN];
+                const float* ex_base = &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN];
+
+                for (size_t j = 0; j < Q_DOCLEN; j += 16) {
+                    __m512 ob  = _mm512_loadu_ps(&ob_base[j]);
+                    __m512 exd = _mm512_loadu_ps(&ex_base[j]);
+                    __m512 qb  = _mm512_load_ps(&query_bias[j]);
+
+                    __m512 combined = _mm512_mul_ps(
+                        _mm512_add_ps(_mm512_fmadd_ps(v_tok_scale, ob, qb), exd),
+                        v_tok_exf);
+
+                    _mm512_store_ps(&max_ts[j],
+                        _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
+                }
+            }
+
+            __m512 sum = _mm512_load_ps(&max_ts[0]);
+            for (size_t j = 16; j < Q_DOCLEN; j += 16)
+                sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
+
+            refined_scores[i] = {_mm512_reduce_add_ps(sum), doc_id};
+        });
+    }
 
     inline void rank_all_tokens_exbits_cpu(
         query_object* queries,
