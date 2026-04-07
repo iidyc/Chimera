@@ -421,6 +421,51 @@ __global__ void extract_one_bit_dists_kernel(
     }
 }
 
+// V2: write directly to pinned host memory with a single block of 128 threads
+// to avoid overloading the PCIe 3.0 controller with too many concurrent writers.
+// Uses float4 vectorized stores (128-bit) to reduce PCIe transaction count by 4x.
+// Writes are contiguous (token-major output), reads are strided (query-major input).
+__global__ void extract_one_bit_dists_kernel_v2(
+    const float*  __restrict__ d_token_dists,
+    const size_t* __restrict__ d_candidate_offsets,
+    const int*    __restrict__ d_selected_indices,
+    float*        h_pinned_out,                    // pinned host memory (device-mapped)
+    const size_t* __restrict__ d_out_offsets,
+    size_t total_tokens,
+    size_t k
+) {
+    // Q_DOCLEN is 32, divisible by 4 → each token produces exactly 8 float4 writes
+    constexpr size_t VEC_SIZE = 4;
+    constexpr size_t Q_DOCLEN_VEC = Q_DOCLEN / VEC_SIZE;  // 8
+
+    for (size_t sel_idx = 0; sel_idx < k; ++sel_idx) {
+        size_t cand_idx = d_selected_indices[sel_idx];
+        size_t tok_start = d_candidate_offsets[cand_idx];
+        size_t tok_end = d_candidate_offsets[cand_idx + 1];
+        size_t num_tokens = tok_end - tok_start;
+        size_t out_base = d_out_offsets[sel_idx];
+        // Total float4 elements: num_tokens * (Q_DOCLEN / 4)
+        size_t total_vec_elems = num_tokens * Q_DOCLEN_VEC;
+
+        for (size_t vi = threadIdx.x; vi < total_vec_elems; vi += blockDim.x) {
+            size_t t_local = vi / Q_DOCLEN_VEC;
+            size_t vec_idx = vi - t_local * Q_DOCLEN_VEC;
+            size_t q_base = vec_idx * VEC_SIZE;
+
+            // Gather 4 strided reads from [query][token] layout
+            float4 packed;
+            packed.x = d_token_dists[(q_base + 0) * total_tokens + tok_start + t_local];
+            packed.y = d_token_dists[(q_base + 1) * total_tokens + tok_start + t_local];
+            packed.z = d_token_dists[(q_base + 2) * total_tokens + tok_start + t_local];
+            packed.w = d_token_dists[(q_base + 3) * total_tokens + tok_start + t_local];
+
+            // Single 128-bit contiguous store to [token][query] layout
+            float4* out_ptr = (float4*)(h_pinned_out + (out_base + t_local) * Q_DOCLEN + q_base);
+            *out_ptr = packed;
+        }
+    }
+}
+
 __global__ void gather_token_ids_kernel(
     const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,

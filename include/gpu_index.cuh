@@ -171,6 +171,7 @@ struct gpu_mvr_index {
         float*  h_pinned_queries;
         float*  h_pinned_cb1_sumq;
         float*  h_pinned_dists;
+        float*  d_pinned_dists;              // device-mapped pointer for GPU direct write
         float*  h_pinned_batch_scores;       // [max_stage2_candidates] batch D2H
 
         size_t max_q_doclen;
@@ -507,7 +508,8 @@ struct gpu_mvr_index {
         // Pinned host memory
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_cb1_sumq, Q_DOCLEN * sizeof(float)));
-        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_dists, ws_.max_stage2_k_tokens * Q_DOCLEN * sizeof(float)));
+        CUDA_CHECK(cudaHostAlloc(&ws_.h_pinned_dists, ws_.max_stage2_k_tokens * Q_DOCLEN * sizeof(float), cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostGetDevicePointer(&ws_.d_pinned_dists, ws_.h_pinned_dists, 0));
 #ifndef GPU_MVR_OVERLAP_STAGE23
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_batch_scores, ws_.max_stage2_candidates * sizeof(float)));
 #endif
@@ -1050,288 +1052,6 @@ struct gpu_mvr_index {
 
     }
 
-    // ======================== STAGE 2: GPU ========================
-
-    inline void rank_all_tokens_1bit_gpu(
-        int num_candidates,  // from Stage 1
-        size_t k,
-        std::vector<size_t>& output_ids,
-        std::vector<float>& one_bit_dists,
-        cudaStream_t stream = 0
-    ) {
-        if (num_candidates == 0) return;
-
-#ifdef GPU_MVR_PROFILE
-        float s2_gather_ms, s2_prefix_ms, s2_tokenids_ms, s2_binaryip_ms;
-        float s2_docscore_ms, s2_topk_ms, s2_d2h_offsets_ms, s2_extract_ms, s2_d2h_dists_ms;
-#endif
-
-        // === NEW: Compute offsets on GPU ===
-        // 1. Gather document lengths
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_gather_start, stream));
-#endif
-        int threads = 256;
-        int blocks = (num_candidates + threads - 1) / threads;
-
-        gather_doc_lengths_kernel<<<blocks, threads, 0, stream>>>(
-            ws_.d_topk_doc_ids, d_doc_ptrs_,
-            ws_.d_pair_doc_ids,  // reuse as doc_lengths buffer
-            num_candidates
-        );
-        CUDA_CHECK(cudaGetLastError());
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_gather_end, stream));
-#endif
-
-        // 2. Compute prefix sum to get candidate_offsets (int lengths → size_t offsets)
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_prefix_start, stream));
-#endif
-        // size_t zero_val = 0;
-        // CUDA_CHECK(cudaMemcpyAsync(ws_.d_candidate_offsets, &zero_val, sizeof(size_t),
-        //                            cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemsetAsync(ws_.d_candidate_offsets, 0, sizeof(size_t), stream));
-        {
-            thrust::device_ptr<int> len_ptr(ws_.d_pair_doc_ids);
-            auto xform_iter = thrust::make_transform_iterator(len_ptr, cast_int_size_t());
-            size_t scan_temp = ws_.cub_temp_storage_bytes;
-            cub::DeviceScan::InclusiveScan(
-                ws_.d_cub_temp_storage, scan_temp,
-                xform_iter, ws_.d_candidate_offsets + 1,
-                thrust::plus<size_t>(), num_candidates, stream);
-        }
-
-        // Get total tokens
-        size_t total_tokens;
-        XFER_RECORD_BEGIN(stream);
-        CUDA_CHECK(cudaMemcpyAsync(&total_tokens, ws_.d_candidate_offsets + num_candidates,
-                                   sizeof(size_t), cudaMemcpyDeviceToHost, stream));
-        XFER_RECORD_END(stream, sizeof(size_t), false);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_prefix_end, stream));
-#endif
-
-        // 3. Build token IDs on GPU
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_tokenids_start, stream));
-#endif
-        gather_token_ids_kernel<<<num_candidates, 256, 0, stream>>>(
-            ws_.d_topk_doc_ids,
-            d_doc_ptrs_,
-            ws_.d_candidate_offsets,
-            ws_.d_token_ids,
-            num_candidates
-        );
-        CUDA_CHECK(cudaGetLastError());
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_tokenids_end, stream));
-#endif
-
-        // 4. Compute all (query, token) 1-bit distances — multi-query fused kernel
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_binaryip_start, stream));
-#endif
-        int threads_per_block = 256;
-        int blocks_x = (total_tokens + threads_per_block - 1) / threads_per_block;
-
-#ifdef GPU_MVR_USE_LUT
-        {
-            size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
-            stage2_binary_ip_lut_kernel<<<blocks_x, threads_per_block, stage2_lut_smem, stream>>>(
-                ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
-                ws_.d_token_ids, ws_.d_token_dists,
-                total_tokens, total_tokens
-            );
-        }
-#else
-        stage2_binary_ip_kernel_v2<<<blocks_x, threads_per_block, 0, stream>>>(
-            ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
-            ws_.d_token_ids, ws_.d_token_dists,
-            total_tokens, total_tokens
-        );
-#endif
-        CUDA_CHECK(cudaGetLastError());
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_binaryip_end, stream));
-#endif
-
-        // 5. Compute doc scores with shared-memory reduction
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_docscore_start, stream));
-#endif
-        int score_threads = 128;
-        while (score_threads < Q_DOCLEN && score_threads < 256) score_threads *= 2;
-        score_threads = std::min(score_threads, 256);
-
-        doc_score_kernel<<<num_candidates, score_threads, 0, stream>>>(
-            ws_.d_token_dists, ws_.d_candidate_offsets, ws_.d_doc_scores,
-            total_tokens, num_candidates
-        );
-        CUDA_CHECK(cudaGetLastError());
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_docscore_end, stream));
-#endif
-
-        // 6. Top-k via CUB sort (descending)
-#ifdef GPU_MVR_PROFILE
-        cudaEvent_t s2_topk_start, s2_topk_end;
-        CUDA_CHECK(cudaEventCreate(&s2_topk_start));
-        CUDA_CHECK(cudaEventCreate(&s2_topk_end));
-        CUDA_CHECK(cudaEventRecord(s2_topk_start, stream));
-#endif
-        thrust::device_ptr<int> indices_ptr(ws_.d_selected_indices);
-        thrust::sequence(thrust::cuda::par.on(stream),
-                        indices_ptr, indices_ptr + num_candidates);
-
-        cub::DeviceRadixSort::SortPairsDescending(
-            ws_.d_cub_temp_storage, ws_.cub_temp_storage_bytes,
-            ws_.d_doc_scores, ws_.d_topk_scores,  // reuse topk buffers
-            ws_.d_selected_indices, ws_.d_topk_indices,
-            num_candidates, 0, 32, stream
-        );
-        CUDA_CHECK(cudaGetLastError());
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(s2_topk_end, stream));
-#endif
-
-        size_t actual_k = std::min(k, (size_t)num_candidates);
-
-        // 7. Build output offsets for selected docs (using CPU for small arrays)
-        // Copy top-k indices and candidate offsets together, sync once
-#ifdef GPU_MVR_PROFILE
-        cudaEvent_t s2_d2h_offsets_start, s2_d2h_offsets_end;
-        CUDA_CHECK(cudaEventCreate(&s2_d2h_offsets_start));
-        CUDA_CHECK(cudaEventCreate(&s2_d2h_offsets_end));
-        CUDA_CHECK(cudaEventRecord(s2_d2h_offsets_start, stream));
-#endif
-        std::vector<int> h_top_k_indices(actual_k);
-        std::vector<size_t> candidate_offsets_cpu(num_candidates + 1);
-        XFER_RECORD_BEGIN(stream);
-        CUDA_CHECK(cudaMemcpyAsync(h_top_k_indices.data(), ws_.d_topk_indices,
-                                   actual_k * sizeof(int), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(candidate_offsets_cpu.data(), ws_.d_candidate_offsets,
-                             (num_candidates + 1) * sizeof(size_t),
-                             cudaMemcpyDeviceToHost, stream));
-        XFER_RECORD_END(stream, actual_k * sizeof(int) + (num_candidates + 1) * sizeof(size_t), false);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(s2_d2h_offsets_end, stream));
-#endif
-
-        std::vector<size_t> out_offsets(actual_k + 1, 0);
-        for (size_t i = 0; i < actual_k; ++i) {
-            size_t cand_idx = h_top_k_indices[i];
-            out_offsets[i + 1] = out_offsets[i] +
-                (candidate_offsets_cpu[cand_idx + 1] - candidate_offsets_cpu[cand_idx]);
-        }
-        size_t total_selected_tokens = out_offsets[actual_k];
-
-        // Upload selection metadata to GPU
-        XFER_RECORD_BEGIN(stream);
-        CUDA_CHECK(cudaMemcpyAsync(ws_.d_selected_indices, h_top_k_indices.data(),
-                                   actual_k * sizeof(int), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(ws_.d_out_offsets, out_offsets.data(),
-                                   (actual_k + 1) * sizeof(size_t), cudaMemcpyHostToDevice, stream));
-        XFER_RECORD_END(stream, actual_k * sizeof(int) + (actual_k + 1) * sizeof(size_t), true);
-
-        // 8. Extract on GPU
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_extract_start, stream));
-#endif
-        extract_one_bit_dists_kernel<<<actual_k, 256, 0, stream>>>(
-            ws_.d_token_dists, ws_.d_candidate_offsets,
-            ws_.d_selected_indices, ws_.d_out_one_bit_dists,
-            ws_.d_out_offsets, total_tokens, actual_k
-        );
-        CUDA_CHECK(cudaGetLastError());
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(ws_.s2_extract_end, stream));
-#endif
-
-        // 9. Copy only selected dists to pinned host memory
-#ifdef GPU_MVR_PROFILE
-        cudaEvent_t s2_d2h_dists_start, s2_d2h_dists_end;
-        CUDA_CHECK(cudaEventCreate(&s2_d2h_dists_start));
-        CUDA_CHECK(cudaEventCreate(&s2_d2h_dists_end));
-        CUDA_CHECK(cudaEventRecord(s2_d2h_dists_start, stream));
-#endif
-        size_t copy_size = total_selected_tokens * Q_DOCLEN;
-        XFER_RECORD_BEGIN(stream);
-        CUDA_CHECK(cudaMemcpyAsync(ws_.h_pinned_dists, ws_.d_out_one_bit_dists,
-                                   copy_size * sizeof(float), cudaMemcpyDeviceToHost, stream));
-
-        // Also get the top-k doc IDs (need to gather from original candidates)
-        auto* h_candidate_doc_ids = ws_.h_pinned_pst_candidate_doc_ids;
-        CUDA_CHECK(cudaMemcpyAsync(h_candidate_doc_ids, ws_.d_topk_doc_ids,
-                             num_candidates * sizeof(int),
-                             cudaMemcpyDeviceToHost, stream));
-        XFER_RECORD_END(stream, copy_size * sizeof(float) + num_candidates * sizeof(int), false);
-
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-#ifdef GPU_MVR_PROFILE
-        CUDA_CHECK(cudaEventRecord(s2_d2h_dists_end, stream));
-        auto build_output_begin = std::chrono::high_resolution_clock::now();
-#endif
-
-        // Build output
-        output_ids.resize(actual_k);
-        // one_bit_dists.resize(copy_size);
-
-        for (size_t i = 0; i < actual_k; ++i) {
-            output_ids[i] = h_candidate_doc_ids[h_top_k_indices[i]];
-        }
-        // memcpy(one_bit_dists.data(), ws_.h_pinned_dists, copy_size * sizeof(float));
-
-#ifdef GPU_MVR_PROFILE
-        auto build_output_end = std::chrono::high_resolution_clock::now();
-        float build_output_time = std::chrono::duration<float, std::milli>(
-            build_output_end - build_output_begin).count();
-
-        // Compute elapsed times
-        CUDA_CHECK(cudaEventElapsedTime(&s2_gather_ms, ws_.s2_gather_start, ws_.s2_gather_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_prefix_ms, ws_.s2_prefix_start, ws_.s2_prefix_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_tokenids_ms, ws_.s2_tokenids_start, ws_.s2_tokenids_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_binaryip_ms, ws_.s2_binaryip_start, ws_.s2_binaryip_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_docscore_ms, ws_.s2_docscore_start, ws_.s2_docscore_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_topk_ms, s2_topk_start, s2_topk_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_d2h_offsets_ms, s2_d2h_offsets_start, s2_d2h_offsets_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_extract_ms, ws_.s2_extract_start, ws_.s2_extract_end));
-        CUDA_CHECK(cudaEventElapsedTime(&s2_d2h_dists_ms, s2_d2h_dists_start, s2_d2h_dists_end));
-
-        // Print detailed breakdown
-        std::cout << "[PROFILE] Stage 2 non-batched breakdown (" << num_candidates << " candidates, "
-                  << total_tokens << " tokens, k=" << actual_k << "):\n";
-        std::cout << "[PROFILE]   1. Gather doc lengths      : " << s2_gather_ms << " ms\n";
-        std::cout << "[PROFILE]   2. Prefix sum              : " << s2_prefix_ms << " ms\n";
-        std::cout << "[PROFILE]   3. Gather token IDs        : " << s2_tokenids_ms << " ms\n";
-        std::cout << "[PROFILE]   4. 1-bit binary IP         : " << s2_binaryip_ms << " ms\n";
-        std::cout << "[PROFILE]   5. Doc scoring             : " << s2_docscore_ms << " ms\n";
-        std::cout << "[PROFILE]   6. Top-k sort              : " << s2_topk_ms << " ms\n";
-        std::cout << "[PROFILE]   7. D2H offsets + indices   : " << s2_d2h_offsets_ms << " ms\n";
-        std::cout << "[PROFILE]   8. Extract kernel          : " << s2_extract_ms << " ms\n";
-        std::cout << "[PROFILE]   9. D2H final dists + IDs   : " << s2_d2h_dists_ms << " ms\n";
-        std::cout << "[PROFILE]   10. Build output on CPU    : " << build_output_time << " ms\n";
-        float s2_total = s2_gather_ms + s2_prefix_ms + s2_tokenids_ms + s2_binaryip_ms +
-                         s2_docscore_ms + s2_topk_ms + s2_d2h_offsets_ms + s2_extract_ms + s2_d2h_dists_ms + build_output_time;
-        std::cout << "[PROFILE]   Sum accounted              : " << s2_total << " ms\n";
-
-        // Cleanup temporary events
-        CUDA_CHECK(cudaEventDestroy(s2_topk_start));
-        CUDA_CHECK(cudaEventDestroy(s2_topk_end));
-        CUDA_CHECK(cudaEventDestroy(s2_d2h_offsets_start));
-        CUDA_CHECK(cudaEventDestroy(s2_d2h_offsets_end));
-        CUDA_CHECK(cudaEventDestroy(s2_d2h_dists_start));
-        CUDA_CHECK(cudaEventDestroy(s2_d2h_dists_end));
-#endif
-
-        for (auto doc_id : output_ids) {
-            __builtin_prefetch(&doc_ptrs_[doc_id]);
-            __builtin_prefetch(&ex_code_[doc_ptrs_[doc_id] * PADDED_DIM * ex_bits / 8]);
-        }
-    }
-
     static constexpr int N_OVERLAP_CHUNKS = 4;   // Number of GPU scoring chunks
     int PRELIM_PER_CHUNK = k_rank_all_tokens / N_OVERLAP_CHUNKS;  // Max docs to CPU-refine per chunk
 
@@ -1376,7 +1096,7 @@ struct gpu_mvr_index {
         // Phase C stream_d2h events (per-chunk)
         cudaEvent_t tl_c_wait_ev[N_OVERLAP_CHUNKS], tl_c_scores_s[N_OVERLAP_CHUNKS];
         cudaEvent_t tl_c_scores_e[N_OVERLAP_CHUNKS];
-        cudaEvent_t tl_c_extract_s[N_OVERLAP_CHUNKS], tl_c_extract_e[N_OVERLAP_CHUNKS];
+        cudaEvent_t tl_c_extract_s[N_OVERLAP_CHUNKS], tl_c_extract_m[N_OVERLAP_CHUNKS], tl_c_extract_e[N_OVERLAP_CHUNKS];
         bool tl_c_has_extract[N_OVERLAP_CHUNKS] = {};
         bool tl_c_has_scores[N_OVERLAP_CHUNKS] = {};
         for (int c = 0; c < N_OVERLAP_CHUNKS; c++) {
@@ -1384,6 +1104,7 @@ struct gpu_mvr_index {
             CUDA_CHECK(cudaEventCreate(&tl_c_scores_s[c]));
             CUDA_CHECK(cudaEventCreate(&tl_c_scores_e[c]));
             CUDA_CHECK(cudaEventCreate(&tl_c_extract_s[c]));
+            CUDA_CHECK(cudaEventCreate(&tl_c_extract_m[c]));
             CUDA_CHECK(cudaEventCreate(&tl_c_extract_e[c]));
         }
 #endif
@@ -1722,12 +1443,21 @@ struct gpu_mvr_index {
                 ws_.d_out_offsets, total_tokens, (size_t)to_refine
             );
             CUDA_CHECK(cudaGetLastError());
+#ifdef GPU_MVR_TIMELINE
+            CUDA_CHECK(cudaEventRecord(tl_c_extract_m[c], stream_d2h));
+#endif
             // D2H extracted dists (contiguous, async — pinned target)
             XFER_RECORD_BEGIN(stream_d2h);
             CUDA_CHECK(cudaMemcpyAsync(ws_.h_pinned_dists, ws_.d_out_one_bit_dists,
                                         total_sel_tokens * Q_DOCLEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, stream_d2h));
             XFER_RECORD_END(stream_d2h, total_sel_tokens * Q_DOCLEN * sizeof(float), false);
+            // extract_one_bit_dists_kernel_v2<<<1, 384, 0, stream_d2h>>>(
+            //     ws_.d_token_dists, ws_.d_pst_candidate_offsets,
+            //     ws_.d_selected_indices, ws_.d_pinned_dists,
+            //     ws_.d_out_offsets, total_tokens, (size_t)to_refine
+            // );
+            // CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_TIMELINE
             CUDA_CHECK(cudaEventRecord(tl_c_extract_e[c], stream_d2h));
 #endif
@@ -1842,8 +1572,10 @@ struct gpu_mvr_index {
                         "d2h_scores_c" + std::to_string(c), "condition"});
                 }
                 if (tl_c_has_extract[c]) {
-                    tl_gpu_d2h.push_back({tl_gpu_us(tl_c_extract_s[c]), tl_gpu_us(tl_c_extract_e[c]),
-                        "extract_c" + std::to_string(c), "module"});
+                    tl_gpu_d2h.push_back({tl_gpu_us(tl_c_extract_s[c]), tl_gpu_us(tl_c_extract_m[c]),
+                        "extract_kernel_c" + std::to_string(c), "module"});
+                    tl_gpu_d2h.push_back({tl_gpu_us(tl_c_extract_m[c]), tl_gpu_us(tl_c_extract_e[c]),
+                        "extract_d2h_c" + std::to_string(c), "condition"});
                 }
             }
 
@@ -1901,6 +1633,7 @@ struct gpu_mvr_index {
                 CUDA_CHECK(cudaEventDestroy(tl_c_scores_s[c]));
                 CUDA_CHECK(cudaEventDestroy(tl_c_scores_e[c]));
                 CUDA_CHECK(cudaEventDestroy(tl_c_extract_s[c]));
+                CUDA_CHECK(cudaEventDestroy(tl_c_extract_m[c]));
                 CUDA_CHECK(cudaEventDestroy(tl_c_extract_e[c]));
             }
         }
@@ -2159,52 +1892,6 @@ struct gpu_mvr_index {
         });
     }
 
-    inline void rank_all_tokens_exbits_cpu(
-        query_object* queries,
-        std::vector<size_t>& input_ids,
-        std::vector<float>& one_bit_dists,
-        size_t k,
-        std::vector<size_t>& output_ids
-    ) {
-        std::vector<size_t> candidate_doc_ptrs(input_ids.size() + 1);
-        size_t total_tokens = 0;
-        for (size_t i = 0; i < input_ids.size(); ++i) {
-            total_tokens += doc_len(input_ids[i]);
-            candidate_doc_ptrs[i + 1] = total_tokens;
-        }
-        std::priority_queue<std::pair<float, size_t>> max_heap;
-#pragma omp parallel for
-        for (size_t idx = 0; idx < input_ids.size(); ++idx) {
-            size_t doc_id = input_ids[idx];
-            float doc_score = 0.0F;
-            for (size_t j = 0; j < Q_DOCLEN; ++j) {
-                float max_token_score = -std::numeric_limits<float>::infinity();
-                for (size_t i = 0; i < doc_len(doc_id); ++i) {
-                    size_t tid = doc_ptrs_[doc_id] + i;
-                    float dist = distance_ex_bits(
-                        queries + j,
-                        &ex_code_[tid * PADDED_DIM * ex_bits / 8],
-                        ex_bits,
-                        ip_func_,
-                        // one_bit_dists[(candidate_doc_ptrs[idx] + i) * Q_DOCLEN + j],
-                        ws_.h_pinned_dists[(candidate_doc_ptrs[idx] + i) * Q_DOCLEN + j],
-                        one_bit_factor_[tid],
-                        ex_factor_[tid],
-                        PADDED_DIM
-                    );
-                    max_token_score = std::max(max_token_score, dist);
-                }
-                doc_score += max_token_score;
-            }
-#pragma omp critical
-            max_heap.emplace(doc_score, doc_id);
-        }
-        for (size_t i = 0; i < k && !max_heap.empty(); ++i) {
-            output_ids.push_back(max_heap.top().second);
-            max_heap.pop();
-        }
-    }
-
     ~gpu_mvr_index() {
         // Free persistent GPU data
         CUDA_CHECK(cudaFree(d_one_bit_code_));
@@ -2256,7 +1943,7 @@ struct gpu_mvr_index {
         // Free pinned memory
         CUDA_CHECK(cudaFreeHost(ws_.h_pinned_queries));
         CUDA_CHECK(cudaFreeHost(ws_.h_pinned_cb1_sumq));
-        CUDA_CHECK(cudaFreeHost(ws_.h_pinned_dists));
+        CUDA_CHECK(cudaFreeHost(ws_.h_pinned_dists));  // also frees the mapped device pointer
 #ifndef GPU_MVR_OVERLAP_STAGE23
         CUDA_CHECK(cudaFreeHost(ws_.h_pinned_batch_scores));
 #endif
