@@ -29,14 +29,15 @@
 #include "gpu_config.cuh"
 
 
-#include <faiss/gpu/GpuIndexFlat.h>
-#include <faiss/IndexFlat.h>
+#include <cuvs/neighbors/brute_force.hpp>
+#include <raft/core/device_mdspan.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
 
 // ---------------------------------------------------------------------------
 // GPU-accelerated index build pipeline
 // ---------------------------------------------------------------------------
-// 1. Train faiss GPU IVF to get centroids + per-embedding cluster assignments
-// 2. Build faiss GPU CAGRA graph on the centroids
+// 1. Randomly sample centroids + GPU brute-force nearest-centroid assignment
+// 2. Build cuvs CAGRA graph on the centroids
 // 3. Quantize data (1-bit + extra-bits via RaBitQ)
 // 4. Assemble IVF_PG and serialize everything to disk
 // ---------------------------------------------------------------------------
@@ -68,22 +69,51 @@ inline void build_index(
         std::memcpy(&centroids[i * d], &data[indices[i] * d], d * sizeof(float));
     }
 
-    // Add centroids to a GPU index flat for nearest-centroid assignment
-    faiss::gpu::StandardGpuResources gpu_res;
-    faiss::gpu::GpuIndexFlatConfig config;
-    config.use_cuvs = true;
-    faiss::gpu::GpuIndexFlat index(&gpu_res, d, faiss::METRIC_INNER_PRODUCT, config);
-    index.add(n_clusters, centroids.data());
+    // GPU brute-force nearest-centroid assignment using cuvs
+    raft::resources res;
+    auto cuda_stream = raft::resource::get_cuda_stream(res);
 
-    // Assign each embedding to its nearest centroid
-    std::vector<float> assign_dists(n);
-    std::vector<faiss::idx_t> list_nos(n);
-    index.search(n, data, 1, assign_dists.data(), list_nos.data());
+    float* d_centroids_ptr;
+    cudaMalloc(&d_centroids_ptr, n_clusters * d * sizeof(float));
+    cudaMemcpy(d_centroids_ptr, centroids.data(), n_clusters * d * sizeof(float), cudaMemcpyHostToDevice);
+
+    auto bf_index = cuvs::neighbors::brute_force::build(
+        res,
+        raft::make_device_matrix_view<const float>(d_centroids_ptr, (int64_t)n_clusters, (int64_t)d),
+        cuvs::distance::DistanceType::InnerProduct
+    );
+
+    // Assign each embedding to its nearest centroid (batched)
+    std::vector<int64_t> list_nos(n);
+    constexpr size_t assign_batch = 65536;
+    float* d_q_ptr;
+    int64_t* d_lab_ptr;
+    float* d_dist_ptr;
+    cudaMalloc(&d_q_ptr, assign_batch * d * sizeof(float));
+    cudaMalloc(&d_lab_ptr, assign_batch * sizeof(int64_t));
+    cudaMalloc(&d_dist_ptr, assign_batch * sizeof(float));
+
+    for (size_t start = 0; start < n; start += assign_batch) {
+        int64_t cur = std::min(assign_batch, n - start);
+        cudaMemcpy(d_q_ptr, data + start * d, cur * d * sizeof(float), cudaMemcpyHostToDevice);
+
+        cuvs::neighbors::brute_force::search(
+            res, bf_index,
+            raft::make_device_matrix_view<const float>(d_q_ptr, cur, (int64_t)d),
+            raft::make_device_matrix_view<int64_t>(d_lab_ptr, cur, (int64_t)1),
+            raft::make_device_matrix_view<float>(d_dist_ptr, cur, (int64_t)1)
+        );
+
+        cudaMemcpy(list_nos.data() + start, d_lab_ptr, cur * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    }
+    raft::resource::sync_stream(res);
+
+    cudaFree(d_q_ptr);
+    cudaFree(d_lab_ptr);
+    cudaFree(d_dist_ptr);
+    cudaFree(d_centroids_ptr);
 
     std::cout << "[build_index] Step 1 done. Centroids sampled, embeddings assigned." << std::endl;
-
-    faiss::IndexFlat cpu_index(d, faiss::METRIC_INNER_PRODUCT);
-    index.copyTo(&cpu_index);
 
     // Load rotator early — needed for centroid rotation (Step 2) and quantization (Step 4)
     Rotator<float>* rotator = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);
@@ -102,10 +132,9 @@ inline void build_index(
     std::cout << "[build_index] Step 2: Rotating centroids and building CAGRA graph on "
               << n_clusters << " centroids ..." << std::endl;
 
-    const float* raw_centroids = cpu_index.get_xb();
     std::vector<float> rotated_centroids(n_clusters * PADDED_DIM);
     for (size_t i = 0; i < n_clusters; ++i) {
-        rotator->rotate(&raw_centroids[i * d], &rotated_centroids[i * PADDED_DIM]);
+        rotator->rotate(&centroids[i * d], &rotated_centroids[i * PADDED_DIM]);
     }
 
     PG_CAGRA* pg_cagra = new PG_CAGRA(n_clusters, PADDED_DIM);
@@ -204,12 +233,15 @@ inline void rebuild_cagra_rotated(
     size_t d,
     const std::string& filename)
 {
-    // 1. Load existing centroids from the saved CAGRA index
-    std::cout << "[rebuild_cagra] Loading old CAGRA from " << filename << ".ivf.cagra ..." << std::endl;
-    faiss::Index* old_cpu_index = faiss::read_index((filename + ".ivf.cagra").c_str());
+    // 1. Load existing centroids from the saved CAGRA index (cuvs format)
+    std::cout << "[rebuild_cagra] Loading CAGRA from " << filename << ".ivf.cagra ..." << std::endl;
+    PG_CAGRA old_pg(n_clusters, d);
+    old_pg.load(filename + ".ivf");
+    // Extract dataset from GPU-resident CAGRA index
+    auto dataset = old_pg.index_cagra->dataset();
     std::vector<float> raw_centroids(n_clusters * d);
-    old_cpu_index->reconstruct_n(0, n_clusters, raw_centroids.data());
-    delete old_cpu_index;
+    cudaMemcpy(raw_centroids.data(), dataset.data_handle(),
+               n_clusters * d * sizeof(float), cudaMemcpyDeviceToHost);
 
     // // 2. Load rotator and rotate centroids
     Rotator<float>* rotator = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);

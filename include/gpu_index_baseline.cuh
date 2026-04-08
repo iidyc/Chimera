@@ -136,7 +136,7 @@ struct gpu_mvr_index_baseline {
 
         // CAGRA batched search workspace
         float*        d_cagra_dists;
-        faiss::idx_t* d_cagra_labels;
+        uint32_t*     d_cagra_labels;
 
         // Pinned host memory (same async infrastructure as optimized)
         float*  h_pinned_queries;
@@ -337,7 +337,7 @@ struct gpu_mvr_index_baseline {
 
         // CAGRA workspace
         CUDA_CHECK(cudaMalloc(&ws_.d_cagra_dists, Q_DOCLEN * nprobe * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ws_.d_cagra_labels, Q_DOCLEN * nprobe * sizeof(faiss::idx_t)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_cagra_labels, Q_DOCLEN * nprobe * sizeof(uint32_t)));
 
         // Pinned host memory (same async infrastructure as optimized)
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
@@ -418,7 +418,7 @@ struct gpu_mvr_index_baseline {
 
         // 1. Batched CAGRA search
         ivf->search_batch_gpu(ws_.d_queries, Q_DOCLEN, nprobe,
-                              ws_.d_cagra_dists, ws_.d_cagra_labels);
+                              ws_.d_cagra_dists, ws_.d_cagra_labels, stream);
 
         // 2. GPU cluster expansion
         compute_query_expansion_sizes_baseline_kernel<<<(Q_DOCLEN + 255) / 256, 256, 0, stream>>>(

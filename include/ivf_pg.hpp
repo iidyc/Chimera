@@ -7,10 +7,16 @@
 
 #include "rabitqlib/third/hnswlib/hnswlib.h"
 
-#include <faiss/gpu/GpuIndexCagra.h>
-#include <faiss/gpu/StandardGpuResources.h>
-#include <faiss/index_io.h>
-#include <faiss/gpu/GpuCloner.h>
+#include <cuvs/neighbors/cagra.hpp>
+#include <raft/core/device_mdspan.hpp>
+#include <raft/core/host_mdspan.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
+
+namespace {
+
+using cagra_index_t = cuvs::neighbors::cagra::index<float, uint32_t>;
+
+}  // namespace
 
 // abstract class for PG index
 struct PG {
@@ -66,53 +72,61 @@ struct PG_HNSW: PG {
 };
 
 struct PG_CAGRA: PG {
-    faiss::gpu::StandardGpuResources res;
-    faiss::gpu::GpuIndexCagra* index_cagra;
+    raft::resources res_;
+    // raft::resources search_res_;
+    std::unique_ptr<cuvs::neighbors::cagra::index<float, uint32_t>> index_cagra;
 
     PG_CAGRA(size_t n, size_t d): PG(n, d) {}
 
     void build_index(const float* data) override {
-        index_cagra = new faiss::gpu::GpuIndexCagra(&res, d);
-        index_cagra->train(n, data);
+        auto dataset = raft::make_host_matrix_view(
+            data,
+            static_cast<std::int64_t>(n),
+            static_cast<std::int64_t>(d)
+        );
+        cuvs::neighbors::cagra::index_params index_params;
+        index_cagra = std::make_unique<cagra_index_t>(
+            cuvs::neighbors::cagra::build(res_, index_params, dataset)
+        );
     }
 
-    void search(const float* query, size_t k, std::vector<size_t>& results) override {
-        std::vector<faiss::idx_t> idxs(k);
-        std::vector<float> dists(k);
-        faiss::gpu::SearchParametersCagra search_params;
-        search_params.algo = faiss::gpu::search_algo::MULTI_CTA;
-        search_params.itopk_size = 512;
-        index_cagra->search(1, query, k, dists.data(), idxs.data(), &search_params);
-        for (size_t i = 0; i < k; ++i) {
-            results.push_back(idxs[i]);
-        }
-    }
+    void search(const float* query, size_t k, std::vector<size_t>& results) override {}
 
-    // Batched search with GPU pointers: one FAISS call for all queries.
-    // d_queries/d_dists/d_labels can be GPU pointers (FAISS auto-detects).
+    // Batched search with GPU pointers.
     void search_batch_gpu(const float* d_queries, size_t n_queries, size_t k,
-                          float* d_dists, faiss::idx_t* d_labels) {
-        faiss::gpu::SearchParametersCagra search_params;
-        // search_params.algo = faiss::gpu::search_algo::MULTI_CTA;
+                          float* d_dists, uint32_t* d_labels, cudaStream_t stream) {
+        // raft::resource::set_cuda_stream(res_, rmm::cuda_stream_view(stream));
+        auto queries = raft::make_device_matrix_view(
+            d_queries,
+            static_cast<std::int64_t>(n_queries),
+            static_cast<std::int64_t>(d)
+        );
+        auto distances = raft::make_device_matrix_view(
+            d_dists,
+            static_cast<std::int64_t>(n_queries),
+            static_cast<std::int64_t>(k)
+        );
+        auto labels = raft::make_device_matrix_view(
+            d_labels,
+            static_cast<std::int64_t>(n_queries),
+            static_cast<std::int64_t>(k)
+        );
+
+        cuvs::neighbors::cagra::search_params search_params;
         search_params.itopk_size = 150;
-        // search_params.max_iterations = 15;
-        // search_params.search_width = 4;
-        index_cagra->search(n_queries, d_queries, k, d_dists, d_labels, &search_params);
+        cuvs::neighbors::cagra::search(res_, search_params, *index_cagra, queries, labels, distances);
     }
 
     void save(const std::string& filename) const override {
-        faiss::Index* cpu_index = faiss::gpu::index_gpu_to_cpu(index_cagra);
-        faiss::write_index(cpu_index, (filename + ".cagra").c_str());
+        cuvs::neighbors::cagra::serialize(res_, filename + ".cagra", *index_cagra);
     }
 
     void load(const std::string& filename) override {
-        faiss::Index* cpu_index = faiss::read_index((filename + ".cagra").c_str());
-        index_cagra = (faiss::gpu::GpuIndexCagra*)faiss::gpu::index_cpu_to_gpu(&res, 0, cpu_index);
+        index_cagra = std::make_unique<cagra_index_t>(res_);
+        cuvs::neighbors::cagra::deserialize(res_, filename + ".cagra", index_cagra.get());
     }
 
-    ~PG_CAGRA() {
-        delete index_cagra;
-    }
+    ~PG_CAGRA() = default;
 };
 
 enum class PGType { HNSW, CAGRA };
@@ -148,10 +162,10 @@ struct IVF_PG {
     // Batched GPU search: delegates to PG_CAGRA::search_batch_gpu.
     // All pointers can be GPU-resident.
     void search_batch_gpu(const float* d_queries, size_t n_queries, size_t n_probe,
-                          float* d_dists, faiss::idx_t* d_labels) {
+                          float* d_dists, uint32_t* d_labels, cudaStream_t stream) {
         auto* cagra = dynamic_cast<PG_CAGRA*>(pg_index);
         if (cagra) {
-            cagra->search_batch_gpu(d_queries, n_queries, n_probe, d_dists, d_labels);
+            cagra->search_batch_gpu(d_queries, n_queries, n_probe, d_dists, d_labels, stream);
         } else {
             throw std::runtime_error("search_batch_gpu requires PG_CAGRA");
         }
@@ -163,7 +177,7 @@ struct IVF_PG {
 
     // Populate inv_list and cluster_pos from in-memory cluster assignments.
     // list_nos[i] is the cluster ID for embedding i, i in [0, n_vectors).
-    void build_from_assignments(const faiss::idx_t* list_nos, size_t n_vectors) {
+    void build_from_assignments(const int64_t* list_nos, size_t n_vectors) {
         std::vector<std::vector<int>> clusters(n_clusters);
         for (size_t i = 0; i < n_vectors; ++i) {
             clusters[list_nos[i]].push_back(static_cast<int>(i));

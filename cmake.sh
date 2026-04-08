@@ -1,3 +1,6 @@
-rm -rf CMakeFiles/
+#!/usr/bin/env bash
+set -euo pipefail
+
+rm -rf CMakeFiles
 rm CMakeCache.txt
-cmake .. -DCMAKE_CUDA_COMPILER=/work/pi_ameliou_umass_edu/yanqichen/cuda12.8/bin/nvcc -DCUDAToolkit_ROOT=/work/pi_ameliou_umass_edu/yanqichen/cuda12.8
+cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=../cmake/conda-toolchain.cmake ..

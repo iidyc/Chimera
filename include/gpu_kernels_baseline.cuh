@@ -291,7 +291,7 @@ __global__ void gather_token_ids_baseline_kernel(
 }
 
 __global__ void compute_query_expansion_sizes_baseline_kernel(
-    const faiss::idx_t* __restrict__ d_cagra_labels,
+    const uint32_t* __restrict__ d_cagra_labels,
     const size_t*       __restrict__ d_cluster_pos,
     int*                d_query_sizes,
     int                 nprobe,
@@ -303,8 +303,8 @@ __global__ void compute_query_expansion_sizes_baseline_kernel(
 
     int total_size = 0;
     for (int p = 0; p < nprobe; ++p) {
-        faiss::idx_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
-        if (cluster_id < 0 || cluster_id >= (faiss::idx_t)n_clusters) continue;
+        uint32_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
+        if (cluster_id >= (uint32_t)n_clusters) continue;
         size_t cluster_size = d_cluster_pos[cluster_id + 1] - d_cluster_pos[cluster_id];
         total_size += (int)cluster_size;
     }
@@ -312,7 +312,7 @@ __global__ void compute_query_expansion_sizes_baseline_kernel(
 }
 
 __global__ void expand_cluster_ids_baseline_kernel(
-    const faiss::idx_t* __restrict__ d_cagra_labels,
+    const uint32_t* __restrict__ d_cagra_labels,
     const int*          __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
@@ -328,8 +328,8 @@ __global__ void expand_cluster_ids_baseline_kernel(
     size_t write_pos = 0;
 
     for (int p = 0; p < nprobe; ++p) {
-        faiss::idx_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
-        if (cluster_id < 0 || cluster_id >= (faiss::idx_t)n_clusters) continue;
+        uint32_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
+        if (cluster_id >= (uint32_t)n_clusters) continue;
 
         size_t cluster_start = d_cluster_pos[cluster_id];
         size_t cluster_end = d_cluster_pos[cluster_id + 1];

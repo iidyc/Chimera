@@ -491,7 +491,7 @@ __global__ void gather_token_ids_kernel(
  * Each thread handles one query and sums up cluster sizes.
  */
 __global__ void compute_query_expansion_sizes_kernel(
-    const faiss::idx_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
+    const uint32_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
     const size_t*       __restrict__ d_cluster_pos,   // [n_clusters + 1]
     int*                d_query_sizes,                // [Q_DOCLEN] output
     int                 nprobe,
@@ -503,8 +503,8 @@ __global__ void compute_query_expansion_sizes_kernel(
 
     int total_size = 0;
     for (int p = 0; p < nprobe; ++p) {
-        faiss::idx_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
-        if (cluster_id < 0 || cluster_id >= n_clusters) continue;
+        uint32_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
+        if (cluster_id >= (uint32_t)n_clusters) continue;
 
         size_t cluster_size = d_cluster_pos[cluster_id + 1] - d_cluster_pos[cluster_id];
         total_size += cluster_size;
@@ -518,7 +518,7 @@ __global__ void compute_query_expansion_sizes_kernel(
  * One block per query, threads cooperatively expand all clusters for that query.
  */
 __global__ void expand_cluster_ids_kernel(
-    const faiss::idx_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
+    const uint32_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
     const int*          __restrict__ d_inv_list,      // [inv_list_size]
     const size_t*       __restrict__ d_cluster_pos,   // [n_clusters + 1]
     const int*          __restrict__ d_query_offsets, // [Q_DOCLEN + 1] prefix sum
@@ -535,8 +535,8 @@ __global__ void expand_cluster_ids_kernel(
 
     // Process each probe for this query
     for (int p = 0; p < nprobe; ++p) {
-        faiss::idx_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
-        if (cluster_id < 0 || cluster_id >= n_clusters) continue;
+        uint32_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
+        if (cluster_id >= (uint32_t)n_clusters) continue;
 
         size_t cluster_start = d_cluster_pos[cluster_id];
         size_t cluster_end = d_cluster_pos[cluster_id + 1];
