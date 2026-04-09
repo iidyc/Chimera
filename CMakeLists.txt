@@ -51,33 +51,77 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-depre
 add_compile_definitions(GPU_MVR_PROFILE)
 # add_compile_definitions(GPU_MVR_TIMELINE)
 add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
-add_compile_definitions(GPU_MVR_USE_LUT)
+# add_compile_definitions(GPU_MVR_USE_LUT)
 
-include_directories("include")
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
 
-add_executable(build expr/build.cpp)
-target_link_libraries(build PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+# ---------- cpu library ----------
+add_library(gpu_mvr_core STATIC
+    cpp/src/estimator.cpp
+    cpp/src/fht_avx.cpp
+    cpp/src/index.cpp
+    cpp/src/io.cpp
+    cpp/src/ivf_pg.cpp
+    cpp/src/quantization.cpp
+    cpp/src/query.cpp
+)
+target_include_directories(gpu_mvr_core PUBLIC cpp/include)
+target_link_libraries(gpu_mvr_core PUBLIC cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
 
-add_executable(search expr/search.cpp)
-target_link_libraries(search PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+# ---------- executables ----------
+# utils.hpp lives in cpp/app/ — add as include dir for all app targets
+# include_directories(cpp/app)
 
-add_executable(test_gather expr/test_gather.cpp)
-target_link_libraries(test_gather PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+add_executable(build cpp/app/build.cpp)
+target_link_libraries(build PRIVATE gpu_mvr_core)
 
-add_executable(test_dist_decomp expr/test_dist_decomp.cpp)
-target_link_libraries(test_dist_decomp PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+add_executable(search cpp/app/search.cpp)
+target_link_libraries(search PRIVATE gpu_mvr_core)
 
-add_executable(build_cagra expr/build_cagra.cpp)
-target_link_libraries(build_cagra PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+add_executable(test_gather cpp/app/test_gather.cpp)
+target_link_libraries(test_gather PRIVATE gpu_mvr_core)
 
-add_executable(gpu_search expr/gpu_search.cu)
+add_executable(test_dist_decomp cpp/app/test_dist_decomp.cpp)
+target_link_libraries(test_dist_decomp PRIVATE gpu_mvr_core)
+
+add_executable(build_cagra cpp/app/build_cagra.cpp)
+target_link_libraries(build_cagra PRIVATE gpu_mvr_core)
+
+add_executable(gpu_search
+    cpp/app/gpu_search.cu
+    cpp/cuda/src/gpu_index.cu
+    cpp/cuda/src/gpu_kernels.cu
+)
+target_include_directories(gpu_search PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
 set_target_properties(gpu_search PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(gpu_search PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+target_link_libraries(gpu_search PRIVATE gpu_mvr_core)
 
-add_executable(gpu_build expr/gpu_build.cu)
+add_executable(gpu_build 
+    cpp/app/gpu_build.cu
+    cpp/cuda/src/build_gpu_index.cu
+)
+target_include_directories(gpu_build PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
 set_target_properties(gpu_build PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(gpu_build PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+target_link_libraries(gpu_build PRIVATE gpu_mvr_core)
 
-add_executable(gpu_search_baseline expr/gpu_search_baseline.cu)
+add_executable(gpu_search_baseline
+    cpp/app/gpu_search_baseline.cu
+    cpp/cuda/src/gpu_index_baseline.cu
+    cpp/cuda/src/gpu_kernels_baseline.cu
+)
+target_include_directories(gpu_search_baseline PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
 set_target_properties(gpu_search_baseline PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(gpu_search_baseline PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
+target_link_libraries(gpu_search_baseline PRIVATE gpu_mvr_core)

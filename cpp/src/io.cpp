@@ -1,11 +1,9 @@
-#pragma once
+#include "io.hpp"
 
 #include <iostream>
 #include <fstream>
-#include <vector>
-#include <string>
 
-std::vector<float> load_data(size_t& num_embeddings, size_t& d, std::string filename = "embeddings.bin") {
+std::vector<float> load_data(size_t& num_embeddings, size_t& d, std::string filename) {
     int n_, d_;
     std::ifstream emb_file(filename, std::ios::binary);
     emb_file.read(reinterpret_cast<char*>(&n_), sizeof(int));
@@ -16,10 +14,10 @@ std::vector<float> load_data(size_t& num_embeddings, size_t& d, std::string file
     emb_file.read(reinterpret_cast<char*>(embeddings.data()), embeddings.size() * sizeof(float));
     emb_file.close();
     std::cout << ">>> Loaded " << num_embeddings << " embeddings of dimension " << d << std::endl;
-    return std::move(embeddings);
+    return embeddings;
 }
 
-std::vector<float> load_query(size_t& q_doclen, size_t& num_q, size_t& d, std::string filename = "query_embeddings.bin") {
+std::vector<float> load_query(size_t& q_doclen, size_t& num_q, size_t& d, std::string filename) {
     std::ifstream qemb_file(filename, std::ios::binary);
     int num_q_, q_doclen_, d_;
     qemb_file.read(reinterpret_cast<char*>(&num_q_), sizeof(int));
@@ -32,10 +30,10 @@ std::vector<float> load_query(size_t& q_doclen, size_t& num_q, size_t& d, std::s
     qemb_file.read(reinterpret_cast<char*>(Q.data()), Q.size() * sizeof(float));
     qemb_file.close();
     std::cout << ">>> Loaded " << num_q << " queries, each with " << q_doclen << " embeddings of dimension " << d << std::endl;
-    return std::move(Q);
+    return Q;
 }
 
-std::vector<int> load_doclens(std::string filename = "doclens.bin") {
+std::vector<int> load_doclens(std::string filename) {
     std::ifstream doc_lens_file(filename, std::ios::binary);
     int doclens_size;
     doc_lens_file.read(reinterpret_cast<char*>(&doclens_size), sizeof(int));
@@ -43,5 +41,5 @@ std::vector<int> load_doclens(std::string filename = "doclens.bin") {
     doc_lens_file.read(reinterpret_cast<char*>(doclens.data()), doclens.size() * sizeof(int));
     doc_lens_file.close();
     std::cout << ">>> Loaded " << doclens_size << " document lengths" << std::endl;
-    return std::move(doclens);
+    return doclens;
 }

@@ -1,59 +1,40 @@
-#pragma once
-
-#include <vector>
-#include <queue>
-#include <unordered_map>
-#include <unordered_set>
-#include <iostream>
-#include <algorithm>
-#include <numeric>
-#include <cfloat>
-#include <limits>
-#include <random>
-#include <cstring>
-#include <atomic>
-#include <chrono>
-#include <fstream>
-#include <sstream>
-#include <immintrin.h>
+#include "build_gpu_index.hpp"
 
 #define EIGEN_NO_CUDA
 
-#include "io.hpp"
-#include "rabitqlib/utils/rotator.hpp"
-#include "rabitqlib/utils/space.hpp"
-#include "quantization.hpp"
-#include "estimator.hpp"
-#include "query.hpp"
-#include "ivf_pg.hpp"
-#include "gpu_config.cuh"
+#include <cuda_runtime.h>
+#include <omp.h>
 
+#include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <stdexcept>
+#include <vector>
 
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
-// ---------------------------------------------------------------------------
-// GPU-accelerated index build pipeline
-// ---------------------------------------------------------------------------
-// 1. Randomly sample centroids
-// 2. Build a temporary non-rotated CAGRA graph for fast centroid assignment
-// 3. Build the persisted CAGRA graph on rotated centroids
-// 4. Assemble IVF_PG, quantize data, and serialize everything to disk
-//
-// Steps 1 and 2 can optionally be bootstrapped from precomputed files
-// produced by expr/build_index_step12.py by passing non-empty
-// `bootstrap_centroids` and `bootstrap_list_nos` paths.
-// ---------------------------------------------------------------------------
-inline void build_index(
+#include "rabitqlib/utils/rotator.hpp"
+#include "rabitqlib/utils/space.hpp"
+#include "gpu_config.cuh"
+#include "ivf_pg.hpp"
+#include "quantization.hpp"
+
+using namespace rabitqlib;
+
+void build_index(
     const float* data,
     size_t n,
     size_t d,
     size_t n_clusters,
     size_t ex_bits,
-    const std::vector<int>& doc_lens,
+    const std::vector<int>& /*doc_lens*/,
     const std::string& filename,
-    const std::string& bootstrap_centroids = "",
-    const std::string& bootstrap_list_nos = "")
+    const std::string& bootstrap_centroids,
+    const std::string& bootstrap_list_nos)
 {
     const bool bootstrap = !bootstrap_centroids.empty() && !bootstrap_list_nos.empty();
 
@@ -61,15 +42,10 @@ inline void build_index(
     std::vector<int64_t> list_nos;
 
     if (bootstrap) {
-        // ------------------------------------------------------------------
-        // Bootstrap path: load centroids + assignments produced by the
-        // Python script (see expr/build_index_step12.py).
-        // ------------------------------------------------------------------
         std::cout << "[build_index] Bootstrapping from "
                   << bootstrap_centroids << " and " << bootstrap_list_nos
                   << " (skipping steps 1 and 2)" << std::endl;
 
-        // centroids file: int32 n_clusters, int32 d, float32[n_clusters*d]
         {
             std::ifstream cf(bootstrap_centroids, std::ios::binary);
             if (!cf.is_open()) {
@@ -89,7 +65,6 @@ inline void build_index(
                     centroids.size() * sizeof(float));
         }
 
-        // list_nos file: int32 n, then n int64 cluster ids
         {
             std::ifstream lf(bootstrap_list_nos, std::ios::binary);
             if (!lf.is_open()) {
@@ -108,20 +83,15 @@ inline void build_index(
 
         std::cout << "[build_index] Bootstrap load done." << std::endl;
     } else {
-        // ------------------------------------------------------------------
-        // Step 1: Randomly sample centroids
-        // ------------------------------------------------------------------
         std::cout << "[build_index] Step 1: Randomly sampling " << n_clusters
                   << " centroids from " << n << " vectors (d=" << d << ") ..." << std::endl;
 
-        // Randomly sample n_clusters indices without replacement
         std::vector<size_t> indices(n);
         std::iota(indices.begin(), indices.end(), 0);
         std::mt19937 rng(42);
         std::shuffle(indices.begin(), indices.end(), rng);
         indices.resize(n_clusters);
 
-        // Copy sampled centroids into a contiguous buffer
         centroids.resize(n_clusters * d);
         for (size_t i = 0; i < n_clusters; ++i) {
             std::memcpy(&centroids[i * d], &data[indices[i] * d], d * sizeof(float));
@@ -129,9 +99,6 @@ inline void build_index(
 
         std::cout << "[build_index] Step 1 done. Sampled centroids." << std::endl;
 
-        // ------------------------------------------------------------------
-        // Step 2: Build non-rotated CAGRA and assign embeddings
-        // ------------------------------------------------------------------
         std::cout << "[build_index] Step 2: Building temporary non-rotated CAGRA graph"
                   << " for centroid assignment ..." << std::endl;
 
@@ -141,7 +108,6 @@ inline void build_index(
         raft::resources res;
         auto cuda_stream = raft::resource::get_cuda_stream(res);
 
-        // Assign each embedding to its nearest centroid (batched through CAGRA)
         list_nos.resize(n);
         constexpr size_t assign_batch = 65536;
         float* d_q_ptr;
@@ -172,7 +138,6 @@ inline void build_index(
         std::cout << "[build_index] Step 2 done. Embeddings assigned with non-rotated CAGRA." << std::endl;
     }
 
-    // Load rotator early — needed for centroid rotation (Step 3) and quantization (Step 5)
     Rotator<float>* rotator = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);
     std::ifstream rot_in("rotator.bin", std::ios::binary);
     if (!rot_in.is_open()) {
@@ -181,9 +146,6 @@ inline void build_index(
     rotator->load(rot_in);
     rot_in.close();
 
-    // ------------------------------------------------------------------
-    // Step 3: Build CAGRA graph on ROTATED centroids
-    // ------------------------------------------------------------------
     std::cout << "[build_index] Step 3: Rotating centroids and building persisted CAGRA graph on "
               << n_clusters << " centroids ..." << std::endl;
 
@@ -197,24 +159,16 @@ inline void build_index(
 
     std::cout << "[build_index] Step 3 done. Persisted rotated CAGRA graph built." << std::endl;
 
-    // ------------------------------------------------------------------
-    // Step 4: Assemble IVF_PG
-    // ------------------------------------------------------------------
     std::cout << "[build_index] Step 4: Assembling IVF_PG ..." << std::endl;
 
     IVF_PG* ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
-    // Replace the default-constructed PG_CAGRA with the one we already built
     delete ivf->pg_index;
     ivf->pg_index = pg_cagra;
-    // Populate inv_list and cluster_pos from assignments
     ivf->build_from_assignments(list_nos.data(), n);
     ivf->save(filename);
 
     std::cout << "[build_index] Step 4 done. IVF_PG assembled and saved." << std::endl;
 
-    // ------------------------------------------------------------------
-    // Step 5: Quantize data (1-bit + extra-bits)
-    // ------------------------------------------------------------------
     std::cout << "[build_index] Step 5: Quantizing " << n << " vectors ..." << std::endl;
 
     std::vector<char>  one_bit_code(n * PADDED_DIM / 8);
@@ -249,9 +203,6 @@ inline void build_index(
 
     std::cout << "[build_index] Step 5 done. Quantization complete." << std::endl;
 
-    // ------------------------------------------------------------------
-    // Step 6: Serialize index payload (matches gpu_mvr_index constructor format)
-    // ------------------------------------------------------------------
     std::cout << "[build_index] Step 6: Saving index payload to " << filename << " ..." << std::endl;
 
     {

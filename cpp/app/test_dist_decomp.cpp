@@ -34,7 +34,7 @@ int main() {
                 float max_dot = -std::numeric_limits<float>::infinity();
                 for (size_t kk = 0; kk < index.doc_len(doc_id); ++kk) {
                     size_t idx = index.doc_ptrs_[doc_id] + kk;
-                    float dot = dot_product(&dataset[idx * d], &Q[i * q_doclen * d + j * d], d);
+                    float dot = rabitqlib::dot_product(&dataset[idx * d], &Q[i * q_doclen * d + j * d], d);
                     max_dot = std::max(max_dot, dot);
                 }
                 doc_score += max_dot;

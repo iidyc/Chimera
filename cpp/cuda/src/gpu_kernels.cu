@@ -1,10 +1,6 @@
-#pragma once
+#include "gpu_kernels.cuh"
 
-#include <cuda_runtime.h>
-#include <cstddef>
-#include <cstdint>
 #include <cfloat>
-#include "gpu_config.cuh"
 
 __global__ void stage1_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
@@ -16,12 +12,11 @@ __global__ void stage1_binary_ip_kernel_v2(
     float* __restrict__ d_out_dists,
     size_t max_embs_per_query
 ) {
-    __shared__ float smem_query[PADDED_DIM];  // 512 bytes
+    __shared__ float smem_query[PADDED_DIM];
 
     const int query_idx = blockIdx.y;
     if (query_idx >= Q_DOCLEN) return;
 
-    // Coalesced load of query vector into shared memory
     const float* q_ptr = d_queries + query_idx * PADDED_DIM;
     #pragma unroll
     for (int i = threadIdx.x; i < PADDED_DIM; i += blockDim.x) {
@@ -34,13 +29,11 @@ __global__ void stage1_binary_ip_kernel_v2(
     const size_t pair_end   = d_pair_offsets[query_idx + 1];
     const size_t num_embs   = pair_end - pair_start;
 
-    // Grid-stride loop: each thread handles one embedding per iteration
     for (size_t idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
          idx < num_embs;
          idx += (size_t)blockDim.x * gridDim.x)
     {
         const size_t emb_id = d_emb_ids[pair_start + idx];
-        // Vectorized 128-bit load of binary code (2 x uint64_t)
         const uint64_t* code_ptr =
             (const uint64_t*)(d_one_bit_code + emb_id * CODE_BYTES);
         uint64_t code_regs[NUM_U64];
@@ -52,11 +45,10 @@ __global__ void stage1_binary_ip_kernel_v2(
         for (int blk = 0; blk < NUM_U64; blk++) {
             uint64_t bits = code_regs[blk];
             int base = blk * 64;
-            // Skip zero bits using __ffsll intrinsic
             while (bits) {
                 int pos = __ffsll(bits) - 1;
                 ip += smem_query[base + pos];
-                bits &= bits - 1;  // clear lowest set bit
+                bits &= bits - 1;
             }
         }
         float dist = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
@@ -66,21 +58,18 @@ __global__ void stage1_binary_ip_kernel_v2(
 }
 
 __global__ void stage2_binary_ip_kernel_v2(
-    const float* __restrict__ d_queries,       // [Q_DOCLEN * PADDED_DIM]
-    const char*  __restrict__ d_one_bit_code,  // [n * CODE_BYTES]
-    const float* __restrict__ d_one_bit_factor,// [n]
-    const float* __restrict__ d_cb1_sumq,      // [Q_DOCLEN]
-    const size_t* __restrict__ d_token_ids,    // [total_tokens]
-    float* __restrict__ d_out_dists,           // [Q_DOCLEN * total_tokens]
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_token_ids,
+    float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
 ) {
-    // Load ALL query vectors into shared memory (16 KB)
     __shared__ float smem_queries[Q_DOCLEN * PADDED_DIM];
-    // Cache cb1_sumq in shared memory to avoid repeated global reads (128 B)
     __shared__ float smem_cb1_sumq[Q_DOCLEN];
 
-    // Cooperative load: 256 threads load 32*128 = 4096 floats → 16 iterations
     const int total_query_floats = Q_DOCLEN * PADDED_DIM;
     for (int i = threadIdx.x; i < total_query_floats; i += blockDim.x) {
         smem_queries[i] = d_queries[i];
@@ -90,23 +79,19 @@ __global__ void stage2_binary_ip_kernel_v2(
     }
     __syncthreads();
 
-    // Grid-stride loop: each thread processes one token against all queries
     for (size_t tok_idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
          tok_idx < batch_tokens;
          tok_idx += (size_t)blockDim.x * gridDim.x)
     {
-        // Load binary code and factor ONCE per token
         const size_t token_id = d_token_ids[tok_idx];
         const float factor = d_one_bit_factor[token_id];
 
-        // Load binary code into registers (2 x uint64_t)
         const uint64_t* code_ptr =
             (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
         uint64_t code_regs[NUM_U64];
         code_regs[0] = code_ptr[0];
         code_regs[1] = code_ptr[1];
 
-        // Score against all Q_DOCLEN queries
         #pragma unroll
         for (int q = 0; q < Q_DOCLEN; q++) {
             const float* q_smem = smem_queries + q * PADDED_DIM;
@@ -117,9 +102,6 @@ __global__ void stage2_binary_ip_kernel_v2(
             for (int blk = 0; blk < NUM_U64; blk++) {
                 uint64_t bits = code_regs[blk];
                 int base = blk * 64;
-                // Fully unrolled loop — compiler emits predicated FADD with zero branching.
-                // Do NOT replace with __ffsll: data-dependent branching causes warp divergence
-                // multiplied 32x across queries, resulting in 3.6x slowdown.
                 #pragma unroll
                 for (int i = 0; i < 64; i++) {
                     if ((bits >> i) & 1ULL)
@@ -133,13 +115,9 @@ __global__ void stage2_binary_ip_kernel_v2(
     }
 }
 
-// ============================================================
-// LUT-based binary IP kernels
-// ============================================================
-
 __global__ void precompute_lut_kernel(
-    const float* __restrict__ d_queries,  // [Q_DOCLEN * PADDED_DIM]
-    float* __restrict__ d_lut             // [Q_DOCLEN * LUT_ENTRIES_PER_QUERY]
+    const float* __restrict__ d_queries,
+    float* __restrict__ d_lut
 ) {
     const int query_idx = blockIdx.x;
     if (query_idx >= Q_DOCLEN) return;
@@ -147,10 +125,9 @@ __global__ void precompute_lut_kernel(
     const float* q_ptr = d_queries + query_idx * PADDED_DIM;
     float* lut_ptr = d_lut + query_idx * LUT_ENTRIES_PER_QUERY;
 
-    // 512 entries total, 256 threads → 2 iterations
     for (int idx = threadIdx.x; idx < LUT_ENTRIES_PER_QUERY; idx += blockDim.x) {
-        int chunk_idx = idx / LUT_SIZE;     // 0..31
-        int lut_entry = idx % LUT_SIZE;     // 0..15 (the 4-bit pattern)
+        int chunk_idx = idx / LUT_SIZE;
+        int lut_entry = idx % LUT_SIZE;
 
         int dim_start = chunk_idx * BITS_PER_CHUNK;
         float sum = 0.0f;
@@ -167,7 +144,7 @@ __global__ void precompute_lut_kernel(
 }
 
 __global__ void stage1_binary_ip_lut_kernel(
-    const float* __restrict__ d_lut,           // [Q_DOCLEN * LUT_ENTRIES_PER_QUERY]
+    const float* __restrict__ d_lut,
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
@@ -176,12 +153,11 @@ __global__ void stage1_binary_ip_lut_kernel(
     float* __restrict__ d_out_dists,
     size_t max_embs_per_query
 ) {
-    __shared__ float smem_lut[LUT_ENTRIES_PER_QUERY];  // 512 floats = 2048 bytes
+    __shared__ float smem_lut[LUT_ENTRIES_PER_QUERY];
 
     const int query_idx = blockIdx.y;
     if (query_idx >= Q_DOCLEN) return;
 
-    // Cooperative load of this query's LUT into shared memory
     const float* lut_ptr = d_lut + query_idx * LUT_ENTRIES_PER_QUERY;
     #pragma unroll
     for (int i = threadIdx.x; i < LUT_ENTRIES_PER_QUERY; i += blockDim.x) {
@@ -222,15 +198,8 @@ __global__ void stage1_binary_ip_lut_kernel(
     }
 }
 
-// Query-tiled stage2 LUT kernel: processes TILE_Q queries per pass
-// to keep shared memory small (16KB) for high occupancy.
-// Code is loaded once per token, nibbles extracted once, reused across all tiles.
-#define STAGE2_LUT_TILE_Q 8
-#define STAGE2_LUT_NUM_TILES (Q_DOCLEN / STAGE2_LUT_TILE_Q)  // 4 tiles
-#define STAGE2_LUT_SMEM_FLOATS (STAGE2_LUT_TILE_Q * LUT_ENTRIES_PER_QUERY)  // 4096
-
 __global__ void stage2_binary_ip_lut_kernel(
-    const float* __restrict__ d_lut,           // [Q_DOCLEN * LUT_ENTRIES_PER_QUERY]
+    const float* __restrict__ d_lut,
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
@@ -239,14 +208,10 @@ __global__ void stage2_binary_ip_lut_kernel(
     size_t total_tokens,
     size_t batch_tokens
 ) {
-    // Shared memory: TILE_Q query LUTs (16 KB) + cb1_sumq tile (32 B)
     extern __shared__ float smem[];
-    float* smem_lut = smem;                              // [TILE_Q * 512]
-    float* smem_cb1_sumq = smem + STAGE2_LUT_SMEM_FLOATS;  // [TILE_Q]
+    float* smem_lut = smem;
+    float* smem_cb1_sumq = smem + STAGE2_LUT_SMEM_FLOATS;
 
-    // Process tokens in a block-cooperative grid-stride pattern.
-    // For each batch of tokens, iterate over query tiles.
-    // All threads must participate in __syncthreads even if they have no valid token.
     size_t tok_base = (size_t)blockIdx.x * blockDim.x;
 
     for (size_t tok_batch_start = tok_base;
@@ -256,7 +221,6 @@ __global__ void stage2_binary_ip_lut_kernel(
         size_t tok_idx = tok_batch_start + threadIdx.x;
         bool valid = tok_idx < batch_tokens;
 
-        // Load code and extract nibbles once per token (reused across all query tiles)
         size_t token_id = 0;
         float factor = 0.0f;
         int nibbles[NUM_CHUNKS];
@@ -281,12 +245,10 @@ __global__ void stage2_binary_ip_lut_kernel(
             }
         }
 
-        // Iterate over query tiles
         #pragma unroll
         for (int tile = 0; tile < STAGE2_LUT_NUM_TILES; tile++) {
             int q_start = tile * STAGE2_LUT_TILE_Q;
 
-            // Cooperative load of this tile's LUTs into shared memory
             __syncthreads();
             const float* tile_lut_src = d_lut + q_start * LUT_ENTRIES_PER_QUERY;
             for (int i = threadIdx.x; i < STAGE2_LUT_SMEM_FLOATS; i += blockDim.x) {
@@ -318,7 +280,7 @@ __global__ void stage2_binary_ip_lut_kernel(
 }
 
 __global__ void doc_score_kernel(
-    const float*  __restrict__ d_token_dists,  // [Q_DOCLEN][total_tokens]
+    const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
     float*        d_doc_scores,
     size_t total_tokens,
@@ -327,7 +289,7 @@ __global__ void doc_score_kernel(
     constexpr int TILE_T = 8;
     __shared__ float tile[Q_DOCLEN * TILE_T];
     __shared__ float max_vals[Q_DOCLEN];
-    __shared__ float reduce_buf[256];  // Assuming max 256 threads per block
+    __shared__ float reduce_buf[256];
 
     size_t cand_idx = blockIdx.x;
     if (cand_idx >= num_candidates) return;
@@ -336,17 +298,14 @@ __global__ void doc_score_kernel(
     size_t tok_end = d_candidate_offsets[cand_idx + 1];
     size_t num_tokens = tok_end - tok_start;
 
-    // Initialize per-query max values cooperatively (all threads participate)
     for (int j = threadIdx.x; j < Q_DOCLEN; j += blockDim.x) {
         max_vals[j] = -FLT_MAX;
     }
     __syncthreads();
 
-    // Tile loop is the outer loop — ALL threads reach every __syncthreads()
     for (size_t t_base = 0; t_base < num_tokens; t_base += TILE_T) {
         int tile_size = ((size_t)TILE_T < num_tokens - t_base) ? TILE_T : (int)(num_tokens - t_base);
 
-        // Cooperative tile load: ALL threads participate
         __syncthreads();
         for (int idx = threadIdx.x; idx < Q_DOCLEN * tile_size; idx += blockDim.x) {
             int q = idx / tile_size;
@@ -355,7 +314,6 @@ __global__ void doc_score_kernel(
         }
         __syncthreads();
 
-        // Each thread updates max for its assigned queries
         for (size_t j = threadIdx.x; j < Q_DOCLEN; j += blockDim.x) {
             float local_max = max_vals[j];
             for (int t_local = 0; t_local < tile_size; t_local++) {
@@ -366,13 +324,11 @@ __global__ void doc_score_kernel(
     }
     __syncthreads();
 
-    // Sum max values across queries
     float my_sum = 0.0f;
     for (size_t j = threadIdx.x; j < Q_DOCLEN; j += blockDim.x) {
         my_sum += max_vals[j];
     }
 
-    // Block-level reduction
     reduce_buf[threadIdx.x] = my_sum;
     __syncthreads();
 
@@ -389,10 +345,10 @@ __global__ void doc_score_kernel(
 }
 
 __global__ void extract_one_bit_dists_kernel(
-    const float*  __restrict__ d_token_dists,     // [Q_DOCLEN][total_tokens] GPU layout
+    const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
     const int*    __restrict__ d_selected_indices,
-    float*        d_out_one_bit_dists,             // [token][query] output layout
+    float*        d_out_one_bit_dists,
     const size_t* __restrict__ d_out_offsets,
     size_t total_tokens,
     size_t k
@@ -407,36 +363,26 @@ __global__ void extract_one_bit_dists_kernel(
     size_t out_base = d_out_offsets[sel_idx];
     size_t total_elems = num_tokens * Q_DOCLEN;
 
-    // Iterate over output elements linearly for coalesced writes
-    // Output layout: [token][query] → out[(out_base + t) * Q_DOCLEN + q]
-    // Adjacent threads write adjacent addresses when iterating linearly
     for (size_t i = threadIdx.x; i < total_elems; i += blockDim.x) {
         size_t t_local = i / Q_DOCLEN;
-        size_t q_idx = i - t_local * Q_DOCLEN;  // avoid expensive modulo
+        size_t q_idx = i - t_local * Q_DOCLEN;
 
-        // Read from [query][token] layout
         float val = d_token_dists[q_idx * total_tokens + tok_start + t_local];
-        // Write to [token][query] layout
         d_out_one_bit_dists[(out_base + t_local) * Q_DOCLEN + q_idx] = val;
     }
 }
 
-// V2: write directly to pinned host memory with a single block of 128 threads
-// to avoid overloading the PCIe 3.0 controller with too many concurrent writers.
-// Uses float4 vectorized stores (128-bit) to reduce PCIe transaction count by 4x.
-// Writes are contiguous (token-major output), reads are strided (query-major input).
 __global__ void extract_one_bit_dists_kernel_v2(
     const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
     const int*    __restrict__ d_selected_indices,
-    float*        h_pinned_out,                    // pinned host memory (device-mapped)
+    float*        h_pinned_out,
     const size_t* __restrict__ d_out_offsets,
     size_t total_tokens,
     size_t k
 ) {
-    // Q_DOCLEN is 32, divisible by 4 → each token produces exactly 8 float4 writes
     constexpr size_t VEC_SIZE = 4;
-    constexpr size_t Q_DOCLEN_VEC = Q_DOCLEN / VEC_SIZE;  // 8
+    constexpr size_t Q_DOCLEN_VEC = Q_DOCLEN / VEC_SIZE;
 
     for (size_t sel_idx = 0; sel_idx < k; ++sel_idx) {
         size_t cand_idx = d_selected_indices[sel_idx];
@@ -444,7 +390,6 @@ __global__ void extract_one_bit_dists_kernel_v2(
         size_t tok_end = d_candidate_offsets[cand_idx + 1];
         size_t num_tokens = tok_end - tok_start;
         size_t out_base = d_out_offsets[sel_idx];
-        // Total float4 elements: num_tokens * (Q_DOCLEN / 4)
         size_t total_vec_elems = num_tokens * Q_DOCLEN_VEC;
 
         for (size_t vi = threadIdx.x; vi < total_vec_elems; vi += blockDim.x) {
@@ -452,14 +397,12 @@ __global__ void extract_one_bit_dists_kernel_v2(
             size_t vec_idx = vi - t_local * Q_DOCLEN_VEC;
             size_t q_base = vec_idx * VEC_SIZE;
 
-            // Gather 4 strided reads from [query][token] layout
             float4 packed;
             packed.x = d_token_dists[(q_base + 0) * total_tokens + tok_start + t_local];
             packed.y = d_token_dists[(q_base + 1) * total_tokens + tok_start + t_local];
             packed.z = d_token_dists[(q_base + 2) * total_tokens + tok_start + t_local];
             packed.w = d_token_dists[(q_base + 3) * total_tokens + tok_start + t_local];
 
-            // Single 128-bit contiguous store to [token][query] layout
             float4* out_ptr = (float4*)(h_pinned_out + (out_base + t_local) * Q_DOCLEN + q_base);
             *out_ptr = packed;
         }
@@ -486,17 +429,13 @@ __global__ void gather_token_ids_kernel(
     }
 }
 
-/**
- * Compute per-query expansion sizes for cluster ID expansion.
- * Each thread handles one query and sums up cluster sizes.
- */
 __global__ void compute_query_expansion_sizes_kernel(
-    const uint32_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
-    const size_t*       __restrict__ d_cluster_pos,   // [n_clusters + 1]
-    int*                d_query_sizes,                // [Q_DOCLEN] output
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*       __restrict__ d_cluster_pos,
+    int*                d_query_sizes,
     int                 nprobe,
     size_t              n_clusters,
-    size_t              num_queries                   // Q_DOCLEN
+    size_t              num_queries
 ) {
     size_t query_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (query_idx >= num_queries) return;
@@ -513,19 +452,15 @@ __global__ void compute_query_expansion_sizes_kernel(
     d_query_sizes[query_idx] = total_size;
 }
 
-/**
- * Expand cluster IDs to embedding IDs on GPU.
- * One block per query, threads cooperatively expand all clusters for that query.
- */
 __global__ void expand_cluster_ids_kernel(
-    const uint32_t* __restrict__ d_cagra_labels,  // [Q_DOCLEN * nprobe]
-    const int*          __restrict__ d_inv_list,      // [inv_list_size]
-    const size_t*       __restrict__ d_cluster_pos,   // [n_clusters + 1]
-    const int*          __restrict__ d_query_offsets, // [Q_DOCLEN + 1] prefix sum
-    size_t*             d_emb_ids,                    // [total_pairs] output
+    const uint32_t* __restrict__ d_cagra_labels,
+    const int*          __restrict__ d_inv_list,
+    const size_t*       __restrict__ d_cluster_pos,
+    const int*          __restrict__ d_query_offsets,
+    size_t*             d_emb_ids,
     int                 nprobe,
     size_t              n_clusters,
-    size_t              num_queries                   // Q_DOCLEN
+    size_t              num_queries
 ) {
     size_t query_idx = blockIdx.x;
     if (query_idx >= num_queries) return;
@@ -533,7 +468,6 @@ __global__ void expand_cluster_ids_kernel(
     size_t out_start = d_query_offsets[query_idx];
     size_t write_pos = 0;
 
-    // Process each probe for this query
     for (int p = 0; p < nprobe; ++p) {
         uint32_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
         if (cluster_id >= (uint32_t)n_clusters) continue;
@@ -542,20 +476,15 @@ __global__ void expand_cluster_ids_kernel(
         size_t cluster_end = d_cluster_pos[cluster_id + 1];
         size_t cluster_size = cluster_end - cluster_start;
 
-        // Cooperative copy: all threads in block write cluster embeddings
         for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
             d_emb_ids[out_start + write_pos + i] = d_inv_list[cluster_start + i];
         }
 
         write_pos += cluster_size;
-        __syncthreads();  // Ensure all threads finish before next cluster
+        __syncthreads();
     }
 }
 
-/**
- * Gather document pointers for top-k docs to compute token counts.
- * Each thread handles one document.
- */
 __global__ void gather_doc_lengths_kernel(
     const int* __restrict__ d_topk_doc_ids,
     const int* __restrict__ d_doc_ptrs,
@@ -564,7 +493,7 @@ __global__ void gather_doc_lengths_kernel(
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= k) return;
-    
+
     int doc_id = d_topk_doc_ids[idx];
     int doc_len = d_doc_ptrs[doc_id + 1] - d_doc_ptrs[doc_id];
     d_doc_lengths[idx] = doc_len;
@@ -582,21 +511,15 @@ __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
     return __int_as_float(old);
 }
 
-/**
- * Atomic max-pooling and aggregation for Stage 1 with touched-doc tracking.
- * Each (emb_id, query_idx) → (doc_id, query_idx) → atomic max into doc_query_matrix.
- * Simultaneously builds a compact list of unique touched document IDs for sparse
- * downstream processing (sum, sort, cleanup).
- */
 __global__ void aggregate_stage1_tracked_kernel(
     const size_t* __restrict__ d_emb_ids,
-    const float*  __restrict__ d_emb_dists,       // [Q_DOCLEN * max_embs_per_query] layout
+    const float*  __restrict__ d_emb_dists,
     const int*    __restrict__ d_pair_offsets,
     const int*    __restrict__ d_doc_ids,
-    float*        d_doc_query_max,                 // [Q_DOCLEN * num_docs] transposed matrix
-    int*          d_doc_touched,                   // [num_docs] per-doc flag
-    int*          d_touched_doc_list,              // [num_docs] compact output list
-    int*          d_num_touched_docs,              // [1] atomic counter
+    float*        d_doc_query_max,
+    int*          d_doc_touched,
+    int*          d_touched_doc_list,
+    int*          d_num_touched_docs,
     size_t        num_docs,
     size_t        total_pairs,
     size_t        max_embs_per_query
@@ -604,7 +527,6 @@ __global__ void aggregate_stage1_tracked_kernel(
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_pairs) return;
 
-    // Binary search for query index (log2(Q_DOCLEN) iterations instead of linear scan)
     int q_idx;
     {
         int lo = 0, hi = Q_DOCLEN;
@@ -627,11 +549,9 @@ __global__ void aggregate_stage1_tracked_kernel(
 
     if (doc_id >= (int)num_docs) return;
 
-    // Atomic max into transposed matrix [q_idx * num_docs + doc_id]
     size_t matrix_idx = (size_t)q_idx * num_docs + doc_id;
     atomicMaxFloat(&d_doc_query_max[matrix_idx], dist);
 
-    // Track touched docs: read flag first (cheap L2 read), atomicExch only if unseen
     if (d_doc_touched[doc_id] == 0) {
         int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
         if (was_touched == 0) {
@@ -641,12 +561,9 @@ __global__ void aggregate_stage1_tracked_kernel(
     }
 }
 
-/**
- * Sum max distances across queries for each document.
- */
 __global__ void sum_doc_scores_kernel(
-    const float* __restrict__ d_doc_query_max,  // [num_docs * Q_DOCLEN]
-    float*       d_doc_scores,                   // [num_docs]
+    const float* __restrict__ d_doc_query_max,
+    float*       d_doc_scores,
     size_t       num_docs
 ) {
     size_t doc_id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -655,20 +572,16 @@ __global__ void sum_doc_scores_kernel(
     float score = 0.0f;
     #pragma unroll
     for (size_t q = 0; q < Q_DOCLEN; ++q) {
-        score += d_doc_query_max[q * num_docs + doc_id];  // transposed: coalesced reads
+        score += d_doc_query_max[q * num_docs + doc_id];
     }
     d_doc_scores[doc_id] = score;
 }
 
-/**
- * Sum max distances across queries for only the touched (active) documents.
- * Writes compact score and doc_id arrays suitable for direct CUB sort.
- */
 __global__ void sum_doc_scores_sparse_kernel(
-    const float* __restrict__ d_doc_query_max,    // [Q_DOCLEN * num_docs] transposed
-    const int*   __restrict__ d_touched_doc_list, // [num_touched] compact doc IDs
-    float*       d_scores_out,                     // [num_touched] compact scores
-    int*         d_doc_ids_out,                    // [num_touched] compact doc IDs for sort
+    const float* __restrict__ d_doc_query_max,
+    const int*   __restrict__ d_touched_doc_list,
+    float*       d_scores_out,
+    int*         d_doc_ids_out,
     int          num_touched,
     size_t       num_docs
 ) {
@@ -684,26 +597,3 @@ __global__ void sum_doc_scores_sparse_kernel(
     d_scores_out[idx] = score;
     d_doc_ids_out[idx] = doc_id;
 }
-
-/**
- * Reset doc_query_max entries and touched flags for only the documents that were
- * active in the current search.  This replaces the expensive full-matrix memset.
- */
-__global__ void cleanup_touched_docs_kernel(
-    float*       d_doc_query_max,                  // [Q_DOCLEN * num_docs] transposed
-    int*         d_doc_touched,                    // [num_docs] per-doc flag
-    const int*   __restrict__ d_touched_doc_list,  // [num_touched] compact doc IDs
-    int          num_touched,
-    size_t       num_docs
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_touched) return;
-
-    int doc_id = d_touched_doc_list[idx];
-    #pragma unroll
-    for (int q = 0; q < Q_DOCLEN; ++q) {
-        d_doc_query_max[(size_t)q * num_docs + doc_id] = 0.0f;
-    }
-    d_doc_touched[doc_id] = 0;
-}
-

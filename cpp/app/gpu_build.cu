@@ -1,5 +1,6 @@
 #include "build_gpu_index.hpp"
 #include "io.hpp"
+#include <iostream>
 
 int main(int argc, char* argv[]) {
     if (argc != 5 && argc != 7) {

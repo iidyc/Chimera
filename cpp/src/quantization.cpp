@@ -1,4 +1,10 @@
-#pragma once
+#include "quantization.hpp"
+
+#include <array>
+#include <queue>
+#include <vector>
+#include <algorithm>
+#include <cmath>
 
 #include "rabitqlib/defines.hpp"
 #include "rabitqlib/utils/space.hpp"
@@ -6,6 +12,7 @@
 
 using namespace rabitqlib;
 
+namespace {
 constexpr std::array<float, 9> kTightStart = {
     0,
     0.15,
@@ -17,9 +24,10 @@ constexpr std::array<float, 9> kTightStart = {
     0.77,
     0.81,
 };
+}
 
 // pack 0/1 data to unsigned integer (LSB-first: dimension i+j maps to bit j)
-inline void pack_binary(
+void pack_binary(
     const int* __restrict__ binary_code, uint64_t* __restrict__ compact_code, size_t length
 ) {
     constexpr size_t kTypeBits = sizeof(uint64_t) * 8;
@@ -34,7 +42,7 @@ inline void pack_binary(
     }
 }
 
-inline void encode_one_bit(const float* rotated_data, size_t dim, uint64_t* one_bit_code, float* factor) {
+void encode_one_bit(const float* rotated_data, size_t dim, uint64_t* one_bit_code, float* factor) {
     std::vector<int> binary_code(dim);
     ConstRowMajorArrayMap<float> data_arr(rotated_data, 1, dim);
     // x_u is the binary code
@@ -49,7 +57,7 @@ inline void encode_one_bit(const float* rotated_data, size_t dim, uint64_t* one_
     *factor = 1.0F / ip_obar_o;
 }
 
-inline double best_rescale_factor(const float* o_abs, size_t dim, size_t ex_bits) {
+double best_rescale_factor(const float* o_abs, size_t dim, size_t ex_bits) {
     constexpr double kEps = 1e-5;
     constexpr int kNEnum = 10;
     double max_o = *std::max_element(o_abs, o_abs + dim);
@@ -108,13 +116,12 @@ inline double best_rescale_factor(const float* o_abs, size_t dim, size_t ex_bits
     return t;
 }
 
-inline void quantize_ex(const float* rotated_data, uint8_t* ex_code, size_t dim, size_t ex_bits) {
+void quantize_ex(const float* rotated_data, uint8_t* ex_code, size_t dim, size_t ex_bits) {
     ConstRowMajorArrayMap<float> data_arr(rotated_data, 1, dim);
     RowMajorArray<float> abs_data = data_arr.rowwise().normalized().abs();
 
     constexpr double kEps = 1e-5;
     double t = best_rescale_factor(abs_data.data(), dim, ex_bits);
-    double ipnorm = 0;
 
     std::vector<int> tmp_code(dim);
     for (size_t i = 0; i < dim; i++) {
@@ -136,7 +143,7 @@ inline void quantize_ex(const float* rotated_data, uint8_t* ex_code, size_t dim,
     }
 }
 
-inline void encode_ex_bits(const float* rotated_data, size_t dim, size_t ex_bits, uint8_t* compact_ex_code, float* factor) {
+void encode_ex_bits(const float* rotated_data, size_t dim, size_t ex_bits, uint8_t* compact_ex_code, float* factor) {
     std::vector<uint8_t> ex_code(dim);
     quantize_ex(rotated_data, ex_code.data(), dim, ex_bits);
 
