@@ -14,7 +14,6 @@
 #include "estimator.hpp"
 #include "query.hpp"
 #include "ivf_pg.hpp"
-#include "ivf_dockmeans.hpp"
 
 using namespace rabitqlib;
 
@@ -30,7 +29,6 @@ struct cpu_mvr_index {
 
     IVFType ivf_type_ = IVFType::PG;
     IVF_PG* ivf = nullptr;
-    IVF_DocKMeans* ivf_dk_ = nullptr;
 
     std::vector<char> one_bit_code_;
     std::vector<char> ex_code_;
@@ -69,7 +67,8 @@ struct cpu_mvr_index {
         ip_func_ = select_excode_ipfunc(ex_bits);
 
         if (ivf_type_ == IVFType::DocKMeans) {
-            ivf_dk_ = new IVF_DocKMeans(n_clusters, d);
+            std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+            exit(0);
         } else {
             ivf = new IVF_PG(n_clusters, d);
         }
@@ -78,7 +77,8 @@ struct cpu_mvr_index {
     void build_index(const float* data, size_t max_kmeans_iter = 20) {
         quantize(data);
         if (ivf_type_ == IVFType::DocKMeans) {
-            ivf_dk_->build(data, doc_ptrs_.data(), num_docs, n, max_kmeans_iter);
+            std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+            exit(0);
         }
         // else: IVF_PG, call ivf->build_from_existing() separately
     }
@@ -425,8 +425,9 @@ struct cpu_mvr_index {
         of.write((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
         of.write((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
         of.close();
-        if (ivf_type_ == IVFType::DocKMeans && ivf_dk_) {
-            ivf_dk_->save(filename);
+        if (ivf_type_ == IVFType::DocKMeans) {
+            std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+            exit(0);
         }
         // else: ivf->save(filename);
     }
@@ -455,9 +456,8 @@ struct cpu_mvr_index {
         rot_in.close();
         inf.close();
         if (ivf_type_ == IVFType::DocKMeans) {
-            ivf_dk_ = new IVF_DocKMeans(n_clusters, d);
-            ivf_dk_->load(filename);
-            n_clusters = ivf_dk_->n_clusters; // ensure consistency
+            std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+            exit(0);
         } else {
             ivf = new IVF_PG(n_clusters, d);
             ivf->load(filename);
@@ -467,6 +467,5 @@ struct cpu_mvr_index {
     ~cpu_mvr_index() {
         delete rotator_;
         delete ivf;
-        delete ivf_dk_;
     }
 };

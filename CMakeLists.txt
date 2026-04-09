@@ -81,6 +81,3 @@ target_link_libraries(gpu_build PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
 add_executable(gpu_search_baseline expr/gpu_search_baseline.cu)
 set_target_properties(gpu_search_baseline PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(gpu_search_baseline PRIVATE cuvs::cuvs OpenMP::OpenMP_CXX rmm::rmm)
-
-add_executable(build_ivfdockmeans expr/build_ivfdockmeans.cpp)
-target_link_libraries(build_ivfdockmeans PRIVATE OpenMP::OpenMP_CXX)
