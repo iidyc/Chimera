@@ -29,17 +29,20 @@
 #include "gpu_config.cuh"
 
 
-#include <cuvs/neighbors/brute_force.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
 // ---------------------------------------------------------------------------
 // GPU-accelerated index build pipeline
 // ---------------------------------------------------------------------------
-// 1. Randomly sample centroids + GPU brute-force nearest-centroid assignment
-// 2. Build cuvs CAGRA graph on the centroids
-// 3. Quantize data (1-bit + extra-bits via RaBitQ)
-// 4. Assemble IVF_PG and serialize everything to disk
+// 1. Randomly sample centroids
+// 2. Build a temporary non-rotated CAGRA graph for fast centroid assignment
+// 3. Build the persisted CAGRA graph on rotated centroids
+// 4. Assemble IVF_PG, quantize data, and serialize everything to disk
+//
+// Steps 1 and 2 can optionally be bootstrapped from precomputed files
+// produced by expr/build_index_step12.py by passing non-empty
+// `bootstrap_centroids` and `bootstrap_list_nos` paths.
 // ---------------------------------------------------------------------------
 inline void build_index(
     const float* data,
@@ -48,74 +51,128 @@ inline void build_index(
     size_t n_clusters,
     size_t ex_bits,
     const std::vector<int>& doc_lens,
-    const std::string& filename)
+    const std::string& filename,
+    const std::string& bootstrap_centroids = "",
+    const std::string& bootstrap_list_nos = "")
 {
-    // ------------------------------------------------------------------
-    // Step 1: Randomly sample centroids and assign embeddings
-    // ------------------------------------------------------------------
-    std::cout << "[build_index] Step 1: Randomly sampling " << n_clusters
-              << " centroids from " << n << " vectors (d=" << d << ") ..." << std::endl;
+    const bool bootstrap = !bootstrap_centroids.empty() && !bootstrap_list_nos.empty();
 
-    // Randomly sample n_clusters indices without replacement
-    std::vector<size_t> indices(n);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::mt19937 rng(42);
-    std::shuffle(indices.begin(), indices.end(), rng);
-    indices.resize(n_clusters);
+    std::vector<float> centroids;
+    std::vector<int64_t> list_nos;
 
-    // Copy sampled centroids into a contiguous buffer
-    std::vector<float> centroids(n_clusters * d);
-    for (size_t i = 0; i < n_clusters; ++i) {
-        std::memcpy(&centroids[i * d], &data[indices[i] * d], d * sizeof(float));
+    if (bootstrap) {
+        // ------------------------------------------------------------------
+        // Bootstrap path: load centroids + assignments produced by the
+        // Python script (see expr/build_index_step12.py).
+        // ------------------------------------------------------------------
+        std::cout << "[build_index] Bootstrapping from "
+                  << bootstrap_centroids << " and " << bootstrap_list_nos
+                  << " (skipping steps 1 and 2)" << std::endl;
+
+        // centroids file: int32 n_clusters, int32 d, float32[n_clusters*d]
+        {
+            std::ifstream cf(bootstrap_centroids, std::ios::binary);
+            if (!cf.is_open()) {
+                throw std::runtime_error("Cannot open centroids file: " + bootstrap_centroids);
+            }
+            int32_t fnc = 0, fd = 0;
+            cf.read(reinterpret_cast<char*>(&fnc), sizeof(int32_t));
+            cf.read(reinterpret_cast<char*>(&fd), sizeof(int32_t));
+            if (static_cast<size_t>(fnc) != n_clusters || static_cast<size_t>(fd) != d) {
+                throw std::runtime_error(
+                    "Centroids file shape mismatch: got (" + std::to_string(fnc) + "," +
+                    std::to_string(fd) + "), expected (" + std::to_string(n_clusters) + "," +
+                    std::to_string(d) + ")");
+            }
+            centroids.resize(n_clusters * d);
+            cf.read(reinterpret_cast<char*>(centroids.data()),
+                    centroids.size() * sizeof(float));
+        }
+
+        // list_nos file: int32 n, then n int64 cluster ids
+        {
+            std::ifstream lf(bootstrap_list_nos, std::ios::binary);
+            if (!lf.is_open()) {
+                throw std::runtime_error("Cannot open list_nos file: " + bootstrap_list_nos);
+            }
+            int32_t fn = 0;
+            lf.read(reinterpret_cast<char*>(&fn), sizeof(int32_t));
+            if (static_cast<size_t>(fn) != n) {
+                throw std::runtime_error(
+                    "list_nos length mismatch: got " + std::to_string(fn) +
+                    ", expected " + std::to_string(n));
+            }
+            list_nos.resize(n);
+            lf.read(reinterpret_cast<char*>(list_nos.data()), n * sizeof(int64_t));
+        }
+
+        std::cout << "[build_index] Bootstrap load done." << std::endl;
+    } else {
+        // ------------------------------------------------------------------
+        // Step 1: Randomly sample centroids
+        // ------------------------------------------------------------------
+        std::cout << "[build_index] Step 1: Randomly sampling " << n_clusters
+                  << " centroids from " << n << " vectors (d=" << d << ") ..." << std::endl;
+
+        // Randomly sample n_clusters indices without replacement
+        std::vector<size_t> indices(n);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::mt19937 rng(42);
+        std::shuffle(indices.begin(), indices.end(), rng);
+        indices.resize(n_clusters);
+
+        // Copy sampled centroids into a contiguous buffer
+        centroids.resize(n_clusters * d);
+        for (size_t i = 0; i < n_clusters; ++i) {
+            std::memcpy(&centroids[i * d], &data[indices[i] * d], d * sizeof(float));
+        }
+
+        std::cout << "[build_index] Step 1 done. Sampled centroids." << std::endl;
+
+        // ------------------------------------------------------------------
+        // Step 2: Build non-rotated CAGRA and assign embeddings
+        // ------------------------------------------------------------------
+        std::cout << "[build_index] Step 2: Building temporary non-rotated CAGRA graph"
+                  << " for centroid assignment ..." << std::endl;
+
+        PG_CAGRA assignment_cagra(n_clusters, d);
+        assignment_cagra.build_index(centroids.data());
+
+        raft::resources res;
+        auto cuda_stream = raft::resource::get_cuda_stream(res);
+
+        // Assign each embedding to its nearest centroid (batched through CAGRA)
+        list_nos.resize(n);
+        constexpr size_t assign_batch = 65536;
+        float* d_q_ptr;
+        uint32_t* d_lab_ptr;
+        float* d_dist_ptr;
+        cudaMalloc(&d_q_ptr, assign_batch * d * sizeof(float));
+        cudaMalloc(&d_lab_ptr, assign_batch * sizeof(uint32_t));
+        cudaMalloc(&d_dist_ptr, assign_batch * sizeof(float));
+        std::vector<uint32_t> batch_labels(assign_batch);
+
+        for (size_t start = 0; start < n; start += assign_batch) {
+            int64_t cur = std::min(assign_batch, n - start);
+            cudaMemcpy(d_q_ptr, data + start * d, cur * d * sizeof(float), cudaMemcpyHostToDevice);
+
+            assignment_cagra.search_batch_gpu(d_q_ptr, cur, 1, d_dist_ptr, d_lab_ptr, cuda_stream);
+
+            cudaMemcpy(batch_labels.data(), d_lab_ptr, cur * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+            for (int64_t i = 0; i < cur; ++i) {
+                list_nos[start + i] = static_cast<int64_t>(batch_labels[i]);
+            }
+        }
+        raft::resource::sync_stream(res);
+
+        cudaFree(d_q_ptr);
+        cudaFree(d_lab_ptr);
+        cudaFree(d_dist_ptr);
+
+        std::cout << "[build_index] Step 2 done. Embeddings assigned with non-rotated CAGRA." << std::endl;
     }
 
-    // GPU brute-force nearest-centroid assignment using cuvs
-    raft::resources res;
-    auto cuda_stream = raft::resource::get_cuda_stream(res);
-
-    float* d_centroids_ptr;
-    cudaMalloc(&d_centroids_ptr, n_clusters * d * sizeof(float));
-    cudaMemcpy(d_centroids_ptr, centroids.data(), n_clusters * d * sizeof(float), cudaMemcpyHostToDevice);
-
-    auto bf_index = cuvs::neighbors::brute_force::build(
-        res,
-        raft::make_device_matrix_view<const float>(d_centroids_ptr, (int64_t)n_clusters, (int64_t)d),
-        cuvs::distance::DistanceType::InnerProduct
-    );
-
-    // Assign each embedding to its nearest centroid (batched)
-    std::vector<int64_t> list_nos(n);
-    constexpr size_t assign_batch = 65536;
-    float* d_q_ptr;
-    int64_t* d_lab_ptr;
-    float* d_dist_ptr;
-    cudaMalloc(&d_q_ptr, assign_batch * d * sizeof(float));
-    cudaMalloc(&d_lab_ptr, assign_batch * sizeof(int64_t));
-    cudaMalloc(&d_dist_ptr, assign_batch * sizeof(float));
-
-    for (size_t start = 0; start < n; start += assign_batch) {
-        int64_t cur = std::min(assign_batch, n - start);
-        cudaMemcpy(d_q_ptr, data + start * d, cur * d * sizeof(float), cudaMemcpyHostToDevice);
-
-        cuvs::neighbors::brute_force::search(
-            res, bf_index,
-            raft::make_device_matrix_view<const float>(d_q_ptr, cur, (int64_t)d),
-            raft::make_device_matrix_view<int64_t>(d_lab_ptr, cur, (int64_t)1),
-            raft::make_device_matrix_view<float>(d_dist_ptr, cur, (int64_t)1)
-        );
-
-        cudaMemcpy(list_nos.data() + start, d_lab_ptr, cur * sizeof(int64_t), cudaMemcpyDeviceToHost);
-    }
-    raft::resource::sync_stream(res);
-
-    cudaFree(d_q_ptr);
-    cudaFree(d_lab_ptr);
-    cudaFree(d_dist_ptr);
-    cudaFree(d_centroids_ptr);
-
-    std::cout << "[build_index] Step 1 done. Centroids sampled, embeddings assigned." << std::endl;
-
-    // Load rotator early — needed for centroid rotation (Step 2) and quantization (Step 4)
+    // Load rotator early — needed for centroid rotation (Step 3) and quantization (Step 5)
     Rotator<float>* rotator = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);
     std::ifstream rot_in("rotator.bin", std::ios::binary);
     if (!rot_in.is_open()) {
@@ -125,11 +182,9 @@ inline void build_index(
     rot_in.close();
 
     // ------------------------------------------------------------------
-    // Step 2: Build CAGRA graph on ROTATED centroids
+    // Step 3: Build CAGRA graph on ROTATED centroids
     // ------------------------------------------------------------------
-    // At search time, CAGRA is queried with rotated queries, so the
-    // centroids must also be in the rotated space for correct retrieval.
-    std::cout << "[build_index] Step 2: Rotating centroids and building CAGRA graph on "
+    std::cout << "[build_index] Step 3: Rotating centroids and building persisted CAGRA graph on "
               << n_clusters << " centroids ..." << std::endl;
 
     std::vector<float> rotated_centroids(n_clusters * PADDED_DIM);
@@ -140,12 +195,12 @@ inline void build_index(
     PG_CAGRA* pg_cagra = new PG_CAGRA(n_clusters, PADDED_DIM);
     pg_cagra->build_index(rotated_centroids.data());
 
-    std::cout << "[build_index] Step 2 done. CAGRA graph built." << std::endl;
+    std::cout << "[build_index] Step 3 done. Persisted rotated CAGRA graph built." << std::endl;
 
     // ------------------------------------------------------------------
-    // Step 3: Assemble IVF_PG
+    // Step 4: Assemble IVF_PG
     // ------------------------------------------------------------------
-    std::cout << "[build_index] Step 3: Assembling IVF_PG ..." << std::endl;
+    std::cout << "[build_index] Step 4: Assembling IVF_PG ..." << std::endl;
 
     IVF_PG* ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
     // Replace the default-constructed PG_CAGRA with the one we already built
@@ -155,12 +210,12 @@ inline void build_index(
     ivf->build_from_assignments(list_nos.data(), n);
     ivf->save(filename);
 
-    std::cout << "[build_index] Step 3 done. IVF_PG assembled and saved." << std::endl;
+    std::cout << "[build_index] Step 4 done. IVF_PG assembled and saved." << std::endl;
 
     // ------------------------------------------------------------------
-    // Step 4: Quantize data (1-bit + extra-bits)
+    // Step 5: Quantize data (1-bit + extra-bits)
     // ------------------------------------------------------------------
-    std::cout << "[build_index] Step 4: Quantizing " << n << " vectors ..." << std::endl;
+    std::cout << "[build_index] Step 5: Quantizing " << n << " vectors ..." << std::endl;
 
     std::vector<char>  one_bit_code(n * PADDED_DIM / 8);
     std::vector<char>  ex_code(n * PADDED_DIM * ex_bits / 8);
@@ -192,12 +247,12 @@ inline void build_index(
         }
     }
 
-    std::cout << "[build_index] Step 4 done. Quantization complete." << std::endl;
+    std::cout << "[build_index] Step 5 done. Quantization complete." << std::endl;
 
     // ------------------------------------------------------------------
-    // Step 5: Serialize index (matches gpu_mvr_index constructor format)
+    // Step 6: Serialize index payload (matches gpu_mvr_index constructor format)
     // ------------------------------------------------------------------
-    std::cout << "[build_index] Step 5: Saving index to " << filename << " ..." << std::endl;
+    std::cout << "[build_index] Step 6: Saving index payload to " << filename << " ..." << std::endl;
 
     {
         std::ofstream of(filename, std::ios::binary);
@@ -218,77 +273,4 @@ inline void build_index(
     delete rotator;
 
     std::cout << "[build_index] Done. Index saved to: " << filename << std::endl;
-}
-
-
-// ---------------------------------------------------------------------------
-// Patch utility: rebuild only the CAGRA graph with rotated centroids
-// ---------------------------------------------------------------------------
-// Recomputes cluster centroids from raw data + IVF assignments, rotates them,
-// builds a new CAGRA graph, and overwrites only the .ivf.cagra file.
-// Much faster than a full rebuild since IVF assignments and quantization are kept.
-// ---------------------------------------------------------------------------
-inline void rebuild_cagra_rotated(
-    size_t n_clusters,
-    size_t d,
-    const std::string& filename)
-{
-    // 1. Load existing centroids from the saved CAGRA index (cuvs format)
-    std::cout << "[rebuild_cagra] Loading CAGRA from " << filename << ".ivf.cagra ..." << std::endl;
-    PG_CAGRA old_pg(n_clusters, d);
-    old_pg.load(filename + ".ivf");
-    // Extract dataset from GPU-resident CAGRA index
-    auto dataset = old_pg.index_cagra->dataset();
-    std::vector<float> raw_centroids(n_clusters * d);
-    cudaMemcpy(raw_centroids.data(), dataset.data_handle(),
-               n_clusters * d * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // // 2. Load rotator and rotate centroids
-    Rotator<float>* rotator = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);
-    std::ifstream rot_in("rotator.bin", std::ios::binary);
-    if (!rot_in.is_open()) {
-        throw std::runtime_error("Cannot open rotator.bin");
-    }
-    rotator->load(rot_in);
-    rot_in.close();
-
-    // std::cout << "[rebuild_cagra] Rotating " << n_clusters << " centroids ..." << std::endl;
-    // std::vector<float> rotated_centroids(n_clusters * PADDED_DIM);
-    // #pragma omp parallel for
-    // for (size_t i = 0; i < n_clusters; ++i) {
-    //     rotator->rotate(&raw_centroids[i * d], &rotated_centroids[i * PADDED_DIM]);
-    // }
-
-    std::ofstream centroids_out("rotated_centroids.bin", std::ios::binary);
-    centroids_out.write((char*)&n_clusters, sizeof(size_t));
-    centroids_out.write((char*)&d, sizeof(size_t));
-    centroids_out.write((char*)raw_centroids.data(), raw_centroids.size() * sizeof(float));
-    centroids_out.close();
-    std::cout << "[rebuild_cagra] Rotated centroids saved to rotated_centroids.bin for inspection." << std::endl;
-
-    size_t num_q, q_doclen_file;
-    std::vector<float> Q = load_query(q_doclen_file, num_q, d);
-    std::vector<float> rotated_Q(num_q * PADDED_DIM);
-#pragma omp parallel for
-    for (size_t i = 0; i < num_q; ++i) {
-        rotator->rotate(&Q[i * d], &rotated_Q[i * PADDED_DIM]);
-    }
-    std::ofstream query_out("rotated_queries.bin", std::ios::binary);
-    query_out.write((char*)&num_q, sizeof(size_t));
-    query_out.write((char*)&d, sizeof(size_t));
-    query_out.write((char*)rotated_Q.data(), rotated_Q.size() * sizeof(float));
-    query_out.close();
-    std::cout << "[rebuild_cagra] Rotated queries saved to rotated_queries.bin for inspection." << std::endl;
-
-    // // 3. Build new CAGRA graph on rotated centroids
-    // std::cout << "[rebuild_cagra] Building CAGRA graph ..." << std::endl;
-    // PG_CAGRA pg_cagra(n_clusters, PADDED_DIM);
-    // pg_cagra.build_index(rotated_centroids.data());
-
-    // // 4. Save only the CAGRA file (overwrite .ivf.cagra)
-    // std::cout << "[rebuild_cagra] Saving CAGRA to " << filename << ".ivf.cagra ..." << std::endl;
-    // pg_cagra.save(filename + ".ivf");
-
-    // delete rotator;
-    // std::cout << "[rebuild_cagra] Done." << std::endl;
 }

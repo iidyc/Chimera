@@ -25,12 +25,11 @@ struct Timer {
     }
 };
 
-std::vector<std::vector<size_t>> read_gt_tsv(int num_queries, int top_k) {
-    const std::string baseline_tsv_name = "lotte-groundtruth-top1000--.tsv";
+std::vector<std::vector<size_t>> read_gt_tsv(int num_queries, int top_k, const std::string& gt_filename = "lotte-groundtruth-top1000--.tsv") {
     std::vector<std::vector<size_t>> ground_truth(num_queries, std::vector<size_t>(top_k, -1));
-    std::ifstream file(baseline_tsv_name);
+    std::ifstream file(gt_filename);
     if (!file.is_open()) {
-        std::cerr << "Error: Could not open file " << baseline_tsv_name << std::endl;
+        std::cerr << "Error: Could not open file " << gt_filename << std::endl;
         return ground_truth; 
     }
     std::string line;

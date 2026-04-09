@@ -46,6 +46,7 @@ add_compile_options(
 add_compile_options(
     $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=68,177,186>
 )
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations")
 
 add_compile_definitions(GPU_MVR_PROFILE)
 # add_compile_definitions(GPU_MVR_TIMELINE)

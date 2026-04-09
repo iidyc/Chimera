@@ -112,7 +112,7 @@ struct gpu_mvr_index {
 
     // Search parameters
     int nprobe = 128;
-    int k_rank_cluster = 5000;    
+    int k_rank_cluster = 3000;    
     int k_rank_all_tokens = 300;
 
     // Pre-allocated GPU workspace (sized for worst-case per search)
@@ -212,6 +212,7 @@ struct gpu_mvr_index {
         cudaStream_t stream_compute;
         cudaStream_t stream_h2d;
         cudaStream_t stream_d2h;
+        cudaStream_t stream_extract;  // high-priority stream for extract kernel
 
         // H2D completion event (reused across searches)
         cudaEvent_t event_h2d_done;
@@ -555,10 +556,15 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMemset(ws_.d_doc_touched, 0, ws_.estimated_num_docs * sizeof(int)));
         CUDA_CHECK(cudaMemset(ws_.d_num_unique_docs, 0, sizeof(int)));
 
-        // === Create CUDA streams ===
-        CUDA_CHECK(cudaStreamCreate(&ws_.stream_compute));
+        // === Create CUDA streams (with priority partitioning) ===
+        // Extract kernel uses 1 SM; give it highest priority so the GPU
+        // scheduler preempts compute-stream blocks immediately.
+        int least_prio, greatest_prio;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_prio, &greatest_prio));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&ws_.stream_compute, cudaStreamDefault, least_prio));
         CUDA_CHECK(cudaStreamCreate(&ws_.stream_h2d));
         CUDA_CHECK(cudaStreamCreate(&ws_.stream_d2h));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&ws_.stream_extract, cudaStreamDefault, greatest_prio));
         CUDA_CHECK(cudaEventCreate(&ws_.event_h2d_done));
 
         // === NEW: Create profiling events ===
@@ -1083,7 +1089,7 @@ struct gpu_mvr_index {
         auto tl_base_cpu = std::chrono::high_resolution_clock::now();
 
         struct TLSpan { int start_us, end_us; std::string name, type; };
-        std::vector<TLSpan> tl_gpu_compute, tl_gpu_d2h, tl_cpu;
+        std::vector<TLSpan> tl_gpu_compute, tl_gpu_d2h, tl_gpu_extract, tl_cpu;
         int tl_actual_chunks = 0; // set later when actual_chunks is known
 
         auto tl_cpu_us = [&](std::chrono::high_resolution_clock::time_point tp) -> int {
@@ -1093,7 +1099,7 @@ struct gpu_mvr_index {
             float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, tl_base, e)); return (int)(ms * 1000.0f);
         };
 
-        // Phase C stream_d2h events (per-chunk)
+        // Phase C stream_d2h + stream_extract events (per-chunk)
         cudaEvent_t tl_c_wait_ev[N_OVERLAP_CHUNKS], tl_c_scores_s[N_OVERLAP_CHUNKS];
         cudaEvent_t tl_c_scores_e[N_OVERLAP_CHUNKS];
         cudaEvent_t tl_c_extract_s[N_OVERLAP_CHUNKS], tl_c_extract_m[N_OVERLAP_CHUNKS], tl_c_extract_e[N_OVERLAP_CHUNKS];
@@ -1197,9 +1203,9 @@ struct gpu_mvr_index {
         float time_phase_a = std::chrono::duration<float, std::milli>(t_cpu6 - t_start_phase_a).count();
 
         // ========================================
-        // Phase B: Launch chunk 0 GPU kernels on stream_compute
-        //          Chunks 1+ launched in Phase C after previous chunk's extract
-        //          D2H managed per-chunk in Phase C on stream_d2h
+        // Phase B: Launch ALL chunk GPU kernels on low-priority stream_compute
+        //          D2H of scores enqueued per-chunk on stream_d2h
+        //          Extract kernels launched in Phase C on high-priority stream_extract
         // ========================================
 
         auto t_start_phase_b = std::chrono::high_resolution_clock::now();
@@ -1327,12 +1333,13 @@ struct gpu_mvr_index {
             CUDA_CHECK(cudaEventRecord(chunk_d2h_done[c], stream_d2h));
         };
 
-        // Launch only chunk 0 upfront; chunks 1+ are launched in Phase C
-        // after the previous chunk's extract_one_bit_dists_kernel_v2 to avoid contention.
-        launch_chunk_compute(0);
-
-                // Record event after chunk 0 GPU scoring (updated to stream for chunk 0 only;
-                // s23_pst_kernel_end is recorded inside launch_chunk_compute for the last chunk)
+        // Launch ALL chunks upfront.  Compute kernels are on the low-priority
+        // stream_compute while extract runs on the high-priority stream_extract,
+        // so the single-block extract kernel gets an SM immediately without
+        // contending with binary_ip / doc_score blocks.
+        for (int c = 0; c < actual_chunks; c++) {
+            launch_chunk_compute(c);
+        }
         CUDA_CHECK(cudaEventRecord(ws_.pst_extract_done, stream));
         auto t_end_phase_b = std::chrono::high_resolution_clock::now();
         float time_phase_b = std::chrono::duration<float, std::milli>(t_end_phase_b - t_start_phase_b).count();
@@ -1424,8 +1431,6 @@ struct gpu_mvr_index {
             }
 
             if (new_docs.empty()) {
-                // Launch next chunk's compute before skipping
-                if (c + 1 < actual_chunks) launch_chunk_compute(c + 1);
 #ifdef GPU_MVR_TIMELINE
                 auto t_skip = std::chrono::high_resolution_clock::now();
                 tl_cpu.push_back({tl_cpu_us(t2), tl_cpu_us(t_skip), "identify_c" + std::to_string(c), "async"});
@@ -1456,49 +1461,32 @@ struct gpu_mvr_index {
             }
             size_t total_sel_tokens = h_out_offsets[to_refine];
 
-            // --- Launch GPU extract + D2H (async on stream_d2h) ---
-            // H2D of metadata (tiny, synchronous due to pageable memory — negligible)
+            // --- Launch GPU extract on high-priority stream_extract ---
+            // Gate on chunk c's compute completion so d_token_dists is ready.
+            cudaStream_t stream_extract = ws_.stream_extract;
+            CUDA_CHECK(cudaStreamWaitEvent(stream_extract, chunk_compute_done[c], 0));
 #ifdef GPU_MVR_TIMELINE
-            CUDA_CHECK(cudaEventRecord(tl_c_extract_s[c], stream_d2h));
+            CUDA_CHECK(cudaEventRecord(tl_c_extract_s[c], stream_extract));
             tl_c_has_extract[c] = true;
 #endif
-            XFER_RECORD_BEGIN(stream_d2h);
+            XFER_RECORD_BEGIN(stream_extract);
             CUDA_CHECK(cudaMemcpyAsync(ws_.d_selected_indices, h_sel_indices.data(),
                                         to_refine * sizeof(int),
-                                        cudaMemcpyHostToDevice, stream_d2h));
+                                        cudaMemcpyHostToDevice, stream_extract));
             CUDA_CHECK(cudaMemcpyAsync(ws_.d_out_offsets, h_out_offsets.data(),
                                         (to_refine + 1) * sizeof(size_t),
-                                        cudaMemcpyHostToDevice, stream_d2h));
-            XFER_RECORD_END(stream_d2h, to_refine * sizeof(int) + (to_refine + 1) * sizeof(size_t), true);
-            // Extract kernel: compacts scattered 1-bit dists into contiguous output
-//             extract_one_bit_dists_kernel<<<to_refine, 256, 0, stream_d2h>>>(
-//                 ws_.d_token_dists, ws_.d_pst_candidate_offsets,
-//                 ws_.d_selected_indices, ws_.d_out_one_bit_dists,
-//                 ws_.d_out_offsets, total_tokens, (size_t)to_refine
-//             );
-//             CUDA_CHECK(cudaGetLastError());
-// #ifdef GPU_MVR_TIMELINE
-//             CUDA_CHECK(cudaEventRecord(tl_c_extract_m[c], stream_d2h));
-// #endif
-//             // D2H extracted dists (contiguous, async — pinned target)
-//             XFER_RECORD_BEGIN(stream_d2h);
-//             CUDA_CHECK(cudaMemcpyAsync(ws_.h_pinned_dists, ws_.d_out_one_bit_dists,
-//                                         total_sel_tokens * Q_DOCLEN * sizeof(float),
-//                                         cudaMemcpyDeviceToHost, stream_d2h));
-//             XFER_RECORD_END(stream_d2h, total_sel_tokens * Q_DOCLEN * sizeof(float), false);
-            extract_one_bit_dists_kernel_v2<<<1, 1024, 0, stream_d2h>>>(
+                                        cudaMemcpyHostToDevice, stream_extract));
+            XFER_RECORD_END(stream_extract, to_refine * sizeof(int) + (to_refine + 1) * sizeof(size_t), true);
+            extract_one_bit_dists_kernel_v2<<<1, 1024, 0, stream_extract>>>(
                 ws_.d_token_dists, ws_.d_pst_candidate_offsets,
                 ws_.d_selected_indices, ws_.d_pinned_dists,
                 ws_.d_out_offsets, total_tokens, (size_t)to_refine
             );
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaEventRecord(chunk_extract_done[c], stream_d2h));
+            CUDA_CHECK(cudaEventRecord(chunk_extract_done[c], stream_extract));
 #ifdef GPU_MVR_TIMELINE
-            CUDA_CHECK(cudaEventRecord(tl_c_extract_e[c], stream_d2h));
+            CUDA_CHECK(cudaEventRecord(tl_c_extract_e[c], stream_extract));
 #endif
-            // Launch next chunk's compute after this chunk's extract is enqueued,
-            // so stage2_binary_ip_kernel_v2 doesn't contend with extract on GPU.
-            if (c + 1 < actual_chunks) launch_chunk_compute(c + 1);
             auto t4 = std::chrono::high_resolution_clock::now();
             time_gpu_extract += std::chrono::duration<double, std::milli>(t4 - t3).count();
 #ifdef GPU_MVR_TIMELINE
@@ -1588,6 +1576,7 @@ struct gpu_mvr_index {
         {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaStreamSynchronize(stream_d2h));
+            CUDA_CHECK(cudaStreamSynchronize(ws_.stream_extract));
 
             // --- Build GPU compute spans (Phase A on stream_compute) ---
             tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_start_event), tl_gpu_us(ws_.phase_a_gather_done_event), "gather_doc_lengths", "async"});
@@ -1616,7 +1605,7 @@ struct gpu_mvr_index {
                         "d2h_scores_c" + std::to_string(c), "condition"});
                 }
                 if (tl_c_has_extract[c]) {
-                    tl_gpu_d2h.push_back({tl_gpu_us(tl_c_extract_s[c]), tl_gpu_us(tl_c_extract_e[c]),
+                    tl_gpu_extract.push_back({tl_gpu_us(tl_c_extract_s[c]), tl_gpu_us(tl_c_extract_e[c]),
                         "extract_v2_c" + std::to_string(c), "module"});
                 }
             }
@@ -1635,6 +1624,7 @@ struct gpu_mvr_index {
             auto span_cmp = [](const TLSpan& a, const TLSpan& b) { return a.start_us < b.start_us; };
             std::sort(tl_gpu_compute.begin(), tl_gpu_compute.end(), span_cmp);
             std::sort(tl_gpu_d2h.begin(), tl_gpu_d2h.end(), span_cmp);
+            std::sort(tl_gpu_extract.begin(), tl_gpu_extract.end(), span_cmp);
             std::sort(tl_cpu.begin(), tl_cpu.end(), span_cmp);
 
             // --- Write JSON ---
@@ -1656,6 +1646,10 @@ struct gpu_mvr_index {
             // Worker 2: stream_d2h
             oss << "{\"worker\":2,\"level\":0,\"data\":[";
             write_spans(oss, tl_gpu_d2h);
+            oss << "]},";
+            // Worker 3: stream_extract (high-priority)
+            oss << "{\"worker\":3,\"level\":0,\"data\":[";
+            write_spans(oss, tl_gpu_extract);
             oss << "]}]},";
             // Executor 1: CPU
             oss << "{\"executor\":1,\"data\":[";
@@ -1890,6 +1884,7 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaStreamDestroy(ws_.stream_compute));
         CUDA_CHECK(cudaStreamDestroy(ws_.stream_h2d));
         CUDA_CHECK(cudaStreamDestroy(ws_.stream_d2h));
+        CUDA_CHECK(cudaStreamDestroy(ws_.stream_extract));
         CUDA_CHECK(cudaEventDestroy(ws_.event_h2d_done));
 
 #ifdef GPU_MVR_PROFILE
