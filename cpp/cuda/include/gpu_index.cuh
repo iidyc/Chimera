@@ -107,6 +107,13 @@ struct gpu_mvr_index {
     int*   d_inv_list_;
     size_t* d_cluster_pos_;
 
+    // Cluster-ordered copies: data reordered by inv_list so that vectors
+    // in the same cluster are contiguous in memory. Stage-1 reads these
+    // instead of the original arrays for coalesced global memory access.
+    char*  d_clustered_code_;
+    float* d_clustered_factor_;
+    int*   d_clustered_doc_ids_;
+
     // Search parameters
     int nprobe = 128;
     int k_rank_cluster = 3000;
@@ -270,7 +277,7 @@ struct gpu_mvr_index {
         int& actual_k_out,
         cudaStream_t stream = 0);
 
-    static constexpr int N_OVERLAP_CHUNKS = 4;
+    static constexpr int N_OVERLAP_CHUNKS = 5;
     int PRELIM_PER_CHUNK = k_rank_all_tokens / N_OVERLAP_CHUNKS;
 
     void rank_stage23_persistent(

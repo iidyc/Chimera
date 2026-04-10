@@ -2,6 +2,18 @@
 
 #include <cfloat>
 
+// Atomic max for floats using compare-and-swap
+__device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
+    int* address_as_int = (int*)address;
+    int old = *address_as_int, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_int, assumed,
+                       __float_as_int(fmaxf(val, __int_as_float(assumed))));
+    } while (assumed != old);
+    return __int_as_float(old);
+}
+
 __global__ void stage1_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
@@ -143,58 +155,143 @@ __global__ void precompute_lut_kernel(
     }
 }
 
+// Fused stage1 kernel: computes per-(query, emb) binary IP distances and
+// directly performs the doc-level atomicMax aggregation + touched-list
+// tracking inline.
+//
+// v3 — flat iteration with preloaded cluster metadata:
+//   1. Cooperatively preload all (cluster_start, cluster_size) pairs
+//      into shared memory, eliminating per-cluster global loads from
+//      the hot loop.
+//   2. Compute a prefix sum of cluster sizes → flat element indices.
+//   3. Single grid-stride loop over ALL elements across all clusters.
+//      A 7-step binary search (on smem) maps flat_idx → (cluster, local).
+//      This removes the 128-iteration cluster loop overhead and ensures
+//      every thread does useful work (no idle threads on small clusters).
+//   4. 128-bit vectorized code load (uint4) + 32-bit nibble extraction
+//      (halves shift instructions vs uint64_t).
+//   5. Read-before-atomic guard on d_doc_query_max.
+//
+// Grid: (blocks_x, Q_DOCLEN).
+// Requires d_doc_query_max, d_doc_touched to be zero-initialised.
+#define STAGE1_MAX_NPROBE 256
+
 __global__ void stage1_binary_ip_lut_kernel(
-    const float* __restrict__ d_lut,
-    const char*  __restrict__ d_one_bit_code,
-    const float* __restrict__ d_one_bit_factor,
-    const float* __restrict__ d_cb1_sumq,
-    const size_t* __restrict__ d_emb_ids,
-    const int*   __restrict__ d_pair_offsets,
-    float* __restrict__ d_out_dists,
-    size_t max_embs_per_query
+    const float*    __restrict__ d_lut,
+    const char*     __restrict__ d_clustered_code,
+    const float*    __restrict__ d_clustered_factor,
+    const float*    __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_clustered_doc_ids,
+    float*       d_doc_query_max,
+    int*         d_doc_touched,
+    int*         d_touched_doc_list,
+    int*         d_num_touched_docs,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
 ) {
-    __shared__ float smem_lut[LUT_ENTRIES_PER_QUERY];
+    __shared__ float    smem_lut[LUT_ENTRIES_PER_QUERY];     // 2048 B
+    __shared__ uint32_t smem_cstart[STAGE1_MAX_NPROBE];      // 1024 B
+    __shared__ int      smem_prefix[STAGE1_MAX_NPROBE + 1];  // 1028 B
 
     const int query_idx = blockIdx.y;
     if (query_idx >= Q_DOCLEN) return;
 
+    // ---- Phase 1: Load LUT into smem ----
     const float* lut_ptr = d_lut + query_idx * LUT_ENTRIES_PER_QUERY;
-    #pragma unroll
     for (int i = threadIdx.x; i < LUT_ENTRIES_PER_QUERY; i += blockDim.x) {
         smem_lut[i] = lut_ptr[i];
     }
+
+    // ---- Phase 2: Cooperatively load cluster metadata ----
+    const uint32_t* my_labels = d_cagra_labels + query_idx * nprobe;
+    for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
+        uint32_t label = my_labels[p];
+        if (label < (uint32_t)n_clusters) {
+            size_t start = d_cluster_pos[label];
+            smem_cstart[p] = (uint32_t)start;
+            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+        } else {
+            smem_cstart[p] = 0;
+            smem_prefix[p + 1] = 0;
+        }
+    }
+    if (threadIdx.x == 0) smem_prefix[0] = 0;
     __syncthreads();
 
-    const float cb1_sumq = d_cb1_sumq[query_idx];
-    const size_t pair_start = d_pair_offsets[query_idx];
-    const size_t pair_end   = d_pair_offsets[query_idx + 1];
-    const size_t num_embs   = pair_end - pair_start;
+    // ---- Phase 3: Prefix sum of cluster sizes (sequential, ~128 adds) ----
+    if (threadIdx.x == 0) {
+        for (int i = 1; i <= nprobe; i++)
+            smem_prefix[i] += smem_prefix[i - 1];
+    }
+    __syncthreads();
 
-    for (size_t idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
-         idx < num_embs;
-         idx += (size_t)blockDim.x * gridDim.x)
+    const int   total_elements = smem_prefix[nprobe];
+    const float cb1_sumq       = d_cb1_sumq[query_idx];
+
+    // ---- Phase 4: Flat grid-stride loop over all elements ----
+    for (int flat_idx = threadIdx.x + blockIdx.x * blockDim.x;
+         flat_idx < total_elements;
+         flat_idx += blockDim.x * gridDim.x)
     {
-        const size_t emb_id = d_emb_ids[pair_start + idx];
-        const uint64_t* code_ptr =
-            (const uint64_t*)(d_one_bit_code + emb_id * CODE_BYTES);
-        uint64_t code_regs[NUM_U64];
-        code_regs[0] = code_ptr[0];
-        code_regs[1] = code_ptr[1];
+        // Binary search: find the probe whose prefix range contains flat_idx.
+        // 7 steps for nprobe ≤ 128, all on shared memory (~28 cycles).
+        int lo = 0, hi = nprobe;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (smem_prefix[mid + 1] <= flat_idx)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
 
+        // 128-bit vectorized code load (one LDG.128 instead of two LDG.64).
+        const uint4 code128 = *reinterpret_cast<const uint4*>(
+            d_clustered_code + emb_pos * CODE_BYTES);
+
+        // Issue factor + doc_id loads early — their ~400-cycle latency
+        // overlaps with the 32-step LUT computation below.
+        const float factor = d_clustered_factor[emb_pos];
+        const int   doc_id = d_clustered_doc_ids[emb_pos];
+
+        // 32-bit nibble extraction: uses native 32-bit shifts (1 PTX insn
+        // each) instead of 64-bit shifts (2 PTX insns each). 4 unrolled
+        // blocks of 8 nibbles from uint4 members .x/.y/.z/.w.
         float ip = 0.0f;
         #pragma unroll
-        for (int blk = 0; blk < NUM_U64; blk++) {
-            uint64_t code = code_regs[blk];
-            #pragma unroll
-            for (int n = 0; n < 16; n++) {
-                int nibble = (code >> (n * 4)) & 0xF;
-                int chunk_idx = blk * 16 + n;
-                ip += smem_lut[chunk_idx * LUT_SIZE + nibble];
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[n * LUT_SIZE + ((code128.x >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(8 + n) * LUT_SIZE + ((code128.y >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(16 + n) * LUT_SIZE + ((code128.z >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(24 + n) * LUT_SIZE + ((code128.w >> (n * 4)) & 0xF)];
+
+        float dist = (ip - cb1_sumq) * factor;
+
+        if (dist > 0.0f && (size_t)doc_id < num_docs) {
+            float* slot = &d_doc_query_max[(size_t)doc_id * Q_DOCLEN + query_idx];
+            if (dist > *slot) {
+                atomicMax(
+                    reinterpret_cast<int*>(slot),
+                    __float_as_int(dist));
+            }
+
+            if (d_doc_touched[doc_id] == 0) {
+                int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
+                if (was_touched == 0) {
+                    int pos = atomicAdd(d_num_touched_docs, 1);
+                    d_touched_doc_list[pos] = doc_id;
+                }
             }
         }
-
-        float dist = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
-        d_out_dists[query_idx * max_embs_per_query + idx] = dist;
     }
 }
 
@@ -460,7 +557,8 @@ __global__ void expand_cluster_ids_kernel(
     size_t*             d_emb_ids,
     int                 nprobe,
     size_t              n_clusters,
-    size_t              num_queries
+    size_t              num_queries,
+    bool                use_clustered_layout
 ) {
     size_t query_idx = blockIdx.x;
     if (query_idx >= num_queries) return;
@@ -476,8 +574,17 @@ __global__ void expand_cluster_ids_kernel(
         size_t cluster_end = d_cluster_pos[cluster_id + 1];
         size_t cluster_size = cluster_end - cluster_start;
 
-        for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
-            d_emb_ids[out_start + write_pos + i] = d_inv_list[cluster_start + i];
+        if (use_clustered_layout) {
+            // Emit the cluster-local position directly. The caller will
+            // index into d_clustered_code/factor/doc_ids which are already
+            // reordered by inv_list, so the position IS the access index.
+            for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
+                d_emb_ids[out_start + write_pos + i] = cluster_start + i;
+            }
+        } else {
+            for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
+                d_emb_ids[out_start + write_pos + i] = d_inv_list[cluster_start + i];
+            }
         }
 
         write_pos += cluster_size;
@@ -499,18 +606,6 @@ __global__ void gather_doc_lengths_kernel(
     d_doc_lengths[idx] = doc_len;
 }
 
-// Atomic max for floats using compare-and-swap
-__device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
-    int* address_as_int = (int*)address;
-    int old = *address_as_int, assumed;
-    do {
-        assumed = old;
-        old = atomicCAS(address_as_int, assumed,
-                       __float_as_int(fmaxf(val, __int_as_float(assumed))));
-    } while (assumed != old);
-    return __int_as_float(old);
-}
-
 __global__ void aggregate_stage1_tracked_kernel(
     const size_t* __restrict__ d_emb_ids,
     const float*  __restrict__ d_emb_dists,
@@ -524,33 +619,36 @@ __global__ void aggregate_stage1_tracked_kernel(
     size_t        total_pairs,
     size_t        max_embs_per_query
 ) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_pairs) return;
+    // Grid: (blocks_x, Q_DOCLEN). blockIdx.y encodes q_idx, eliminating binary search.
+    const int q_idx = blockIdx.y;
+    if (q_idx >= Q_DOCLEN) return;
 
-    int q_idx;
-    {
-        int lo = 0, hi = Q_DOCLEN;
-        while (lo < hi) {
-            int mid = (lo + hi) >> 1;
-            if ((size_t)d_pair_offsets[mid + 1] <= idx) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        q_idx = lo;
-    }
+    const int pair_start = d_pair_offsets[q_idx];
+    const int pair_end   = d_pair_offsets[q_idx + 1];
+    const int num_embs   = pair_end - pair_start;
 
-    size_t emb_id = d_emb_ids[idx];
-    int doc_id = d_doc_ids[emb_id];
+    const int local_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_idx >= num_embs) return;
 
-    int local_pair_idx = (int)(idx - (size_t)d_pair_offsets[q_idx]);
-    float dist = d_emb_dists[(size_t)q_idx * max_embs_per_query + local_pair_idx];
+    // Load emb dist first. If it is non-positive, the atomicMax on the
+    // zero-initialized d_doc_query_max is guaranteed to be a no-op, so we
+    // can skip both the atomic and the touched-list bookkeeping. This is
+    // the single biggest cost in this kernel — in the doc-major layout
+    // each atomic goes to its own cache line, so halving the atomic count
+    // ~halves the kernel time. A doc whose contributions are all <= 0
+    // would have score 0 and can never appear in top-k anyway, so dropping
+    // it from the touched list is safe.
+    const float dist =
+        d_emb_dists[(size_t)q_idx * max_embs_per_query + local_idx];
+    if (dist <= 0.0f) return;
 
+    const size_t emb_id = d_emb_ids[(size_t)pair_start + local_idx];
+    const int doc_id = d_doc_ids[emb_id];
     if (doc_id >= (int)num_docs) return;
 
-    size_t matrix_idx = (size_t)q_idx * num_docs + doc_id;
-    atomicMaxFloat(&d_doc_query_max[matrix_idx], dist);
+    // Doc-major layout: [doc_id * Q_DOCLEN + q_idx]. Adjacent q's for same
+    // doc are contiguous, which makes the subsequent sum kernel coalesced.
+    atomicMaxFloat(&d_doc_query_max[(size_t)doc_id * Q_DOCLEN + q_idx], dist);
 
     if (d_doc_touched[doc_id] == 0) {
         int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
@@ -561,21 +659,12 @@ __global__ void aggregate_stage1_tracked_kernel(
     }
 }
 
-__global__ void sum_doc_scores_kernel(
-    const float* __restrict__ d_doc_query_max,
-    float*       d_doc_scores,
-    size_t       num_docs
-) {
-    size_t doc_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (doc_id >= num_docs) return;
-
-    float score = 0.0f;
-    #pragma unroll
-    for (size_t q = 0; q < Q_DOCLEN; ++q) {
-        score += d_doc_query_max[q * num_docs + doc_id];
-    }
-    d_doc_scores[doc_id] = score;
-}
+// Warp-per-doc cooperative summation.
+// Q_DOCLEN == 32 == warp size, so each lane loads exactly one float,
+// then we warp-shuffle reduce.  This replaces 8 serial float4 loads
+// per thread with a single float load + 5-step shuffle — a dramatic
+// reduction in per-doc L2 traffic and latency.
+// Launch: <<<(num_touched + WARPS_PER_BLOCK-1)/WARPS_PER_BLOCK, WARPS_PER_BLOCK*32>>>
 
 __global__ void sum_doc_scores_sparse_kernel(
     const float* __restrict__ d_doc_query_max,
@@ -585,15 +674,26 @@ __global__ void sum_doc_scores_sparse_kernel(
     int          num_touched,
     size_t       num_docs
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_touched) return;
+    const int warp_id_in_block = threadIdx.x >> 5;          // 0..7
+    const int lane             = threadIdx.x & 31;          // 0..31
+    const int global_warp_id   = blockIdx.x * SUM_SCORES_WARPS_PER_BLOCK + warp_id_in_block;
 
-    int doc_id = d_touched_doc_list[idx];
-    float score = 0.0f;
+    if (global_warp_id >= num_touched) return;
+
+    const int doc_id = d_touched_doc_list[global_warp_id];
+
+    // Each lane loads one of the 32 query-max values for this doc.
+    // The row is 128 bytes = exactly 1 cache line, so the whole warp
+    // satisfies the load in a single L2 transaction.
+    float val = d_doc_query_max[(size_t)doc_id * Q_DOCLEN + lane];
+
+    // Warp-shuffle tree reduction (5 steps for 32 lanes).
     #pragma unroll
-    for (int q = 0; q < Q_DOCLEN; ++q) {
-        score += d_doc_query_max[(size_t)q * num_docs + doc_id];
+    for (int offset = 16; offset >= 1; offset >>= 1)
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+
+    if (lane == 0) {
+        d_scores_out[global_warp_id]  = val;
+        d_doc_ids_out[global_warp_id] = doc_id;
     }
-    d_scores_out[idx] = score;
-    d_doc_ids_out[idx] = doc_id;
 }

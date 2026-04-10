@@ -2,5 +2,5 @@
 set -euo pipefail
 
 rm -rf CMakeFiles
-rm CMakeCache.txt
+rm -f CMakeCache.txt
 cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=../cmake/conda-toolchain.cmake ..

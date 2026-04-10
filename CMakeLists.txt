@@ -51,7 +51,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-depre
 add_compile_definitions(GPU_MVR_PROFILE)
 # add_compile_definitions(GPU_MVR_TIMELINE)
 add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
-# add_compile_definitions(GPU_MVR_USE_LUT)
+add_compile_definitions(GPU_MVR_USE_LUT)
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)

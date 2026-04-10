@@ -27,6 +27,9 @@
 #define STAGE2_PERSISTENT_MAX_WARPS (STAGE2_PERSISTENT_BLOCK / 32)  // = 8
 #define PST_CHUNK_SIZE 2000                                       // candidates per chunk in persistent kernel
 
+// Sum-doc-scores kernel configuration
+#define SUM_SCORES_WARPS_PER_BLOCK 8                                 // warps per block for warp-per-doc summation
+
 // Validation
 static_assert(PADDED_DIM % 64 == 0, "PADDED_DIM must be a multiple of 64");
 static_assert(PADDED_DIM > 0, "PADDED_DIM must be positive");

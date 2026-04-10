@@ -55,19 +55,66 @@ gpu_mvr_index::gpu_mvr_index(const std::string& filename, const std::vector<int>
     CUDA_CHECK(cudaMalloc(&d_doc_ptrs_, (num_docs + 1) * sizeof(int)));
 
     // Upload inverted list structures to GPU
-    size_t inv_list_size = ivf->inv_list.size();
-    CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cluster_pos_, (ivf->n_clusters + 1) * sizeof(size_t)));
-
-    CUDA_CHECK(cudaMemcpy(d_inv_list_, ivf->inv_list.data(),
-                          inv_list_size * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_cluster_pos_, ivf->cluster_pos.data(),
                           (ivf->n_clusters + 1) * sizeof(size_t), cudaMemcpyHostToDevice));
+
+#ifndef GPU_MVR_USE_LUT
+    // d_inv_list_ is only needed by the non-LUT stage-1 path (expansion
+    // kernel). The LUT path iterates clusters directly from CAGRA labels
+    // and the clustered arrays, so we skip this ~n*4 byte allocation.
+    size_t inv_list_size = ivf->inv_list.size();
+    CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_inv_list_, ivf->inv_list.data(),
+                          inv_list_size * sizeof(int), cudaMemcpyHostToDevice));
+#else
+    d_inv_list_ = nullptr;
+#endif
 
     CUDA_CHECK(cudaMemcpy(d_one_bit_code_, one_bit_code_.data(), code_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_one_bit_factor_, one_bit_factor_.data(), n * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_doc_ids_, doc_ids_.data(), n * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_doc_ptrs_, doc_ptrs_.data(), (num_docs + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+    // Build cluster-ordered copies: reorder code/factor/doc_id so that
+    // entries in the same IVF cluster are contiguous in memory. This makes
+    // the stage-1 kernel's global memory reads coalesced — adjacent threads
+    // process adjacent inv_list positions and therefore read adjacent memory.
+    {
+        size_t inv_n = ivf->inv_list.size();
+        size_t code_per_vec = PADDED_DIM / 8;  // == CODE_BYTES
+
+        std::vector<char>  clustered_code(inv_n * code_per_vec);
+        std::vector<float> clustered_factor(inv_n);
+        std::vector<int>   clustered_doc_ids(inv_n);
+
+        for (size_t i = 0; i < inv_n; ++i) {
+            int orig_id = ivf->inv_list[i];
+            memcpy(clustered_code.data() + i * code_per_vec,
+                   one_bit_code_.data() + (size_t)orig_id * code_per_vec,
+                   code_per_vec);
+            clustered_factor[i]  = one_bit_factor_[orig_id];
+            clustered_doc_ids[i] = doc_ids_[orig_id];
+        }
+
+        CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
+        CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
+
+        CUDA_CHECK(cudaMemcpy(d_clustered_code_, clustered_code.data(),
+                              inv_n * code_per_vec, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_clustered_factor_, clustered_factor.data(),
+                              inv_n * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_clustered_doc_ids_, clustered_doc_ids.data(),
+                              inv_n * sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    // print gpu memory usage after uploading index
+    size_t free_mem, total_mem;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+    std::cout << "GPU memory usage after index upload: "
+              << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
+              << (total_mem / (1024.0 * 1024.0)) << " MB\n";
 
     // Allocate workspace
     allocate_workspace();
@@ -559,6 +606,16 @@ void gpu_mvr_index::rank_cluster_dists_gpu(
     CUDA_CHECK(cudaEventRecord(ws_.s1_expansion_start, stream));
 #endif
 
+#ifdef GPU_MVR_USE_LUT
+    // LUT path: the kernel iterates clusters directly from CAGRA labels,
+    // so we skip the expansion kernel and d_emb_ids entirely. This removes
+    // the emb_id load → code load dependency chain (400 cycles savings)
+    // and the expansion kernel itself (~0.18 ms).
+#ifdef GPU_MVR_PROFILE
+    CUDA_CHECK(cudaEventRecord(ws_.s1_expansion_end, stream));
+#endif
+#else
+    // Non-LUT path still needs the expansion.
     compute_query_expansion_sizes_kernel<<<(Q_DOCLEN + 255) / 256, 256, 0, stream>>>(
         ws_.d_cagra_labels,
         d_cluster_pos_,
@@ -598,55 +655,86 @@ void gpu_mvr_index::rank_cluster_dists_gpu(
         ws_.d_emb_ids,
         nprobe,
         ivf->n_clusters,
-        Q_DOCLEN
+        Q_DOCLEN,
+        false
     );
 
 #ifdef GPU_MVR_PROFILE
     CUDA_CHECK(cudaEventRecord(ws_.s1_expansion_end, stream));
 #endif
-
-    int max_embs_per_query = ws_.max_embs_per_query_bound;
+#endif  // GPU_MVR_USE_LUT
 
     int threads_per_block = 256;
-    int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
 
-    dim3 grid(blocks_x, Q_DOCLEN);
+    // The fused stage1 kernel writes directly into d_doc_query_max /
+    // d_doc_touched / d_num_unique_docs, so the memset on stream_d2h must
+    // complete before we launch it. The memset (~1.1 ms) runs concurrently
+    // with CAGRA search (~1.17 ms), so waiting here is free on the
+    // critical path.
+    CUDA_CHECK(cudaStreamWaitEvent(stream, ws_.event_h2d_done));
+
 #ifdef GPU_MVR_PROFILE
     CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_start, stream));
 #endif
 #ifdef GPU_MVR_USE_LUT
-    stage1_binary_ip_lut_kernel<<<grid, threads_per_block, 0, stream>>>(
-        ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
-        ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
-        max_embs_per_query
-    );
+    {
+        // Flat iteration: each block processes elements across ALL probed
+        // clusters. Ensure enough blocks for good SM occupancy — at least
+        // 16 blocks per Y-dimension so the grid has 16×32 = 512 blocks.
+        int blocks_x = std::max(
+            (max_cluster_size + threads_per_block - 1) / threads_per_block,
+            16);
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_lut_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_lut, d_clustered_code_, d_clustered_factor_, ws_.d_cb1_sumq,
+            ws_.d_cagra_labels, d_cluster_pos_,
+            d_clustered_doc_ids_,
+            ws_.d_doc_query_max,
+            ws_.d_doc_touched,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+    }
 #else
-    stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
-        ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
-        ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
-        max_embs_per_query
-    );
+    {
+        int max_embs_per_query = ws_.max_embs_per_query_bound;
+        int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+            ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
+            max_embs_per_query
+        );
+    }
 #endif
     CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
     CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
 #endif
 
-    CUDA_CHECK(cudaStreamWaitEvent(stream, ws_.event_h2d_done));
-
-    int thread_count = 256;
-    int block_count = (total_pairs + thread_count - 1) / thread_count;
-
 #ifdef GPU_MVR_PROFILE
     CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
 #endif
-    aggregate_stage1_tracked_kernel<<<block_count, thread_count, 0, stream>>>(
-        ws_.d_emb_ids, ws_.d_emb_dists, ws_.d_pair_offsets, d_doc_ids_,
-        ws_.d_doc_query_max,
-        ws_.d_doc_touched, ws_.d_unique_doc_ids, ws_.d_num_unique_docs,
-        num_docs, total_pairs, max_embs_per_query
-    );
-    CUDA_CHECK(cudaGetLastError());
+#ifndef GPU_MVR_USE_LUT
+    // Non-LUT path still uses a separate aggregation kernel.
+    {
+        int max_embs_per_query = ws_.max_embs_per_query_bound;
+        const int agg_threads = 256;
+        dim3 agg_grid((max_embs_per_query + agg_threads - 1) / agg_threads, Q_DOCLEN);
+        aggregate_stage1_tracked_kernel<<<agg_grid, agg_threads, 0, stream>>>(
+            ws_.d_emb_ids, ws_.d_emb_dists, ws_.d_pair_offsets, d_doc_ids_,
+            ws_.d_doc_query_max,
+            ws_.d_doc_touched, ws_.d_unique_doc_ids, ws_.d_num_unique_docs,
+            num_docs, (size_t)total_pairs, (size_t)max_embs_per_query
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+#endif
 #ifdef GPU_MVR_PROFILE
     CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
 #endif
@@ -664,7 +752,8 @@ void gpu_mvr_index::rank_cluster_dists_gpu(
     }
     actual_k_out = std::min((int)k, h_num_touched);
 
-    int sparse_blocks = (h_num_touched + thread_count - 1) / thread_count;
+    const int thread_count = SUM_SCORES_WARPS_PER_BLOCK * 32; // 256
+    int sparse_blocks = (h_num_touched + SUM_SCORES_WARPS_PER_BLOCK - 1) / SUM_SCORES_WARPS_PER_BLOCK;
 #ifdef GPU_MVR_PROFILE
     CUDA_CHECK(cudaEventRecord(ws_.s1_sum_scores_start, stream));
 #endif
@@ -1371,8 +1460,14 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaFree(d_one_bit_factor_));
     CUDA_CHECK(cudaFree(d_doc_ids_));
     CUDA_CHECK(cudaFree(d_doc_ptrs_));
+#ifndef GPU_MVR_USE_LUT
     CUDA_CHECK(cudaFree(d_inv_list_));
+#endif
     CUDA_CHECK(cudaFree(d_cluster_pos_));
+
+    CUDA_CHECK(cudaFree(d_clustered_code_));
+    CUDA_CHECK(cudaFree(d_clustered_factor_));
+    CUDA_CHECK(cudaFree(d_clustered_doc_ids_));
 
     CUDA_CHECK(cudaFree(ws_.d_queries));
     CUDA_CHECK(cudaFree(ws_.d_cb1_sumq));
