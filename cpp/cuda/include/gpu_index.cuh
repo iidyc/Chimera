@@ -91,7 +91,7 @@ struct gpu_mvr_index {
     Rotator<float>* rotator_;
     IVF_PG* ivf;
     std::vector<char> one_bit_code_;
-    std::vector<char> ex_code_;
+    std::vector<char> full_code_;
     std::vector<float> one_bit_factor_;
     std::vector<float> ex_factor_;
     std::vector<int> doc_ids_;
@@ -301,7 +301,6 @@ struct gpu_mvr_index {
         const size_t* h_out_offsets,
         int to_refine,
         const query_object* queries,
-        const float* h_pinned_dists,
-        const float* ip_ex_buf,
+        const float* ip_full_buf,
         std::pair<float, int>* refined_scores);
 };

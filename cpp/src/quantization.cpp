@@ -162,3 +162,30 @@ void encode_ex_bits(const float* rotated_data, size_t dim, size_t ex_bits, uint8
         ex_code.data(), compact_ex_code, dim, ex_bits
     );
 }
+
+void encode_full_code(const float* rotated_data, size_t dim, size_t ex_bits, uint8_t* compact_full_code, float* factor) {
+    std::vector<uint8_t> ex_code(dim);
+    quantize_ex(rotated_data, ex_code.data(), dim, ex_bits);
+
+    // build total code: ex_code + sign_bit << ex_bits  (1+ex_bits bits per dim)
+    RowMajorArray<int> total_code =
+        RowMajorArrayMap<uint8_t>(ex_code.data(), 1, dim).template cast<int>();
+    for (size_t i = 0; i < dim; ++i) {
+        total_code(0, i) += static_cast<int>(rotated_data[i] >= 0) << ex_bits;
+    }
+
+    // compute factor: 1 / <o_bar, o>
+    float cb = -(static_cast<float>(1 << ex_bits) - 0.5F);
+    RowMajorArray<float> xu_cb = total_code.template cast<float>() + cb;
+    float ip_obar_o = dot_product<float>(xu_cb.data(), rotated_data, dim);
+    *factor = 1.0F / ip_obar_o;
+
+    // pack total_code as (1+ex_bits)-bit codes
+    std::vector<uint8_t> total_code_u8(dim);
+    for (size_t i = 0; i < dim; ++i) {
+        total_code_u8[i] = static_cast<uint8_t>(total_code(0, i));
+    }
+    quant::rabitq_impl::ex_bits::packing_rabitqplus_code(
+        total_code_u8.data(), compact_full_code, dim, 1 + ex_bits
+    );
+}

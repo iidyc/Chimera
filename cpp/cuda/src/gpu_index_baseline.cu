@@ -23,12 +23,12 @@ gpu_mvr_index_baseline::gpu_mvr_index_baseline(const std::string& filename, cons
     }
 
     one_bit_code_.resize(n * PADDED_DIM / 8);
-    ex_code_.resize(n * PADDED_DIM * ex_bits / 8);
+    full_code_.resize(n * PADDED_DIM * (1 + ex_bits) / 8);
     one_bit_factor_.resize(n);
     ex_factor_.resize(n);
 
     inf.read(one_bit_code_.data(), one_bit_code_.size());
-    inf.read(ex_code_.data(), ex_code_.size());
+    inf.read(full_code_.data(), full_code_.size());
     inf.read((char*)one_bit_factor_.data(), n * sizeof(float));
     inf.read((char*)ex_factor_.data(), n * sizeof(float));
     inf.close();
@@ -38,8 +38,8 @@ gpu_mvr_index_baseline::gpu_mvr_index_baseline(const std::string& filename, cons
     rotator_->load(rot_in);
     rot_in.close();
 
-    ip_func_ = select_excode_ipfunc(ex_bits);
-    unpack_func_ = select_excode_unpackfunc(ex_bits);
+    ip_func_ = select_excode_ipfunc(1 + ex_bits);
+    unpack_func_ = select_excode_unpackfunc(1 + ex_bits);
 
     ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
     ivf->load(filename);
@@ -472,13 +472,10 @@ void gpu_mvr_index_baseline::rank_all_tokens_exbits_cpu(
             float max_token_score = -std::numeric_limits<float>::infinity();
             for (size_t i = 0; i < doc_len(doc_id); ++i) {
                 size_t tid = doc_ptrs_[doc_id] + i;
-                float dist = distance_ex_bits(
+                float dist = distance_full_code(
                     queries + j,
-                    &ex_code_[tid * PADDED_DIM * ex_bits / 8],
-                    ex_bits,
+                    &full_code_[tid * PADDED_DIM * (1 + ex_bits) / 8],
                     ip_func_,
-                    ws_.h_pinned_dists[(candidate_doc_ptrs[idx] + i) * Q_DOCLEN + j],
-                    one_bit_factor_[tid],
                     ex_factor_[tid],
                     PADDED_DIM
                 );

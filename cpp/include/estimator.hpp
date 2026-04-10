@@ -20,3 +20,11 @@ float distance_ex_bits(
     float ex_factor,
     size_t padded_dim
 );
+
+float distance_full_code(
+    query_object* query,
+    const char* full_code,
+    float (*ip_func_)(const float*, const uint8_t*, size_t),
+    float ex_factor,
+    size_t padded_dim
+);
