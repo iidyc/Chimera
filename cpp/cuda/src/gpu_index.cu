@@ -94,52 +94,70 @@ gpu_mvr_index::gpu_mvr_index(const std::string& filename, const std::vector<int>
     //           << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
     //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
 
-    // Build cluster-ordered copies: reorder code/factor/doc_id so that
-    // entries in the same IVF cluster are contiguous in memory. This makes
-    // the stage-1 kernel's global memory reads coalesced — adjacent threads
-    // process adjacent inv_list positions and therefore read adjacent memory.
+    allocate_workspace();
+
+    // Decide whether to build cluster-ordered copies based on available GPU memory.
+    // Cluster-ordered layout gives coalesced memory access in stage-1 but costs
+    // inv_n * (code_per_vec + 8) bytes. If insufficient, fall back to the original
+    // non-clustered arrays with an inv_list indirection (only inv_n * 4 bytes).
     {
         size_t inv_n = ivf->inv_list.size();
         size_t code_per_vec = PADDED_DIM / 8;  // == CODE_BYTES
+        size_t clustered_bytes = inv_n * (code_per_vec + sizeof(float) + sizeof(int));
 
-        std::vector<char>  clustered_code(inv_n * code_per_vec);
-        std::vector<float> clustered_factor(inv_n);
-        std::vector<int>   clustered_doc_ids(inv_n);
+        size_t free_mem, total_mem;
+        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
 
-        for (size_t i = 0; i < inv_n; ++i) {
-            int orig_id = ivf->inv_list[i];
-            memcpy(clustered_code.data() + i * code_per_vec,
-                   one_bit_code_.data() + (size_t)orig_id * code_per_vec,
-                   code_per_vec);
-            clustered_factor[i]  = one_bit_factor_[orig_id];
-            clustered_doc_ids[i] = doc_ids_[orig_id];
+        // if (false) {
+        if (free_mem > clustered_bytes) {
+            use_clustered_ = true;
+
+            std::vector<char>  clustered_code(inv_n * code_per_vec);
+            std::vector<float> clustered_factor(inv_n);
+            std::vector<int>   clustered_doc_ids(inv_n);
+
+            for (size_t i = 0; i < inv_n; ++i) {
+                int orig_id = ivf->inv_list[i];
+                memcpy(clustered_code.data() + i * code_per_vec,
+                       one_bit_code_.data() + (size_t)orig_id * code_per_vec,
+                       code_per_vec);
+                clustered_factor[i]  = one_bit_factor_[orig_id];
+                clustered_doc_ids[i] = doc_ids_[orig_id];
+            }
+
+            CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
+            CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
+
+            CUDA_CHECK(cudaMemcpy(d_clustered_code_, clustered_code.data(),
+                                  inv_n * code_per_vec, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_clustered_factor_, clustered_factor.data(),
+                                  inv_n * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_clustered_doc_ids_, clustered_doc_ids.data(),
+                                  inv_n * sizeof(int), cudaMemcpyHostToDevice));
+
+            std::cout << "[gpu_mvr] Using cluster-ordered layout ("
+                      << (clustered_bytes / (1024.0 * 1024.0)) << " MB)\n";
+        } else {
+            use_clustered_ = false;
+            d_clustered_code_    = nullptr;
+            d_clustered_factor_  = nullptr;
+            d_clustered_doc_ids_ = nullptr;
+
+#ifdef GPU_MVR_USE_LUT
+            // LUT path normally skips d_inv_list_; allocate it now for indirection
+            size_t inv_list_size = ivf->inv_list.size();
+            CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
+            CUDA_CHECK(cudaMemcpy(d_inv_list_, ivf->inv_list.data(),
+                                  inv_list_size * sizeof(int), cudaMemcpyHostToDevice));
+#endif
+
+            std::cout << "[gpu_mvr] Insufficient GPU memory for cluster-ordered layout ("
+                      << (clustered_bytes / (1024.0 * 1024.0)) << " MB needed, "
+                      << (free_mem / (1024.0 * 1024.0)) << " MB free). "
+                      << "Falling back to inv_list indirection.\n";
         }
-
-        CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
-        CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
-
-        CUDA_CHECK(cudaMemcpy(d_clustered_code_, clustered_code.data(),
-                              inv_n * code_per_vec, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_clustered_factor_, clustered_factor.data(),
-                              inv_n * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_clustered_doc_ids_, clustered_doc_ids.data(),
-                              inv_n * sizeof(int), cudaMemcpyHostToDevice));
     }
-
-    // print gpu memory usage after uploading index
-    // CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-    // std::cout << "GPU memory usage after index upload: "
-    //           << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
-    //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
-
-    // Allocate workspace
-    allocate_workspace();
-
-    // CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-    // std::cout << "GPU memory usage after index upload: "
-    //           << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
-    //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
 }
 
 // ======================== set_doc_mapping ========================
@@ -761,10 +779,9 @@ void gpu_mvr_index::rank_cluster_dists_gpu(
     CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_start, stream));
 #endif
 #ifdef GPU_MVR_USE_LUT
-    {
-        // Flat iteration: each block processes elements across ALL probed
-        // clusters. Ensure enough blocks for good SM occupancy — at least
-        // 16 blocks per Y-dimension so the grid has 16×32 = 512 blocks.
+    if (use_clustered_) {
+        // Clustered layout: flat iteration across all probed clusters with
+        // coalesced memory access. Ensure enough blocks for good SM occupancy.
         int blocks_x = std::max(
             (max_cluster_size + threads_per_block - 1) / threads_per_block,
             16);
@@ -774,6 +791,35 @@ void gpu_mvr_index::rank_cluster_dists_gpu(
             ws_.d_lut, d_clustered_code_, d_clustered_factor_, ws_.d_cb1_sumq,
             ws_.d_cagra_labels, d_cluster_pos_,
             d_clustered_doc_ids_,
+            ws_.d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+            ws_.d_ht_keys,
+            ws_.d_ht_vals,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+            ws_.ht_mask,
+#else
+            ws_.d_doc_touched,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+#endif
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+    } else {
+        // Non-clustered fallback: explicit cluster iteration with inv_list
+        // indirection, smem tiling, and __ldg() for scattered reads.
+        int blocks_x = std::max(
+            (max_cluster_size + threads_per_block - 1) / threads_per_block,
+            16);
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+            ws_.d_cagra_labels, d_cluster_pos_,
+            d_doc_ids_,
+            d_inv_list_,
             ws_.d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
             ws_.d_ht_keys,
@@ -1539,11 +1585,12 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaFree(d_one_bit_factor_));
     CUDA_CHECK(cudaFree(d_doc_ids_));
     CUDA_CHECK(cudaFree(d_doc_ptrs_));
-#ifndef GPU_MVR_USE_LUT
+    // d_inv_list_ may be allocated in non-LUT path or as fallback in LUT path;
+    // cudaFree(nullptr) is a safe no-op
     CUDA_CHECK(cudaFree(d_inv_list_));
-#endif
     CUDA_CHECK(cudaFree(d_cluster_pos_));
 
+    // Clustered arrays are nullptr when fallback is active; cudaFree(nullptr) is safe
     CUDA_CHECK(cudaFree(d_clustered_code_));
     CUDA_CHECK(cudaFree(d_clustered_factor_));
     CUDA_CHECK(cudaFree(d_clustered_doc_ids_));

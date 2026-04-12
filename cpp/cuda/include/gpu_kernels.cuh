@@ -63,6 +63,35 @@ __global__ void stage1_binary_ip_lut_kernel(
     size_t       n_clusters
 );
 
+// Non-clustered variant: uses inv_list indirection to access original arrays.
+// Optimized for scattered access with explicit cluster iteration, shared-memory
+// inv_list tiling, and __ldg() for read-only cache utilization.
+__global__ void stage1_binary_ip_lut_nonclustered_kernel(
+    const float*    __restrict__ d_lut,
+    const char*     __restrict__ d_code,
+    const float*    __restrict__ d_factor,
+    const float*    __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_inv_list,
+    float*       d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    int*         d_ht_keys,
+    int*         d_ht_vals,
+    int*         d_touched_doc_list,
+    int*         d_num_touched_docs,
+    unsigned int ht_mask,
+#else
+    int*         d_doc_touched,
+    int*         d_touched_doc_list,
+    int*         d_num_touched_docs,
+#endif
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+);
+
 __global__ void stage2_binary_ip_lut_kernel(
     const float* __restrict__ d_lut,
     const char*  __restrict__ d_one_bit_code,

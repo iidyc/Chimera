@@ -113,6 +113,7 @@ struct gpu_mvr_index {
     char*  d_clustered_code_;
     float* d_clustered_factor_;
     int*   d_clustered_doc_ids_;
+    bool   use_clustered_ = true;  // false = fallback to non-clustered + inv_list indirection
 
     // Search parameters
     int nprobe = 128;

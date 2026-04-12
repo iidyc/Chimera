@@ -351,6 +351,147 @@ __global__ void stage1_binary_ip_lut_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Non-clustered variant: same flat grid-stride structure as the clustered
+// kernel to preserve full parallelism, but uses inv_list indirection and
+// __ldg() for scattered code/factor/doc_id reads through the read-only cache.
+// ---------------------------------------------------------------------------
+
+__global__ void stage1_binary_ip_lut_nonclustered_kernel(
+    const float*    __restrict__ d_lut,
+    const char*     __restrict__ d_code,
+    const float*    __restrict__ d_factor,
+    const float*    __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_inv_list,
+    float*       d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    int*         d_ht_keys,
+    int*         d_ht_vals,
+    int*         d_touched_doc_list,
+    int*         d_num_touched_docs,
+    unsigned int ht_mask,
+#else
+    int*         d_doc_touched,
+    int*         d_touched_doc_list,
+    int*         d_num_touched_docs,
+#endif
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+) {
+    __shared__ float    smem_lut[LUT_ENTRIES_PER_QUERY];     // 2048 B
+    __shared__ uint32_t smem_cstart[STAGE1_MAX_NPROBE];      // 1024 B
+    __shared__ int      smem_prefix[STAGE1_MAX_NPROBE + 1];  // 1028 B
+
+    const int query_idx = blockIdx.y;
+    if (query_idx >= Q_DOCLEN) return;
+
+    // ---- Phase 1: Load LUT into smem ----
+    const float* lut_ptr = d_lut + query_idx * LUT_ENTRIES_PER_QUERY;
+    for (int i = threadIdx.x; i < LUT_ENTRIES_PER_QUERY; i += blockDim.x) {
+        smem_lut[i] = lut_ptr[i];
+    }
+
+    // ---- Phase 2: Cooperatively load cluster metadata ----
+    const uint32_t* my_labels = d_cagra_labels + query_idx * nprobe;
+    for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
+        uint32_t label = my_labels[p];
+        if (label < (uint32_t)n_clusters) {
+            size_t start = d_cluster_pos[label];
+            smem_cstart[p] = (uint32_t)start;
+            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+        } else {
+            smem_cstart[p] = 0;
+            smem_prefix[p + 1] = 0;
+        }
+    }
+    if (threadIdx.x == 0) smem_prefix[0] = 0;
+    __syncthreads();
+
+    // ---- Phase 3: Prefix sum of cluster sizes ----
+    if (threadIdx.x == 0) {
+        for (int i = 1; i <= nprobe; i++)
+            smem_prefix[i] += smem_prefix[i - 1];
+    }
+    __syncthreads();
+
+    const int   total_elements = smem_prefix[nprobe];
+    const float cb1_sumq       = d_cb1_sumq[query_idx];
+
+    // ---- Phase 4: Flat grid-stride loop over all elements ----
+    for (int flat_idx = threadIdx.x + blockIdx.x * blockDim.x;
+         flat_idx < total_elements;
+         flat_idx += blockDim.x * gridDim.x)
+    {
+        // Binary search for the cluster containing flat_idx
+        int lo = 0, hi = nprobe;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (smem_prefix[mid + 1] <= flat_idx)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
+
+        // inv_list indirection: map cluster position -> original vector ID
+        uint32_t orig_id = (uint32_t)__ldg(&d_inv_list[emb_pos]);
+
+        // __ldg() routes scattered reads through the read-only texture cache
+        const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
+            d_code + (size_t)orig_id * CODE_BYTES));
+        const float factor = __ldg(&d_factor[orig_id]);
+        const int   doc_id = __ldg(&d_doc_ids[orig_id]);
+
+        float ip = 0.0f;
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[n * LUT_SIZE + ((code128.x >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(8 + n) * LUT_SIZE + ((code128.y >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(16 + n) * LUT_SIZE + ((code128.z >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(24 + n) * LUT_SIZE + ((code128.w >> (n * 4)) & 0xF)];
+
+        float dist = (ip - cb1_sumq) * factor;
+
+        if (dist > 0.0f && (size_t)doc_id < num_docs) {
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+            int cid = doc_ht_find_or_insert(
+                d_ht_keys, d_ht_vals,
+                d_touched_doc_list, d_num_touched_docs,
+                doc_id, ht_mask);
+
+            float* slot = &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx];
+#else
+            float* slot = &d_doc_query_max[(size_t)doc_id * Q_DOCLEN + query_idx];
+#endif
+            if (dist > *slot) {
+                atomicMax(
+                    reinterpret_cast<int*>(slot),
+                    __float_as_int(dist));
+            }
+
+#ifndef GPU_MVR_COMPACT_DOC_BUFFER
+            if (d_doc_touched[doc_id] == 0) {
+                int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
+                if (was_touched == 0) {
+                    int pos = atomicAdd(d_num_touched_docs, 1);
+                    d_touched_doc_list[pos] = doc_id;
+                }
+            }
+#endif
+        }
+    }
+}
+
 __global__ void stage2_binary_ip_lut_kernel(
     const float* __restrict__ d_lut,
     const char*  __restrict__ d_one_bit_code,
