@@ -52,6 +52,8 @@ add_compile_definitions(GPU_MVR_PROFILE)
 # add_compile_definitions(GPU_MVR_TIMELINE)
 add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
 add_compile_definitions(GPU_MVR_USE_LUT)
+# Uncomment to use compact doc buffer (hash table) instead of full num_docs buffer
+add_compile_definitions(GPU_MVR_COMPACT_DOC_BUFFER)
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)

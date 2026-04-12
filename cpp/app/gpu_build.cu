@@ -15,11 +15,13 @@ int main(int argc, char* argv[]) {
     int n_clusters = std::stoi(argv[4]);
     std::string bootstrap_centroids = (argc == 7) ? argv[5] : "";
     std::string bootstrap_list_nos  = (argc == 7) ? argv[6] : "";
-    size_t ex_bits = 4;
+    size_t ex_bits = 3;
     size_t d = 128;  // embedding dimension
 
-    size_t n;
-    std::vector<float> data = load_data(n, d, data_filename);
+    std::vector<float> data;
+    size_t n = 596847412;
+    // size_t n;
+    // std::vector<float> data = load_data(n, d, data_filename);
     auto doc_lens = load_doclens(doclens_filename);
     build_index(data.data(), n, d, n_clusters, ex_bits, doc_lens, index_name,
                 bootstrap_centroids, bootstrap_list_nos);

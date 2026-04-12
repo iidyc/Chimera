@@ -2,6 +2,43 @@
 
 #include <cfloat>
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+// ---- Open-addressing hash table: doc_id → compact_slot ----
+// Keys array is initialised to -1 (empty). Vals array to -1 (not yet assigned).
+// Returns the compact_id assigned to doc_id (newly allocated or existing).
+__device__ __forceinline__
+int doc_ht_find_or_insert(
+    int* __restrict__ ht_keys,         // [ht_capacity], init -1
+    int* __restrict__ ht_vals,         // [ht_capacity], init -1
+    int* __restrict__ touched_list,    // [max_compact_docs]
+    int* __restrict__ num_inserted,    // scalar, init 0
+    int  doc_id,
+    unsigned int ht_mask               // ht_capacity - 1
+) {
+    unsigned int h = (unsigned int)doc_id * 2654435761u;   // Knuth multiplicative hash
+    h &= ht_mask;
+
+    for (;;) {
+        int probe = atomicCAS(&ht_keys[h], -1, doc_id);
+        if (probe == -1) {
+            // We just inserted this key. Allocate a compact id.
+            int cid = atomicAdd(num_inserted, 1);
+            touched_list[cid] = doc_id;
+            atomicExch(&ht_vals[h], cid);     // publish
+            return cid;
+        }
+        if (probe == doc_id) {
+            // Key already exists. Spin until compact_id is published.
+            int cid;
+            do { cid = *(volatile int*)&ht_vals[h]; } while (cid < 0);
+            return cid;
+        }
+        // Collision with a different key — linear probe.
+        h = (h + 1) & ht_mask;
+    }
+}
+#endif
+
 // Atomic max for floats using compare-and-swap
 __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
     int* address_as_int = (int*)address;
@@ -173,7 +210,7 @@ __global__ void precompute_lut_kernel(
 //   5. Read-before-atomic guard on d_doc_query_max.
 //
 // Grid: (blocks_x, Q_DOCLEN).
-// Requires d_doc_query_max, d_doc_touched to be zero-initialised.
+// Requires d_doc_query_max to be zero-initialised.
 #define STAGE1_MAX_NPROBE 256
 
 __global__ void stage1_binary_ip_lut_kernel(
@@ -185,9 +222,17 @@ __global__ void stage1_binary_ip_lut_kernel(
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
     float*       d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    int*         d_ht_keys,
+    int*         d_ht_vals,
+    int*         d_touched_doc_list,
+    int*         d_num_touched_docs,
+    unsigned int ht_mask,
+#else
     int*         d_doc_touched,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+#endif
     size_t       num_docs,
     int          nprobe,
     size_t       n_clusters
@@ -277,13 +322,23 @@ __global__ void stage1_binary_ip_lut_kernel(
         float dist = (ip - cb1_sumq) * factor;
 
         if (dist > 0.0f && (size_t)doc_id < num_docs) {
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+            int cid = doc_ht_find_or_insert(
+                d_ht_keys, d_ht_vals,
+                d_touched_doc_list, d_num_touched_docs,
+                doc_id, ht_mask);
+
+            float* slot = &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx];
+#else
             float* slot = &d_doc_query_max[(size_t)doc_id * Q_DOCLEN + query_idx];
+#endif
             if (dist > *slot) {
                 atomicMax(
                     reinterpret_cast<int*>(slot),
                     __float_as_int(dist));
             }
 
+#ifndef GPU_MVR_COMPACT_DOC_BUFFER
             if (d_doc_touched[doc_id] == 0) {
                 int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
                 if (was_touched == 0) {
@@ -291,6 +346,7 @@ __global__ void stage1_binary_ip_lut_kernel(
                     d_touched_doc_list[pos] = doc_id;
                 }
             }
+#endif
         }
     }
 }
@@ -612,9 +668,17 @@ __global__ void aggregate_stage1_tracked_kernel(
     const int*    __restrict__ d_pair_offsets,
     const int*    __restrict__ d_doc_ids,
     float*        d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    int*          d_ht_keys,
+    int*          d_ht_vals,
+    int*          d_touched_doc_list,
+    int*          d_num_touched_docs,
+    unsigned int  ht_mask,
+#else
     int*          d_doc_touched,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
+#endif
     size_t        num_docs,
     size_t        total_pairs,
     size_t        max_embs_per_query
@@ -646,6 +710,15 @@ __global__ void aggregate_stage1_tracked_kernel(
     const int doc_id = d_doc_ids[emb_id];
     if (doc_id >= (int)num_docs) return;
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    // Doc-major layout: [compact_id * Q_DOCLEN + q_idx]. Adjacent q's for
+    // same doc are contiguous, which makes the subsequent sum kernel coalesced.
+    int cid = doc_ht_find_or_insert(
+        d_ht_keys, d_ht_vals,
+        d_touched_doc_list, d_num_touched_docs,
+        doc_id, ht_mask);
+    atomicMaxFloat(&d_doc_query_max[(size_t)cid * Q_DOCLEN + q_idx], dist);
+#else
     // Doc-major layout: [doc_id * Q_DOCLEN + q_idx]. Adjacent q's for same
     // doc are contiguous, which makes the subsequent sum kernel coalesced.
     atomicMaxFloat(&d_doc_query_max[(size_t)doc_id * Q_DOCLEN + q_idx], dist);
@@ -657,6 +730,7 @@ __global__ void aggregate_stage1_tracked_kernel(
             d_touched_doc_list[pos] = doc_id;
         }
     }
+#endif
 }
 
 // Warp-per-doc cooperative summation.
@@ -671,8 +745,10 @@ __global__ void sum_doc_scores_sparse_kernel(
     const int*   __restrict__ d_touched_doc_list,
     float*       d_scores_out,
     int*         d_doc_ids_out,
-    int          num_touched,
-    size_t       num_docs
+    int          num_touched
+#ifndef GPU_MVR_COMPACT_DOC_BUFFER
+    , size_t     num_docs
+#endif
 ) {
     const int warp_id_in_block = threadIdx.x >> 5;          // 0..7
     const int lane             = threadIdx.x & 31;          // 0..31
@@ -682,10 +758,14 @@ __global__ void sum_doc_scores_sparse_kernel(
 
     const int doc_id = d_touched_doc_list[global_warp_id];
 
-    // Each lane loads one of the 32 query-max values for this doc.
-    // The row is 128 bytes = exactly 1 cache line, so the whole warp
-    // satisfies the load in a single L2 transaction.
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    // d_doc_query_max is compact-indexed: row = global_warp_id
+    // (== compact_id because touched_list is in compact_id order).
+    float val = d_doc_query_max[(size_t)global_warp_id * Q_DOCLEN + lane];
+#else
+    // d_doc_query_max is indexed by doc_id directly.
     float val = d_doc_query_max[(size_t)doc_id * Q_DOCLEN + lane];
+#endif
 
     // Warp-shuffle tree reduction (5 steps for 32 lanes).
     #pragma unroll

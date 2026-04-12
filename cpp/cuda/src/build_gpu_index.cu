@@ -169,58 +169,58 @@ void build_index(
 
     std::cout << "[build_index] Step 4 done. IVF_PG assembled and saved." << std::endl;
 
-    std::cout << "[build_index] Step 5: Quantizing " << n << " vectors ..." << std::endl;
+//     std::cout << "[build_index] Step 5: Quantizing " << n << " vectors ..." << std::endl;
 
-    std::vector<char>  one_bit_code(n * PADDED_DIM / 8);
-    std::vector<char>  ex_code(n * PADDED_DIM * ex_bits / 8);
-    std::vector<float> one_bit_factor(n);
-    std::vector<float> ex_factor(n);
+//     std::vector<char>  one_bit_code(n * PADDED_DIM / 8);
+//     std::vector<char>  full_code(n * PADDED_DIM * (1 + ex_bits) / 8);
+//     std::vector<float> one_bit_factor(n);
+//     std::vector<float> ex_factor(n);
 
-    size_t batch_size = 10240;
-    for (size_t start = 0; start < n; start += batch_size) {
-        size_t end = std::min(start + batch_size, n);
-        size_t cur_batch = end - start;
+//     size_t batch_size = 10240;
+//     for (size_t start = 0; start < n; start += batch_size) {
+//         size_t end = std::min(start + batch_size, n);
+//         size_t cur_batch = end - start;
 
-        std::vector<float> rotated(cur_batch * PADDED_DIM);
-#pragma omp parallel for
-        for (size_t i = 0; i < cur_batch; ++i) {
-            rotator->rotate(&data[(start + i) * d], &rotated[i * PADDED_DIM]);
+//         std::vector<float> rotated(cur_batch * PADDED_DIM);
+// #pragma omp parallel for
+//         for (size_t i = 0; i < cur_batch; ++i) {
+//             rotator->rotate(&data[(start + i) * d], &rotated[i * PADDED_DIM]);
 
-            encode_one_bit(
-                &rotated[i * PADDED_DIM],
-                PADDED_DIM,
-                reinterpret_cast<uint64_t*>(&one_bit_code[(start + i) * PADDED_DIM / 8]),
-                &one_bit_factor[start + i]);
+//             encode_one_bit(
+//                 &rotated[i * PADDED_DIM],
+//                 PADDED_DIM,
+//                 reinterpret_cast<uint64_t*>(&one_bit_code[(start + i) * PADDED_DIM / 8]),
+//                 &one_bit_factor[start + i]);
 
-            encode_ex_bits(
-                &rotated[i * PADDED_DIM],
-                PADDED_DIM,
-                ex_bits,
-                reinterpret_cast<uint8_t*>(&ex_code[(start + i) * PADDED_DIM * ex_bits / 8]),
-                &ex_factor[start + i]);
-        }
-    }
+//             encode_full_code(
+//                 &rotated[i * PADDED_DIM],
+//                 PADDED_DIM,
+//                 ex_bits,
+//                 reinterpret_cast<uint8_t*>(&full_code[(start + i) * PADDED_DIM * (1 + ex_bits) / 8]),
+//                 &ex_factor[start + i]);
+//         }
+//     }
 
-    std::cout << "[build_index] Step 5 done. Quantization complete." << std::endl;
+//     std::cout << "[build_index] Step 5 done. Quantization complete." << std::endl;
 
-    std::cout << "[build_index] Step 6: Saving index payload to " << filename << " ..." << std::endl;
+//     std::cout << "[build_index] Step 6: Saving index payload to " << filename << " ..." << std::endl;
 
-    {
-        std::ofstream of(filename, std::ios::binary);
-        size_t padded_dim = PADDED_DIM;
-        of.write(reinterpret_cast<const char*>(&n), sizeof(size_t));
-        of.write(reinterpret_cast<const char*>(&d), sizeof(size_t));
-        of.write(reinterpret_cast<const char*>(&n_clusters), sizeof(size_t));
-        of.write(reinterpret_cast<const char*>(&ex_bits), sizeof(size_t));
-        of.write(reinterpret_cast<const char*>(&padded_dim), sizeof(size_t));
-        of.write(one_bit_code.data(), one_bit_code.size());
-        of.write(ex_code.data(), ex_code.size());
-        of.write(reinterpret_cast<const char*>(one_bit_factor.data()), n * sizeof(float));
-        of.write(reinterpret_cast<const char*>(ex_factor.data()), n * sizeof(float));
-        of.close();
-    }
+//     {
+//         std::ofstream of(filename, std::ios::binary);
+//         size_t padded_dim = PADDED_DIM;
+//         of.write(reinterpret_cast<const char*>(&n), sizeof(size_t));
+//         of.write(reinterpret_cast<const char*>(&d), sizeof(size_t));
+//         of.write(reinterpret_cast<const char*>(&n_clusters), sizeof(size_t));
+//         of.write(reinterpret_cast<const char*>(&ex_bits), sizeof(size_t));
+//         of.write(reinterpret_cast<const char*>(&padded_dim), sizeof(size_t));
+//         of.write(one_bit_code.data(), one_bit_code.size());
+//         of.write(full_code.data(), full_code.size());
+//         of.write(reinterpret_cast<const char*>(one_bit_factor.data()), n * sizeof(float));
+//         of.write(reinterpret_cast<const char*>(ex_factor.data()), n * sizeof(float));
+//         of.close();
+//     }
 
-    delete ivf;
+    // delete ivf;
     delete rotator;
 
     std::cout << "[build_index] Done. Index saved to: " << filename << std::endl;
