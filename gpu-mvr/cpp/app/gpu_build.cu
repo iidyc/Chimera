@@ -1,3 +1,4 @@
+#include "arg_utils.hpp"
 #include "build_gpu_index.hpp"
 #include "io.hpp"
 
@@ -25,13 +26,6 @@ void print_input_help(const char* program) {
         << "Summary:\n"
         << "  index_dir specifies the output directory.\n"
         << "  doclens, data, and n_clusters are inputs to the build.\n";
-}
-
-std::string require_value(int argc, char* argv[], int& i, const std::string& flag) {
-    if (i + 1 >= argc) {
-        throw std::runtime_error("Missing value for " + flag);
-    }
-    return argv[++i];
 }
 
 }  // namespace
