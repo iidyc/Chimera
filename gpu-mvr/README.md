@@ -86,17 +86,19 @@ These formats are implemented in [cpp/src/io.cpp](/data/juelin/gpu-mvr/gpu-mvr/g
 
 ## Index Layout
 
-The current GPU-oriented index layout is split into three files inside one index directory:
+The current GPU-oriented index layout is split into four files inside one index directory:
 
 - `ivf.bin`
-- `quantized_data.bin`
+- `cpu_index.bin`
+- `gpu_index.bin`
 - `centroids.carga`
 
 This layout is defined in [cpp/include/gpu_index_layout.hpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/include/gpu_index_layout.hpp).
 
 Notes:
 
-- `quantized_data.bin` contains the index header, the embedded rotator, and the quantized payload.
+- `cpu_index.bin` contains the index header, the embedded rotator, and the CPU-side quantized payload.
+- `gpu_index.bin` contains the cluster-ordered one-bit GPU layout plus the original-token to cluster-position map used by `v3`.
 - `ivf.bin` contains the IVF inverted list and cluster offsets.
 - `ivf.bin` now stores vector IDs as `uint32_t`.
 - `centroids.carga` stores the persisted centroid graph used by IVF-PG.
@@ -123,6 +125,7 @@ Recent behavior worth knowing:
 - Step 2 uses double buffering per GPU worker to overlap data loading and device work.
 - Step timings are printed as human-readable durations.
 - Step 2 progress is reported as `% documents handled`.
+- The helper script [build_index.sh](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/build_index.sh) runs the full from-scratch build and writes the raw build log plus extracted per-phase timings under `gpu-mvr/profiling/`.
 
 ## Search Pipeline
 
@@ -131,14 +134,14 @@ The main GPU search path is implemented in [cpp/cuda/src/gpu_index.cu](/data/jue
 At a high level:
 
 1. Load the split index layout.
-2. Read the embedded rotator from `quantized_data.bin`.
+2. Read the embedded rotator from `cpu_index.bin`.
 3. Rotate query token embeddings.
 4. Use the centroid graph to pick clusters.
 5. Score token candidates with one-bit or LUT-based approximate distance on GPU.
 6. Aggregate token scores into document scores.
 7. Re-rank a reduced candidate set.
 
-There is also a baseline GPU search path in [cpp/cuda/src/gpu_index_baseline.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index_baseline.cu).
+There is also a `v0` comparison path in [cpp/cuda/src/gpu_index_baseline.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index_baseline.cu).
 
 ## Building
 
@@ -163,7 +166,7 @@ If you only need specific binaries:
 
 ```bash
 source ./cmake.sh
-cmake --build build --target gpu_build gpu_search gpu_search_baseline -j 4
+cmake --build build --target gpu_build gpu_search gpu_search_v0 gpu_search_v1 gpu_search_v2 gpu_search_v3 -j 4
 ```
 
 `cmake.sh` currently:
@@ -205,7 +208,8 @@ Arguments:
 Output:
 
 - `<index_dir>/ivf.bin`
-- `<index_dir>/quantized_data.bin`
+- `<index_dir>/cpu_index.bin`
+- `<index_dir>/gpu_index.bin`
 - `<index_dir>/centroids.carga`
 
 Example:
@@ -223,7 +227,8 @@ Operational notes:
 - This is the primary build binary for the current GPU index format.
 - It memory-maps the embedding file instead of loading the whole dataset eagerly.
 - It currently fixes `ex_bits = 3` in the app wrapper.
-- Search binaries can be pointed either at the index directory or directly at `quantized_data.bin`.
+- Search binaries can be pointed either at the index directory or directly at `cpu_index.bin`.
+- The repository helper [build_index.sh](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/build_index.sh) is the recommended way to rebuild the LOTTE index end to end.
 
 ### `gpu_search`
 
@@ -240,7 +245,7 @@ CLI:
   --query <query_embeddings.bin> \
   --doclens <doclens.bin> \
   --gt <groundtruth.tsv> \
-  --index <index_dir_or_quantized_data.bin> \
+  --index <index_dir_or_cpu_index.bin> \
   [--k <top_k>] \
   [--nq <num_queries_to_run>] \
   [--warmup <num_warmup_queries>]
@@ -251,7 +256,7 @@ Notes:
 - `Q_DOCLEN` in `gpu_config.cuh` must match the `q_doclen` stored in `query_embeddings.bin`.
 - `--nq` and `--warmup` are clamped to the number of queries in the query file.
 
-### `gpu_search_baseline`
+### `gpu_search_v0`
 
 Source: [cpp/app/gpu_search_baseline.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search_baseline.cu)
 
@@ -262,11 +267,11 @@ Purpose:
 CLI:
 
 ```bash
-./build/gpu_search_baseline \
+./build/gpu_search_v0 \
   --query <query_embeddings.bin> \
   --doclens <doclens.bin> \
   --gt <groundtruth.tsv> \
-  --index <index_dir_or_quantized_data.bin> \
+  --index <index_dir_or_cpu_index.bin> \
   [--k <top_k>] \
   [--nq <num_queries_to_run>] \
   [--warmup <num_warmup_queries>]
@@ -292,7 +297,7 @@ CLI:
   --query <query_embeddings.bin> \
   --doclens <doclens.bin> \
   --gt <groundtruth.tsv> \
-  --index <index_dir_or_quantized_data.bin> \
+  --index <index_dir_or_cpu_index.bin> \
   [--k <top_k>] \
   [--nprobe <num_probes>] \
   [--nq <num_queries_to_run>]
@@ -362,7 +367,7 @@ CLI:
   --query <query_embeddings.bin> \
   --doclens <doclens.bin> \
   --gt <groundtruth.tsv> \
-  --index <index_dir_or_quantized_data.bin> \
+  --index <index_dir_or_cpu_index.bin> \
   --output <gather_recall.csv> \
   [--k <top_k>] \
   [--nq <num_queries_to_run>] \
@@ -389,7 +394,7 @@ CLI:
   --data <embeddings.bin> \
   --query <query_embeddings.bin> \
   --doclens <doclens.bin> \
-  --index <index_dir_or_quantized_data.bin> \
+  --index <index_dir_or_cpu_index.bin> \
   --output <dist_decomp.csv> \
   [--nq <num_queries_to_run>] \
   [--nprobe <num_probes>] \
@@ -406,7 +411,7 @@ Notes:
 If you are new to the repo, start here:
 
 1. Build with `source ./cmake.sh`.
-2. Use `gpu_build` to generate a split-format index directory.
+2. Use `build_index.sh` or `gpu_build` to generate a split-format index directory.
 3. Use `gpu_search` to run the main GPU search path.
 
 Example:

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <filesystem>
+#include <sys/mman.h>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -30,6 +31,7 @@
 #include <raft/core/resource/cuda_stream.hpp>
 
 #include "gpu_index_layout.hpp"
+#include "clustered_stage1_file_format.hpp"
 #include "mvr_index_file_format.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
@@ -111,6 +113,17 @@ struct QuantizedSectionLayout
     size_t ex_factor_offset = 0;
     size_t one_bit_bytes_per_vector = 0;
     size_t full_code_bytes_per_vector = 0;
+    size_t total_bytes = 0;
+};
+
+struct ClusteredStage1SectionLayout
+{
+    size_t prefix_bytes = 0;
+    size_t code_offset = 0;
+    size_t factor_offset = 0;
+    size_t doc_id_offset = 0;
+    size_t token_to_cluster_pos_offset = 0;
+    size_t code_bytes_per_vector = 0;
     size_t total_bytes = 0;
 };
 
@@ -253,6 +266,150 @@ class QuantizedOutputWriter
     std::string path_;
     int fd_ = -1;
     QuantizedSectionLayout layout_;
+};
+
+class ClusteredStage1OutputWriter
+{
+   public:
+    ClusteredStage1OutputWriter(
+        const std::string& path,
+        size_t n_entries,
+        size_t code_bytes_per_vector)
+        : path_(path)
+    {
+        clustered_stage1_file_format::Header header;
+        header.n_entries = n_entries;
+        header.code_bytes_per_vector = code_bytes_per_vector;
+
+        std::ofstream output(path_, std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
+        {
+            throw std::runtime_error("Failed to open clustered sidecar output file: " + path_);
+        }
+
+        clustered_stage1_file_format::write_header(output, header, path_);
+
+        const auto prefix_pos = output.tellp();
+        if (prefix_pos == std::streampos(-1))
+        {
+            throw std::runtime_error("Failed to determine clustered sidecar header size for: " + path_);
+        }
+
+        layout_.prefix_bytes = static_cast<size_t>(prefix_pos);
+        layout_.code_bytes_per_vector = code_bytes_per_vector;
+        layout_.code_offset = layout_.prefix_bytes;
+        layout_.factor_offset = layout_.code_offset + n_entries * code_bytes_per_vector;
+        layout_.doc_id_offset = layout_.factor_offset + n_entries * sizeof(float);
+        layout_.token_to_cluster_pos_offset = layout_.doc_id_offset + n_entries * sizeof(int);
+        layout_.total_bytes =
+            layout_.token_to_cluster_pos_offset + n_entries * sizeof(uint32_t);
+        output.close();
+
+        fd_ = open(path_.c_str(), O_RDWR);
+        if (fd_ < 0)
+        {
+            throw std::runtime_error(
+                "Failed to reopen clustered sidecar output file: " + path_);
+        }
+        if (ftruncate(fd_, static_cast<off_t>(layout_.total_bytes)) != 0)
+        {
+            const auto err = errno;
+            close(fd_);
+            fd_ = -1;
+            throw std::runtime_error(
+                "Failed to size clustered sidecar output file " + path_ + ": " +
+                std::system_category().message(err));
+        }
+
+        mapping_ = mmap(nullptr, layout_.total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (mapping_ == MAP_FAILED)
+        {
+            const auto err = errno;
+            close(fd_);
+            fd_ = -1;
+            mapping_ = nullptr;
+            throw std::runtime_error(
+                "Failed to mmap clustered sidecar output file " + path_ + ": " +
+                std::system_category().message(err));
+        }
+
+        code_data_ = static_cast<char*>(mapping_) + layout_.code_offset;
+        factor_data_ = reinterpret_cast<float*>(static_cast<char*>(mapping_) + layout_.factor_offset);
+        doc_id_data_ = reinterpret_cast<int*>(static_cast<char*>(mapping_) + layout_.doc_id_offset);
+        token_to_cluster_pos_data_ = reinterpret_cast<uint32_t*>(
+            static_cast<char*>(mapping_) + layout_.token_to_cluster_pos_offset);
+        if (n_entries > 0)
+        {
+            current_doc_end_ = 0;
+        }
+    }
+
+    ClusteredStage1OutputWriter(const ClusteredStage1OutputWriter&) = delete;
+    ClusteredStage1OutputWriter& operator=(const ClusteredStage1OutputWriter&) = delete;
+
+    ~ClusteredStage1OutputWriter()
+    {
+        if (mapping_ != nullptr)
+        {
+            msync(mapping_, layout_.total_bytes, MS_SYNC);
+            munmap(mapping_, layout_.total_bytes);
+        }
+        if (fd_ >= 0)
+        {
+            close(fd_);
+        }
+    }
+
+    void scatter_batch(
+        size_t start,
+        size_t cur_batch,
+        const uint64_t* one_bit_code,
+        const float* one_bit_factor,
+        const uint32_t* cluster_rank,
+        const std::vector<int>& doc_ptrs)
+    {
+        const size_t code_bytes = layout_.code_bytes_per_vector;
+        size_t doc_id = current_doc_id_;
+        size_t doc_end = current_doc_end_;
+        if (doc_ptrs.size() > 1 && doc_end == 0)
+        {
+            doc_end = static_cast<size_t>(doc_ptrs[1]);
+        }
+
+        for (size_t i = 0; i < cur_batch; ++i)
+        {
+            const size_t orig_id = start + i;
+            while (orig_id >= doc_end && doc_id + 1 < doc_ptrs.size() - 1)
+            {
+                ++doc_id;
+                doc_end = static_cast<size_t>(doc_ptrs[doc_id + 1]);
+            }
+
+            const size_t clustered_pos = cluster_rank[orig_id];
+            std::memcpy(
+                code_data_ + clustered_pos * code_bytes,
+                reinterpret_cast<const char*>(one_bit_code) + i * code_bytes,
+                code_bytes);
+            factor_data_[clustered_pos] = one_bit_factor[i];
+            doc_id_data_[clustered_pos] = static_cast<int>(doc_id);
+            token_to_cluster_pos_data_[orig_id] = static_cast<uint32_t>(clustered_pos);
+        }
+
+        current_doc_id_ = doc_id;
+        current_doc_end_ = doc_end;
+    }
+
+   private:
+    std::string path_;
+    int fd_ = -1;
+    void* mapping_ = nullptr;
+    ClusteredStage1SectionLayout layout_;
+    char* code_data_ = nullptr;
+    float* factor_data_ = nullptr;
+    int* doc_id_data_ = nullptr;
+    uint32_t* token_to_cluster_pos_data_ = nullptr;
+    size_t current_doc_id_ = 0;
+    size_t current_doc_end_ = 0;
 };
 
 struct Step2ProgressState
@@ -527,7 +684,7 @@ void build_index(
     const MmapedEmbeddings &data,
     size_t n_clusters,
     size_t ex_bits,
-    const std::vector<int> & /*doc_lens*/,
+    const std::vector<int> &doc_lens,
     const std::string &index_dir)
 {
     using Clock = std::chrono::steady_clock;
@@ -537,10 +694,17 @@ void build_index(
     const auto build_start = Clock::now();
 
     std::filesystem::create_directories(index_dir);
+    std::error_code cleanup_ec;
+    std::filesystem::remove(
+        gpu_index_layout::legacy_quantized_data_path(index_dir), cleanup_ec);
+    cleanup_ec.clear();
+    std::filesystem::remove(
+        gpu_index_layout::legacy_clustered_stage1_path(index_dir), cleanup_ec);
 
     const std::string ivf_path = gpu_index_layout::ivf_path(index_dir);
-    const std::string quantized_data_path = gpu_index_layout::quantized_data_path(index_dir);
+    const std::string quantized_data_path = gpu_index_layout::cpu_index_path(index_dir);
     const std::string centroids_path = gpu_index_layout::centroids_path(index_dir);
+    const std::string clustered_stage1_path = gpu_index_layout::gpu_index_path(index_dir);
 
     std::vector<float> centroids;
 
@@ -603,10 +767,6 @@ void build_index(
     ivf->pg_index = pg_cagra;
     ivf->build_from_assignments(list_nos.data(), n);
     ivf->save(ivf_path, centroids_path);
-    delete ivf;
-    ivf = nullptr;
-    list_nos.clear();
-    list_nos.shrink_to_fit();
     centroids.clear();
     centroids.shrink_to_fit();
     rotated_centroids.clear();
@@ -640,6 +800,27 @@ void build_index(
         *rotator,
         n,
         ex_bits);
+    ClusteredStage1OutputWriter clustered_stage1_writer(
+        clustered_stage1_path,
+        ivf->inv_list.size(),
+        PADDED_DIM / 8);
+
+    std::vector<int> doc_ptrs(doc_lens.size() + 1, 0);
+    for (size_t i = 0; i < doc_lens.size(); ++i)
+    {
+        doc_ptrs[i + 1] = doc_ptrs[i] + doc_lens[i];
+    }
+    if (static_cast<size_t>(doc_ptrs.back()) != n)
+    {
+        throw std::runtime_error(
+            "doclens token count does not match embedding count while building clustered sidecar");
+    }
+
+    for (size_t pos = 0; pos < ivf->inv_list.size(); ++pos)
+    {
+        const uint32_t orig_id = ivf->inv_list[pos];
+        list_nos[orig_id] = static_cast<uint32_t>(pos);
+    }
 
     size_t batch_size = 10240;
     std::vector<float> raw_batch(batch_size * d);
@@ -683,6 +864,13 @@ void build_index(
             full_code_batch.data(),
             one_bit_factor_batch.data(),
             ex_factor_batch.data());
+        clustered_stage1_writer.scatter_batch(
+            start,
+            cur_batch,
+            one_bit_code_batch.data(),
+            one_bit_factor_batch.data(),
+            list_nos.data(),
+            doc_ptrs);
         step6_write_ms += elapsed_ms(write_batch_start, Clock::now());
     }
 
@@ -694,8 +882,16 @@ void build_index(
               << format_elapsed(step6_write_ms)
               << ". Quantized payload saved to " << quantized_data_path
               << "." << std::endl;
+    std::cout << "[build_index] Step 6b done in "
+              << format_elapsed(step6_write_ms)
+              << ". Clustered stage-1 payload saved to " << clustered_stage1_path
+              << "." << std::endl;
     std::cout << "[build_index] Quantize pipeline total: "
               << format_elapsed(elapsed_ms(step5_start, step5_end)) << "." << std::endl;
+    delete ivf;
+    ivf = nullptr;
+    list_nos.clear();
+    list_nos.shrink_to_fit();
     delete rotator;
 
     const auto build_end = Clock::now();
@@ -703,4 +899,143 @@ void build_index(
               << format_elapsed(elapsed_ms(build_start, build_end)) << std::endl;
 
     std::cout << "[build_index] Done. Index saved under: " << index_dir << std::endl;
+}
+
+void build_clustered_stage1_sidecar(
+    const std::vector<int>& doc_lens,
+    const std::string& source_index_dir,
+    const std::string& index_dir)
+{
+    using Clock = std::chrono::steady_clock;
+
+    const auto build_start = Clock::now();
+    std::filesystem::create_directories(index_dir);
+    std::error_code cleanup_ec;
+    std::filesystem::remove(
+        gpu_index_layout::legacy_quantized_data_path(index_dir), cleanup_ec);
+    cleanup_ec.clear();
+    std::filesystem::remove(
+        gpu_index_layout::legacy_clustered_stage1_path(index_dir), cleanup_ec);
+
+    const auto source_quantized_path =
+        gpu_index_layout::resolve_existing_cpu_index_path(source_index_dir);
+    const auto source_ivf_path = gpu_index_layout::ivf_path(source_index_dir);
+    const auto source_centroids_path = gpu_index_layout::centroids_path(source_index_dir);
+
+    const auto target_quantized_path = gpu_index_layout::cpu_index_path(index_dir);
+    const auto target_ivf_path = gpu_index_layout::ivf_path(index_dir);
+    const auto target_centroids_path = gpu_index_layout::centroids_path(index_dir);
+    const auto target_clustered_stage1_path = gpu_index_layout::gpu_index_path(index_dir);
+
+    std::cout << "[build_index] Fast sidecar mode: cloning base index from "
+              << source_index_dir << " to " << index_dir << std::endl;
+
+    const auto copy_start = Clock::now();
+    std::filesystem::copy_file(
+        source_quantized_path,
+        target_quantized_path,
+        std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(
+        source_ivf_path,
+        target_ivf_path,
+        std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(
+        source_centroids_path,
+        target_centroids_path,
+        std::filesystem::copy_options::overwrite_existing);
+    std::cout << "[build_index] Base index cloned in "
+              << format_elapsed(elapsed_ms(copy_start, Clock::now())) << std::endl;
+
+    std::ifstream inf(target_quantized_path, std::ios::binary);
+    const auto header = mvr_index_file_format::read_header(inf, target_quantized_path);
+    const size_t n = header.n;
+    const size_t code_bytes_per_vector = PADDED_DIM / 8;
+    if (header.padded_dim != PADDED_DIM) {
+        throw std::runtime_error(
+            "Index file padded_dim=" + std::to_string(header.padded_dim) +
+            " does not match compiled PADDED_DIM=" + std::to_string(PADDED_DIM));
+    }
+
+    auto* rotator = mvr_index_file_format::load_rotator(inf, header, target_quantized_path);
+    delete rotator;
+    rotator = nullptr;
+    const auto prefix_bytes = static_cast<size_t>(inf.tellg());
+
+    const size_t one_bit_bytes = n * code_bytes_per_vector;
+    const size_t full_code_bytes = n * PADDED_DIM * (1 + header.ex_bits) / 8;
+    const size_t factor_offset = prefix_bytes + one_bit_bytes + full_code_bytes;
+    inf.close();
+
+    if (doc_lens.empty()) {
+        throw std::runtime_error("doclens is empty while generating clustered sidecar");
+    }
+
+    std::vector<int> doc_ptrs(doc_lens.size() + 1, 0);
+    for (size_t i = 0; i < doc_lens.size(); ++i) {
+        doc_ptrs[i + 1] = doc_ptrs[i] + doc_lens[i];
+    }
+    if (static_cast<size_t>(doc_ptrs.back()) != n) {
+        throw std::runtime_error(
+            "doclens token count does not match embedding count while generating clustered sidecar");
+    }
+
+    IVF_PG ivf(header.n_clusters, header.d, PGType::CAGRA);
+    ivf.load(target_ivf_path, target_centroids_path);
+
+    std::vector<uint32_t> cluster_rank(n);
+    for (size_t pos = 0; pos < ivf.inv_list.size(); ++pos) {
+        cluster_rank[ivf.inv_list[pos]] = static_cast<uint32_t>(pos);
+    }
+
+    ClusteredStage1OutputWriter clustered_stage1_writer(
+        target_clustered_stage1_path,
+        ivf.inv_list.size(),
+        code_bytes_per_vector);
+
+    std::ifstream code_file(target_quantized_path, std::ios::binary);
+    std::ifstream factor_file(target_quantized_path, std::ios::binary);
+    code_file.seekg(static_cast<std::streamoff>(prefix_bytes));
+    factor_file.seekg(static_cast<std::streamoff>(factor_offset));
+    if (!code_file || !factor_file) {
+        throw std::runtime_error(
+            "Failed to position cpu index while generating gpu_index.bin");
+    }
+
+    const auto sidecar_start = Clock::now();
+    const size_t batch_vectors = 1 << 20;
+    std::vector<uint64_t> one_bit_code_batch(batch_vectors * PADDED_DIM / 64);
+    std::vector<float> one_bit_factor_batch(batch_vectors);
+
+    for (size_t start = 0; start < n; start += batch_vectors) {
+        const size_t cur_batch = std::min(batch_vectors, n - start);
+        const size_t cur_code_bytes = cur_batch * code_bytes_per_vector;
+        const size_t cur_factor_bytes = cur_batch * sizeof(float);
+
+        code_file.read(
+            reinterpret_cast<char*>(one_bit_code_batch.data()),
+            static_cast<std::streamsize>(cur_code_bytes));
+        factor_file.read(
+            reinterpret_cast<char*>(one_bit_factor_batch.data()),
+            static_cast<std::streamsize>(cur_factor_bytes));
+        if (!code_file || !factor_file) {
+            throw std::runtime_error(
+                "Failed to read one-bit sections while generating clustered sidecar");
+        }
+
+        clustered_stage1_writer.scatter_batch(
+            start,
+            cur_batch,
+            one_bit_code_batch.data(),
+            one_bit_factor_batch.data(),
+            cluster_rank.data(),
+            doc_ptrs);
+    }
+
+    code_file.close();
+    factor_file.close();
+
+    std::cout << "[build_index] gpu_index.bin generated in "
+              << format_elapsed(elapsed_ms(sidecar_start, Clock::now())) << std::endl;
+    std::cout << "[build_index][profile] Fast sidecar build total: "
+              << format_elapsed(elapsed_ms(build_start, Clock::now())) << std::endl;
 }

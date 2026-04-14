@@ -1,6 +1,7 @@
 #include "arg_utils.hpp"
-#include "gpu_index_baseline.cuh"
+#include "gpu_index_v3.cuh"
 #include "io.hpp"
+#include "startup_profile.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -69,18 +70,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    gpu_mvr::StartupProfile startup("app");
+
     size_t num_q, d, q_doclen_file;
     std::vector<float> Q = load_query(q_doclen_file, num_q, d, query_file);
+    startup.mark("load_query");
     std::vector<int> doclens = load_doclens(doclens_file);
-    auto ground_truth = read_gt_tsv(static_cast<int>(num_q), 1000, gt_file);
+    startup.mark("load_doclens");
+    auto ground_truth = read_gt_tsv(num_q, 1000, gt_file);
+    startup.mark("read_gt_tsv");
 
+    // Validate that query file matches compiled Q_DOCLEN
     if (q_doclen_file != Q_DOCLEN) {
         std::cerr << "ERROR: Query file q_doclen=" << q_doclen_file
                   << " does not match compiled Q_DOCLEN=" << Q_DOCLEN << std::endl;
+        std::cerr << "Please recompile with matching Q_DOCLEN in gpu_config.cuh" << std::endl;
         return 1;
     }
 
-    gpu_mvr_index_baseline index(index_file, doclens);
+    gpu_mvr_index index(index_file, doclens);
+    startup.mark("construct_index");
 
     const int warmup_queries = std::min<int>(warmup, static_cast<int>(num_q));
     for (int i = 0; i < warmup_queries; ++i) {
@@ -98,11 +107,14 @@ int main(int argc, char** argv) {
     Timer timer;
     timer.tick();
     std::vector<std::vector<size_t>> results(run_queries);
+    const int profiled_queries = std::min(run_queries, 5);
     for (int i = 0; i < run_queries; ++i) {
         const int query_idx = warmup_queries + i;
-        results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], k);
+        results[i] = (i < profiled_queries)
+            ? index.search_profiled(&Q[query_idx * Q_DOCLEN * d], k)
+            : index.search(&Q[query_idx * Q_DOCLEN * d], k);
     }
-    timer.tuck("v0 GPU search time for " + std::to_string(run_queries) + " queries.");
+    timer.tuck("GPU search time for " + std::to_string(run_queries) + " queries.");
 
     std::vector<std::vector<size_t>> eval_ground_truth(
         ground_truth.begin() + warmup_queries,

@@ -103,7 +103,59 @@ target_include_directories(gpu_search PRIVATE
     cpp/cuda/include
 )
 set_target_properties(gpu_search PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search PRIVATE GPU_MVR_IMPL_NAME=\"v3\")
 target_link_libraries(gpu_search PRIVATE gpu_mvr_core)
+
+add_executable(gpu_search_v3
+    cpp/app/gpu_search_v3.cu
+    cpp/cuda/src/gpu_index_v3.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+)
+target_include_directories(gpu_search_v3 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v3 PRIVATE GPU_MVR_IMPL_NAME=\"v3\")
+target_link_libraries(gpu_search_v3 PRIVATE gpu_mvr_core)
+
+add_executable(gpu_search_v2
+    cpp/app/gpu_search_v2.cu
+    cpp/cuda/src/gpu_index_v2.cu
+    cpp/cuda/src/gpu_kernels_v2.cu
+)
+target_include_directories(gpu_search_v2 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+target_compile_definitions(gpu_search_v2 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v2\"
+    GPU_MVR_DOC_SCORE_IMPL=2
+    GPU_MVR_BINARY_IP_IMPL=2
+    GPU_MVR_CPU_REFINE_IMPL=2
+    GPU_MVR_STAGE1_SPARSE_CLEANUP=0
+)
+set_target_properties(gpu_search_v2 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(gpu_search_v2 PRIVATE gpu_mvr_core)
+
+add_executable(gpu_search_v1
+    cpp/app/gpu_search_v1.cu
+    cpp/cuda/src/gpu_index_v1.cu
+    cpp/cuda/src/gpu_kernels_v1.cu
+)
+target_include_directories(gpu_search_v1 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+target_compile_definitions(gpu_search_v1 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v1\"
+    GPU_MVR_DOC_SCORE_IMPL=1
+    GPU_MVR_BINARY_IP_IMPL=1
+    GPU_MVR_CPU_REFINE_IMPL=1
+    GPU_MVR_STAGE1_SPARSE_CLEANUP=0
+)
+set_target_properties(gpu_search_v1 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(gpu_search_v1 PRIVATE gpu_mvr_core)
 
 add_executable(gpu_build 
     cpp/app/gpu_build.cu
@@ -116,14 +168,14 @@ target_include_directories(gpu_build PRIVATE
 set_target_properties(gpu_build PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(gpu_build PRIVATE gpu_mvr_core)
 
-add_executable(gpu_search_baseline
+add_executable(gpu_search_v0
     cpp/app/gpu_search_baseline.cu
     cpp/cuda/src/gpu_index_baseline.cu
     cpp/cuda/src/gpu_kernels_baseline.cu
 )
-target_include_directories(gpu_search_baseline PRIVATE
+target_include_directories(gpu_search_v0 PRIVATE
     cpp/include
     cpp/cuda/include
 )
-set_target_properties(gpu_search_baseline PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(gpu_search_baseline PRIVATE gpu_mvr_core)
+set_target_properties(gpu_search_v0 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(gpu_search_v0 PRIVATE gpu_mvr_core)

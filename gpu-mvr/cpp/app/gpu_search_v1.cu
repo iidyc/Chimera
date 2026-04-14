@@ -1,6 +1,7 @@
 #include "arg_utils.hpp"
-#include "gpu_index_baseline.cuh"
+#include "gpu_index_v1.cuh"
 #include "io.hpp"
+#include "startup_profile.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -69,10 +70,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    gpu_mvr::StartupProfile startup("app");
+
     size_t num_q, d, q_doclen_file;
     std::vector<float> Q = load_query(q_doclen_file, num_q, d, query_file);
+    startup.mark("load_query");
     std::vector<int> doclens = load_doclens(doclens_file);
+    startup.mark("load_doclens");
     auto ground_truth = read_gt_tsv(static_cast<int>(num_q), 1000, gt_file);
+    startup.mark("read_gt_tsv");
 
     if (q_doclen_file != Q_DOCLEN) {
         std::cerr << "ERROR: Query file q_doclen=" << q_doclen_file
@@ -80,7 +86,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    gpu_mvr_index_baseline index(index_file, doclens);
+    gpu_mvr_index index(index_file, doclens);
+    startup.mark("construct_index");
 
     const int warmup_queries = std::min<int>(warmup, static_cast<int>(num_q));
     for (int i = 0; i < warmup_queries; ++i) {
@@ -102,7 +109,7 @@ int main(int argc, char** argv) {
         const int query_idx = warmup_queries + i;
         results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], k);
     }
-    timer.tuck("v0 GPU search time for " + std::to_string(run_queries) + " queries.");
+    timer.tuck("GPU search time for " + std::to_string(run_queries) + " queries.");
 
     std::vector<std::vector<size_t>> eval_ground_truth(
         ground_truth.begin() + warmup_queries,
