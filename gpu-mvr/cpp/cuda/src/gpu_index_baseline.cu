@@ -500,6 +500,12 @@ void gpu_mvr_index_baseline::rank_all_tokens_exbits_cpu(
 // ======================== DESTRUCTOR ========================
 
 gpu_mvr_index_baseline::~gpu_mvr_index_baseline() {
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // PG_CAGRA stores a RAFT resource whose active stream is rebound during search.
+    delete ivf;
+    ivf = nullptr;
+
     CUDA_CHECK(cudaFree(d_one_bit_code_));
     CUDA_CHECK(cudaFree(d_one_bit_factor_));
     CUDA_CHECK(cudaFree(d_doc_ids_));
@@ -541,5 +547,4 @@ gpu_mvr_index_baseline::~gpu_mvr_index_baseline() {
     CUDA_CHECK(cudaEventDestroy(ws_.event_h2d_done));
 
     delete rotator_;
-    delete ivf;
 }

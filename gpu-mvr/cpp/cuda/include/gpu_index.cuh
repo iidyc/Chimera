@@ -78,18 +78,18 @@ struct cast_int_size_t {
 
 struct gpu_mvr_index {
     // Scalar metadata
-    size_t n;
-    size_t d;
-    size_t n_clusters;
-    size_t ex_bits;
-    size_t num_docs;
+    size_t n = 0;
+    size_t d = 0;
+    size_t n_clusters = 0;
+    size_t ex_bits = 0;
+    size_t num_docs = 0;
 
     int max_doc_len = 0;
     int max_cluster_size = 0;
 
     // CPU-side data
-    Rotator<float>* rotator_;
-    IVF_PG* ivf;
+    Rotator<float>* rotator_ = nullptr;
+    IVF_PG* ivf = nullptr;
     std::vector<char> one_bit_code_;
     std::vector<char> full_code_;
     std::vector<float> one_bit_factor_;
@@ -100,19 +100,19 @@ struct gpu_mvr_index {
     void (*unpack_func_)(const uint8_t*, float*, size_t);
 
     // GPU persistent data
-    char*  d_one_bit_code_;
-    float* d_one_bit_factor_;
-    int*   d_doc_ids_;
-    int*   d_doc_ptrs_;
-    uint32_t* d_inv_list_;
-    size_t* d_cluster_pos_;
+    char*  d_one_bit_code_ = nullptr;
+    float* d_one_bit_factor_ = nullptr;
+    int*   d_doc_ids_ = nullptr;
+    int*   d_doc_ptrs_ = nullptr;
+    uint32_t* d_inv_list_ = nullptr;
+    size_t* d_cluster_pos_ = nullptr;
 
     // Cluster-ordered copies: data reordered by inv_list so that vectors
     // in the same cluster are contiguous in memory. Stage-1 reads these
     // instead of the original arrays for coalesced global memory access.
-    char*  d_clustered_code_;
-    float* d_clustered_factor_;
-    int*   d_clustered_doc_ids_;
+    char*  d_clustered_code_ = nullptr;
+    float* d_clustered_factor_ = nullptr;
+    int*   d_clustered_doc_ids_ = nullptr;
     bool   use_clustered_ = true;  // false = fallback to non-clustered + inv_list indirection
 
     // Search parameters
@@ -269,7 +269,7 @@ struct gpu_mvr_index {
         std::vector<float>                 ip_ex_buf;
         std::vector<std::pair<float, int>> refined_scores;
         std::vector<bool>                  seen_doc_map;
-    } ws_;
+    } ws_{};
 
     // Constructor / destructor
     gpu_mvr_index(const std::string& filename, const std::vector<int>& doc_lens);
@@ -280,8 +280,17 @@ struct gpu_mvr_index {
     size_t doc_len(size_t doc_id) const;
 
     std::vector<size_t> search(const float* queries, size_t k);
+    std::vector<size_t> search_profiled(const float* queries, size_t k);
+    template <bool kProfile>
+    std::vector<size_t> search_impl(const float* queries, size_t k);
 
     void rank_cluster_dists_gpu(
+        query_object* h_query_objs,
+        size_t nprobe, size_t k,
+        int& actual_k_out,
+        cudaStream_t stream = 0);
+    template <bool kProfile>
+    void rank_cluster_dists_gpu_impl(
         query_object* h_query_objs,
         size_t nprobe, size_t k,
         int& actual_k_out,
@@ -291,6 +300,13 @@ struct gpu_mvr_index {
     int PRELIM_PER_CHUNK = k_rank_all_tokens / N_OVERLAP_CHUNKS;
 
     void rank_stage23_persistent(
+        int num_candidates,
+        size_t k,
+        size_t k_stage2,
+        query_object* queries,
+        std::vector<size_t>& result);
+    template <bool kProfile>
+    void rank_stage23_persistent_impl(
         int num_candidates,
         size_t k,
         size_t k_stage2,

@@ -47,17 +47,17 @@ struct cast_int_size_t_baseline {
 };
 
 struct gpu_mvr_index_baseline {
-    size_t n;
-    size_t d;
-    size_t n_clusters;
-    size_t ex_bits;
-    size_t num_docs;
+    size_t n = 0;
+    size_t d = 0;
+    size_t n_clusters = 0;
+    size_t ex_bits = 0;
+    size_t num_docs = 0;
 
     int max_doc_len = 0;
     int max_cluster_size = 0;
 
-    Rotator<float>* rotator_;
-    IVF_PG* ivf;
+    Rotator<float>* rotator_ = nullptr;
+    IVF_PG* ivf = nullptr;
     std::vector<char> one_bit_code_;
     std::vector<char> full_code_;
     std::vector<float> one_bit_factor_;
@@ -67,12 +67,12 @@ struct gpu_mvr_index_baseline {
     float (*ip_func_)(const float*, const uint8_t*, size_t);
     void (*unpack_func_)(const uint8_t*, float*, size_t);
 
-    char*   d_one_bit_code_;
-    float*  d_one_bit_factor_;
-    int*    d_doc_ids_;
-    int*    d_doc_ptrs_;
-    uint32_t* d_inv_list_;
-    size_t* d_cluster_pos_;
+    char*   d_one_bit_code_ = nullptr;
+    float*  d_one_bit_factor_ = nullptr;
+    int*    d_doc_ids_ = nullptr;
+    int*    d_doc_ptrs_ = nullptr;
+    uint32_t* d_inv_list_ = nullptr;
+    size_t* d_cluster_pos_ = nullptr;
 
     int nprobe = 128;
     int k_rank_cluster = 5000;
@@ -128,7 +128,7 @@ struct gpu_mvr_index_baseline {
         size_t max_stage2_k_tokens;
         size_t estimated_num_docs;
         int    max_embs_per_query_bound;
-    } ws_;
+    } ws_{};
 
     gpu_mvr_index_baseline(const std::string& filename, const std::vector<int>& doc_lens);
     ~gpu_mvr_index_baseline();

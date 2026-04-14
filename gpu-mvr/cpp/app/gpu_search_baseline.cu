@@ -21,7 +21,7 @@ void print_input_help(const char* program) {
 
 int main(int argc, char** argv) {
     int k = 100;
-    int nq = 5;
+    int nq = -1;
     int warmup = 5;
     std::string query_file;
     std::string doclens_file;
@@ -86,16 +86,28 @@ int main(int argc, char** argv) {
     for (int i = 0; i < warmup_queries; ++i) {
         index.search(&Q[i * Q_DOCLEN * d], k);
     }
+
+    const int remaining_queries = std::max<int>(0, static_cast<int>(num_q) - warmup_queries);
+    const int run_queries =
+        (nq < 0) ? remaining_queries : std::min<int>(nq, remaining_queries);
+    if (run_queries == 0) {
+        std::cerr << "No evaluation queries remain after warmup." << std::endl;
+        return 1;
+    }
+
     Timer timer;
     timer.tick();
-    const int run_queries = std::min<int>(nq, static_cast<int>(num_q));
     std::vector<std::vector<size_t>> results(run_queries);
     for (int i = 0; i < run_queries; ++i) {
-        results[i] = index.search(&Q[i * Q_DOCLEN * d], k);
+        const int query_idx = warmup_queries + i;
+        results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], k);
     }
     timer.tuck("Baseline GPU search time for " + std::to_string(run_queries) + " queries.");
 
-    compute_recall(ground_truth, results, k);
+    std::vector<std::vector<size_t>> eval_ground_truth(
+        ground_truth.begin() + warmup_queries,
+        ground_truth.begin() + warmup_queries + run_queries);
+    compute_recall(eval_ground_truth, results, k);
 
     return 0;
 }
