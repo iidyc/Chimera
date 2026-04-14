@@ -268,6 +268,85 @@ class QuantizedOutputWriter
     QuantizedSectionLayout layout_;
 };
 
+class QuantizedOutputBuffer
+{
+   public:
+    explicit QuantizedOutputBuffer(size_t n, size_t ex_bits)
+        : one_bit_code_(n * PADDED_DIM / 64),
+          full_code_(n * PADDED_DIM * (1 + ex_bits) / 8),
+          one_bit_factor_(n),
+          ex_factor_(n),
+          one_bit_bytes_per_vector_(PADDED_DIM / 8),
+          full_code_bytes_per_vector_(PADDED_DIM * (1 + ex_bits) / 8)
+    {
+    }
+
+    void copy_batch(
+        size_t start,
+        size_t cur_batch,
+        const uint64_t* one_bit_code,
+        const uint8_t* full_code,
+        const float* one_bit_factor,
+        const float* ex_factor)
+    {
+        std::memcpy(
+            one_bit_code_.data() + start * (PADDED_DIM / 64),
+            one_bit_code,
+            cur_batch * one_bit_bytes_per_vector_);
+        std::memcpy(
+            full_code_.data() + start * full_code_bytes_per_vector_,
+            full_code,
+            cur_batch * full_code_bytes_per_vector_);
+        std::memcpy(
+            one_bit_factor_.data() + start,
+            one_bit_factor,
+            cur_batch * sizeof(float));
+        std::memcpy(
+            ex_factor_.data() + start,
+            ex_factor,
+            cur_batch * sizeof(float));
+    }
+
+    void write_to_file(
+        const std::string& path,
+        const mvr_index_file_format::Header& header,
+        const Rotator<float>& rotator) const
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
+        {
+            throw std::runtime_error("Failed to open quantized output file: " + path);
+        }
+
+        mvr_index_file_format::write_header(output, header, path);
+        mvr_index_file_format::save_rotator(output, rotator, path);
+        output.write(
+            reinterpret_cast<const char*>(one_bit_code_.data()),
+            static_cast<std::streamsize>(one_bit_code_.size() * sizeof(uint64_t)));
+        output.write(
+            reinterpret_cast<const char*>(full_code_.data()),
+            static_cast<std::streamsize>(full_code_.size()));
+        output.write(
+            reinterpret_cast<const char*>(one_bit_factor_.data()),
+            static_cast<std::streamsize>(one_bit_factor_.size() * sizeof(float)));
+        output.write(
+            reinterpret_cast<const char*>(ex_factor_.data()),
+            static_cast<std::streamsize>(ex_factor_.size() * sizeof(float)));
+        if (!output)
+        {
+            throw std::runtime_error("Failed to write quantized output file: " + path);
+        }
+    }
+
+   private:
+    std::vector<uint64_t> one_bit_code_;
+    std::vector<uint8_t> full_code_;
+    std::vector<float> one_bit_factor_;
+    std::vector<float> ex_factor_;
+    size_t one_bit_bytes_per_vector_ = 0;
+    size_t full_code_bytes_per_vector_ = 0;
+};
+
 class ClusteredStage1OutputWriter
 {
    public:
@@ -408,6 +487,97 @@ class ClusteredStage1OutputWriter
     float* factor_data_ = nullptr;
     int* doc_id_data_ = nullptr;
     uint32_t* token_to_cluster_pos_data_ = nullptr;
+    size_t current_doc_id_ = 0;
+    size_t current_doc_end_ = 0;
+};
+
+class ClusteredStage1Buffer
+{
+   public:
+    ClusteredStage1Buffer(size_t n_entries, size_t code_bytes_per_vector)
+        : code_(n_entries * code_bytes_per_vector),
+          factor_(n_entries),
+          doc_id_(n_entries),
+          token_to_cluster_pos_(n_entries),
+          code_bytes_per_vector_(code_bytes_per_vector)
+    {
+    }
+
+    void scatter_batch(
+        size_t start,
+        size_t cur_batch,
+        const uint64_t* one_bit_code,
+        const float* one_bit_factor,
+        const uint32_t* cluster_rank,
+        const std::vector<int>& doc_ptrs)
+    {
+        size_t doc_id = current_doc_id_;
+        size_t doc_end = current_doc_end_;
+        if (doc_ptrs.size() > 1 && doc_end == 0)
+        {
+            doc_end = static_cast<size_t>(doc_ptrs[1]);
+        }
+
+        for (size_t i = 0; i < cur_batch; ++i)
+        {
+            const size_t orig_id = start + i;
+            while (orig_id >= doc_end && doc_id + 1 < doc_ptrs.size() - 1)
+            {
+                ++doc_id;
+                doc_end = static_cast<size_t>(doc_ptrs[doc_id + 1]);
+            }
+
+            const size_t clustered_pos = cluster_rank[orig_id];
+            std::memcpy(
+                code_.data() + clustered_pos * code_bytes_per_vector_,
+                reinterpret_cast<const char*>(one_bit_code) + i * code_bytes_per_vector_,
+                code_bytes_per_vector_);
+            factor_[clustered_pos] = one_bit_factor[i];
+            doc_id_[clustered_pos] = static_cast<int>(doc_id);
+            token_to_cluster_pos_[orig_id] = static_cast<uint32_t>(clustered_pos);
+        }
+
+        current_doc_id_ = doc_id;
+        current_doc_end_ = doc_end;
+    }
+
+    void write_to_file(const std::string& path) const
+    {
+        clustered_stage1_file_format::Header header;
+        header.n_entries = factor_.size();
+        header.code_bytes_per_vector = code_bytes_per_vector_;
+
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
+        {
+            throw std::runtime_error("Failed to open clustered stage-1 output file: " + path);
+        }
+
+        clustered_stage1_file_format::write_header(output, header, path);
+        output.write(
+            code_.data(),
+            static_cast<std::streamsize>(code_.size()));
+        output.write(
+            reinterpret_cast<const char*>(factor_.data()),
+            static_cast<std::streamsize>(factor_.size() * sizeof(float)));
+        output.write(
+            reinterpret_cast<const char*>(doc_id_.data()),
+            static_cast<std::streamsize>(doc_id_.size() * sizeof(int)));
+        output.write(
+            reinterpret_cast<const char*>(token_to_cluster_pos_.data()),
+            static_cast<std::streamsize>(token_to_cluster_pos_.size() * sizeof(uint32_t)));
+        if (!output)
+        {
+            throw std::runtime_error("Failed to write clustered stage-1 output file: " + path);
+        }
+    }
+
+   private:
+    std::vector<char> code_;
+    std::vector<float> factor_;
+    std::vector<int> doc_id_;
+    std::vector<uint32_t> token_to_cluster_pos_;
+    size_t code_bytes_per_vector_ = 0;
     size_t current_doc_id_ = 0;
     size_t current_doc_end_ = 0;
 };
@@ -791,17 +961,9 @@ void build_index(
               << quantized_data_path << " ..." << std::endl;
 
     const auto step5_start = Clock::now();
-    double step5_quantize_ms = 0.0;
-    double step6_write_ms = 0.0;
 
-    QuantizedOutputWriter quantized_writer(
-        quantized_data_path,
-        header,
-        *rotator,
-        n,
-        ex_bits);
-    ClusteredStage1OutputWriter clustered_stage1_writer(
-        clustered_stage1_path,
+    QuantizedOutputBuffer quantized_buffer(n, ex_bits);
+    ClusteredStage1Buffer clustered_stage1_buffer(
         ivf->inv_list.size(),
         PADDED_DIM / 8);
 
@@ -829,7 +991,6 @@ void build_index(
         size_t end = std::min(start + batch_size, n);
         size_t cur_batch = end - start;
 
-        const auto quantize_batch_start = Clock::now();
         data.copy_embeddings(start, cur_batch, raw_batch.data());
         std::vector<float> rotated(cur_batch * PADDED_DIM);
         std::vector<uint64_t> one_bit_code_batch(cur_batch * PADDED_DIM / 64);
@@ -854,36 +1015,40 @@ void build_index(
                 full_code_batch.data() + i * (PADDED_DIM * (1 + ex_bits) / 8),
                 &ex_factor_batch[i]);
         }
-        step5_quantize_ms += elapsed_ms(quantize_batch_start, Clock::now());
-
-        const auto write_batch_start = Clock::now();
-        quantized_writer.write_batch(
+        quantized_buffer.copy_batch(
             start,
             cur_batch,
             one_bit_code_batch.data(),
             full_code_batch.data(),
             one_bit_factor_batch.data(),
             ex_factor_batch.data());
-        clustered_stage1_writer.scatter_batch(
+        clustered_stage1_buffer.scatter_batch(
             start,
             cur_batch,
             one_bit_code_batch.data(),
             one_bit_factor_batch.data(),
             list_nos.data(),
             doc_ptrs);
-        step6_write_ms += elapsed_ms(write_batch_start, Clock::now());
     }
 
     const auto step5_end = Clock::now();
+    const auto flush_start = Clock::now();
+    quantized_buffer.write_to_file(
+        quantized_data_path,
+        header,
+        *rotator);
+    clustered_stage1_buffer.write_to_file(clustered_stage1_path);
+    const auto flush_end = Clock::now();
+
     std::cout << "[build_index] Step 5 done in "
-              << format_elapsed(step5_quantize_ms)
+              << format_elapsed(elapsed_ms(step5_start, step5_end))
               << ". Quantization complete." << std::endl;
     std::cout << "[build_index] Step 6 done in "
-              << format_elapsed(step6_write_ms)
+              << format_elapsed(elapsed_ms(flush_start, flush_end))
               << ". Quantized payload saved to " << quantized_data_path
               << "." << std::endl;
     std::cout << "[build_index] Step 6b done in "
-              << format_elapsed(step6_write_ms)
+              << format_elapsed(elapsed_ms(flush_start, flush_end))
               << ". Clustered stage-1 payload saved to " << clustered_stage1_path
               << "." << std::endl;
     std::cout << "[build_index] Quantize pipeline total: "

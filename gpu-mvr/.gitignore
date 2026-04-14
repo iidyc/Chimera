@@ -2,3 +2,5 @@ build/
 .vscode/
 faiss/
 .claude/
+
+*.sh
