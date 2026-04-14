@@ -247,6 +247,11 @@ CLI:
   --gt <groundtruth.tsv> \
   --index <index_dir_or_cpu_index.bin> \
   [--k <top_k>] \
+  [--nprobe <num_probes>] \
+  [--k-rank-cluster <count>] \
+  [--k-rank-all-tokens <count>] \
+  [--itopk-size <count>] \
+  [--overlap-chunks <count>] \
   [--nq <num_queries_to_run>] \
   [--warmup <num_warmup_queries>]
 ```
@@ -255,6 +260,10 @@ Notes:
 
 - `Q_DOCLEN` in `gpu_config.cuh` must match the `q_doclen` stored in `query_embeddings.bin`.
 - `--nq` and `--warmup` are clamped to the number of queries in the query file.
+- The GPU search binaries now share one standardized CLI parser. `gpu_search`, `gpu_search_v0`, `gpu_search_v1`, `gpu_search_v2`, and `gpu_search_v3` all accept the same search-tuning flags.
+- Default values still differ by binary where the code previously differed, especially `--k-rank-cluster`.
+- `--itopk-size` controls CAGRA's internal intermediate top-k during centroid search.
+- `--overlap-chunks` is used by the persistent overlap pipeline in `v1`/`v2`/`v3` and is ignored by `v0`.
 
 ### `gpu_search_v0`
 
@@ -273,6 +282,11 @@ CLI:
   --gt <groundtruth.tsv> \
   --index <index_dir_or_cpu_index.bin> \
   [--k <top_k>] \
+  [--nprobe <num_probes>] \
+  [--k-rank-cluster <count>] \
+  [--k-rank-all-tokens <count>] \
+  [--itopk-size <count>] \
+  [--overlap-chunks <count>] \
   [--nq <num_queries_to_run>] \
   [--warmup <num_warmup_queries>]
 ```

@@ -100,7 +100,8 @@ void PG_CAGRA::build_index(const float* data) {
 void PG_CAGRA::search(const float* /*query*/, size_t /*k*/, std::vector<size_t>& /*results*/) {}
 
 void PG_CAGRA::search_batch_gpu(const float* d_queries, size_t n_queries, size_t k,
-                                float* d_dists, uint32_t* d_labels, cudaStream_t stream) {
+                                float* d_dists, uint32_t* d_labels, cudaStream_t stream,
+                                size_t itopk_size) {
     raft::resource::set_cuda_stream(res_, rmm::cuda_stream_view(stream));
 
     auto queries = raft::make_device_matrix_view(
@@ -120,7 +121,7 @@ void PG_CAGRA::search_batch_gpu(const float* d_queries, size_t n_queries, size_t
     );
 
     cuvs::neighbors::cagra::search_params search_params;
-    search_params.itopk_size = 150;
+    search_params.itopk_size = itopk_size;
     cuvs::neighbors::cagra::search(res_, search_params, *index_cagra, queries, labels, distances);
 }
 
@@ -160,10 +161,12 @@ void IVF_PG::search(const float* query, size_t n_probe, std::vector<size_t>& res
 }
 
 void IVF_PG::search_batch_gpu(const float* d_queries, size_t n_queries, size_t n_probe,
-                              float* d_dists, uint32_t* d_labels, cudaStream_t stream) {
+                              float* d_dists, uint32_t* d_labels, cudaStream_t stream,
+                              size_t itopk_size) {
     auto* cagra = dynamic_cast<PG_CAGRA*>(pg_index);
     if (cagra) {
-        cagra->search_batch_gpu(d_queries, n_queries, n_probe, d_dists, d_labels, stream);
+        cagra->search_batch_gpu(
+            d_queries, n_queries, n_probe, d_dists, d_labels, stream, itopk_size);
     } else {
         throw std::runtime_error("search_batch_gpu requires PG_CAGRA");
     }

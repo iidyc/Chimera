@@ -14,7 +14,15 @@
 
 // ======================== CONSTRUCTOR ========================
 
-gpu_mvr_index::gpu_mvr_index(const std::string& filename, const std::vector<int>& doc_lens) {
+gpu_mvr_index::gpu_mvr_index(
+    const std::string& filename,
+    const std::vector<int>& doc_lens,
+    const gpu_search_runtime_options& runtime_options) {
+    nprobe = runtime_options.nprobe;
+    k_rank_cluster = runtime_options.k_rank_cluster;
+    k_rank_all_tokens = runtime_options.k_rank_all_tokens;
+    itopk_size = runtime_options.itopk_size;
+    overlap_chunks = runtime_options.overlap_chunks;
     gpu_mvr::StartupProfile startup("index_ctor");
     const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
     startup.mark("resolve_index_paths");
@@ -790,8 +798,14 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     }
 #endif
 
-    ivf->search_batch_gpu(ws_.d_queries, Q_DOCLEN, nprobe,
-                          ws_.d_cagra_dists, ws_.d_cagra_labels, stream);
+    ivf->search_batch_gpu(
+        ws_.d_queries,
+        Q_DOCLEN,
+        nprobe,
+        ws_.d_cagra_dists,
+        ws_.d_cagra_labels,
+        stream,
+        static_cast<size_t>(itopk_size));
 
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -1064,12 +1078,12 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, tl_base, e)); return (int)(ms * 1000.0f);
     };
 
-    cudaEvent_t tl_c_wait_ev[N_OVERLAP_CHUNKS], tl_c_scores_s[N_OVERLAP_CHUNKS];
-    cudaEvent_t tl_c_scores_e[N_OVERLAP_CHUNKS];
-    cudaEvent_t tl_c_extract_s[N_OVERLAP_CHUNKS], tl_c_extract_m[N_OVERLAP_CHUNKS], tl_c_extract_e[N_OVERLAP_CHUNKS];
-    bool tl_c_has_extract[N_OVERLAP_CHUNKS] = {};
-    bool tl_c_has_scores[N_OVERLAP_CHUNKS] = {};
-    for (int c = 0; c < N_OVERLAP_CHUNKS; c++) {
+    std::vector<cudaEvent_t> tl_c_wait_ev(overlap_chunks), tl_c_scores_s(overlap_chunks);
+    std::vector<cudaEvent_t> tl_c_scores_e(overlap_chunks);
+    std::vector<cudaEvent_t> tl_c_extract_s(overlap_chunks), tl_c_extract_m(overlap_chunks), tl_c_extract_e(overlap_chunks);
+    std::vector<bool> tl_c_has_extract(overlap_chunks, false);
+    std::vector<bool> tl_c_has_scores(overlap_chunks, false);
+    for (int c = 0; c < overlap_chunks; c++) {
         CUDA_CHECK(cudaEventCreate(&tl_c_wait_ev[c]));
         CUDA_CHECK(cudaEventCreate(&tl_c_scores_s[c]));
         CUDA_CHECK(cudaEventCreate(&tl_c_scores_e[c]));
@@ -1180,15 +1194,15 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     while (score_threads < Q_DOCLEN && score_threads < 256) score_threads *= 2;
     score_threads = std::min(score_threads, 256);
 
-    int actual_chunks = std::min((int)N_OVERLAP_CHUNKS, num_candidates);
+    int actual_chunks = std::min(overlap_chunks, num_candidates);
     int cand_chunk_size = (num_candidates + actual_chunks - 1) / actual_chunks;
 #ifdef GPU_MVR_TIMELINE
     tl_actual_chunks = actual_chunks;
 #endif
 
-    cudaEvent_t chunk_compute_done[N_OVERLAP_CHUNKS];
-    cudaEvent_t chunk_d2h_done[N_OVERLAP_CHUNKS];
-    cudaEvent_t chunk_extract_done[N_OVERLAP_CHUNKS];
+    std::vector<cudaEvent_t> chunk_compute_done(actual_chunks);
+    std::vector<cudaEvent_t> chunk_d2h_done(actual_chunks);
+    std::vector<cudaEvent_t> chunk_extract_done(actual_chunks);
     for (int c = 0; c < actual_chunks; c++) {
         CUDA_CHECK(cudaEventCreateWithFlags(&chunk_compute_done[c], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&chunk_d2h_done[c], cudaEventDisableTiming));
@@ -1196,11 +1210,11 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     }
 
 #ifdef GPU_MVR_PROFILE
-    cudaEvent_t chunk_bip_start[N_OVERLAP_CHUNKS];
-    cudaEvent_t chunk_bip_end[N_OVERLAP_CHUNKS];
-    cudaEvent_t chunk_docscore_start[N_OVERLAP_CHUNKS];
-    cudaEvent_t chunk_docscore_end[N_OVERLAP_CHUNKS];
-    bool chunk_has_bip[N_OVERLAP_CHUNKS] = {};
+    std::vector<cudaEvent_t> chunk_bip_start(actual_chunks);
+    std::vector<cudaEvent_t> chunk_bip_end(actual_chunks);
+    std::vector<cudaEvent_t> chunk_docscore_start(actual_chunks);
+    std::vector<cudaEvent_t> chunk_docscore_end(actual_chunks);
+    std::vector<bool> chunk_has_bip(actual_chunks, false);
     if constexpr (kProfile) {
         ws_.s23_pst_kernel_ms = 0;
         ws_.s23_pst_bip_ms = 0;
@@ -1565,7 +1579,7 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         std::cout << "[TIMELINE] Wrote timeline.json\n";
 
         CUDA_CHECK(cudaEventDestroy(tl_base));
-        for (int c = 0; c < N_OVERLAP_CHUNKS; c++) {
+        for (int c = 0; c < overlap_chunks; c++) {
             CUDA_CHECK(cudaEventDestroy(tl_c_wait_ev[c]));
             CUDA_CHECK(cudaEventDestroy(tl_c_scores_s[c]));
             CUDA_CHECK(cudaEventDestroy(tl_c_scores_e[c]));

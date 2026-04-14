@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include "gpu_search_options.hpp"
 #include "gpu_config.cuh"
 #include "ivf_pg.hpp"
 
@@ -58,6 +59,8 @@ struct gpu_mvr_index {
     int nprobe = 128;
     int k_rank_cluster = 1800;
     int k_rank_all_tokens = 300;
+    int itopk_size = 150;
+    int overlap_chunks = 5;
 
     struct Workspace {
         float* d_queries;
@@ -190,10 +193,10 @@ struct gpu_mvr_index {
         std::vector<std::pair<float, int>> refined_scores;
     } ws_;
 
-    static constexpr int N_OVERLAP_CHUNKS = 5;
-    int PRELIM_PER_CHUNK = k_rank_all_tokens / N_OVERLAP_CHUNKS;
-
-    gpu_mvr_index(const std::string& filename, const std::vector<int>& doc_lens);
+    gpu_mvr_index(
+        const std::string& filename,
+        const std::vector<int>& doc_lens,
+        const gpu_search_runtime_options& runtime_options);
 
     void set_doc_mapping(const std::vector<int>& doc_lens);
     void allocate_workspace();

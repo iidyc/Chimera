@@ -33,6 +33,7 @@
 #include <fstream>
 #include <sstream>
 #include <immintrin.h>
+#include "gpu_search_options.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
 #include "quantization.hpp"
@@ -116,6 +117,8 @@ struct gpu_mvr_index {
     int nprobe = 128;
     int k_rank_cluster = 3000;
     int k_rank_all_tokens = 300;
+    int itopk_size = 150;
+    int overlap_chunks = 5;
 
     // Pre-allocated GPU workspace
     struct Workspace {
@@ -269,7 +272,10 @@ struct gpu_mvr_index {
     } ws_{};
 
     // Constructor / destructor
-    gpu_mvr_index(const std::string& filename, const std::vector<int>& doc_lens);
+    gpu_mvr_index(
+        const std::string& filename,
+        const std::vector<int>& doc_lens,
+        const gpu_search_runtime_options& runtime_options);
     ~gpu_mvr_index();
 
     void set_doc_mapping(const std::vector<int>& doc_lens);
@@ -292,9 +298,6 @@ struct gpu_mvr_index {
         size_t nprobe, size_t k,
         int& actual_k_out,
         cudaStream_t stream = 0);
-
-    static constexpr int N_OVERLAP_CHUNKS = 5;
-    int PRELIM_PER_CHUNK = k_rank_all_tokens / N_OVERLAP_CHUNKS;
 
     void rank_stage23_persistent(
         int num_candidates,

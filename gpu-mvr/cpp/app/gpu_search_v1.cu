@@ -1,83 +1,31 @@
-#include "arg_utils.hpp"
+#include "gpu_search_cli.hpp"
 #include "gpu_index_v1.cuh"
 #include "io.hpp"
 #include "startup_profile.hpp"
 #include "utils.hpp"
 
-namespace {
-
-void print_input_help(const char* program) {
-    std::cout
-        << "Usage: " << program << "\n"
-        << "  --query <query_embeddings.bin>\n"
-        << "  --doclens <doclens.bin>\n"
-        << "  --gt <groundtruth.tsv>\n"
-        << "  --index <index_dir|cpu_index.bin>\n"
-        << "  [--k <top_k>]\n"
-        << "  [--nq <num_queries_to_run>]\n"
-        << "  [--warmup <num_warmup_queries>]\n";
-}
-
-}  // namespace
-
 int main(int argc, char** argv) {
-    int k = 100;
-    int nq = -1;
-    int warmup = 5;
-    std::string query_file;
-    std::string doclens_file;
-    std::string gt_file;
-    std::string index_file;
-
-    if (argc == 1) {
-        print_input_help(argv[0]);
-        return 1;
-    }
+    gpu_search_cli_args args;
+    args.runtime.k_rank_cluster = 1800;
 
     try {
-        for (int i = 1; i < argc; ++i) {
-            std::string arg = argv[i];
-            if (arg == "--query" || arg == "-q") {
-                query_file = require_value(argc, argv, i, arg);
-            } else if (arg == "--doclens" || arg == "-d") {
-                doclens_file = require_value(argc, argv, i, arg);
-            } else if (arg == "--gt" || arg == "-g") {
-                gt_file = require_value(argc, argv, i, arg);
-            } else if (arg == "--index" || arg == "-i") {
-                index_file = require_value(argc, argv, i, arg);
-            } else if (arg == "--k") {
-                k = std::stoi(require_value(argc, argv, i, arg));
-            } else if (arg == "--nq") {
-                nq = std::stoi(require_value(argc, argv, i, arg));
-            } else if (arg == "--warmup") {
-                warmup = std::stoi(require_value(argc, argv, i, arg));
-            } else if (arg == "--help" || arg == "-h") {
-                print_input_help(argv[0]);
-                return 0;
-            } else {
-                throw std::runtime_error("Unknown argument: " + arg);
-            }
-        }
+        args = parse_gpu_search_args(argc, argv, args);
     } catch (const std::exception& e) {
-        std::cerr << "Argument error: " << e.what() << "\n\n";
-        print_input_help(argv[0]);
-        return 1;
-    }
-
-    if (query_file.empty() || doclens_file.empty() || gt_file.empty() || index_file.empty()) {
-        std::cerr << "Missing required arguments.\n\n";
-        print_input_help(argv[0]);
-        return 1;
+        if (std::string(e.what()) != "help_requested") {
+            std::cerr << "Argument error: " << e.what() << "\n\n";
+        }
+        print_gpu_search_help(argv[0], args);
+        return std::string(e.what()) == "help_requested" ? 0 : 1;
     }
 
     gpu_mvr::StartupProfile startup("app");
 
     size_t num_q, d, q_doclen_file;
-    std::vector<float> Q = load_query(q_doclen_file, num_q, d, query_file);
+    std::vector<float> Q = load_query(q_doclen_file, num_q, d, args.query_file);
     startup.mark("load_query");
-    std::vector<int> doclens = load_doclens(doclens_file);
+    std::vector<int> doclens = load_doclens(args.doclens_file);
     startup.mark("load_doclens");
-    auto ground_truth = read_gt_tsv(static_cast<int>(num_q), 1000, gt_file);
+    auto ground_truth = read_gt_tsv(static_cast<int>(num_q), 1000, args.gt_file);
     startup.mark("read_gt_tsv");
 
     if (q_doclen_file != Q_DOCLEN) {
@@ -86,17 +34,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    gpu_mvr_index index(index_file, doclens);
+    gpu_mvr_index index(args.index_file, doclens, args.runtime);
     startup.mark("construct_index");
 
-    const int warmup_queries = std::min<int>(warmup, static_cast<int>(num_q));
+    const int warmup_queries = std::min<int>(args.warmup, static_cast<int>(num_q));
     for (int i = 0; i < warmup_queries; ++i) {
-        index.search(&Q[i * Q_DOCLEN * d], k);
+        index.search(&Q[i * Q_DOCLEN * d], args.k);
     }
 
     const int remaining_queries = std::max<int>(0, static_cast<int>(num_q) - warmup_queries);
     const int run_queries =
-        (nq < 0) ? remaining_queries : std::min<int>(nq, remaining_queries);
+        (args.nq < 0) ? remaining_queries : std::min<int>(args.nq, remaining_queries);
     if (run_queries == 0) {
         std::cerr << "No evaluation queries remain after warmup." << std::endl;
         return 1;
@@ -107,14 +55,14 @@ int main(int argc, char** argv) {
     std::vector<std::vector<size_t>> results(run_queries);
     for (int i = 0; i < run_queries; ++i) {
         const int query_idx = warmup_queries + i;
-        results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], k);
+        results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], args.k);
     }
     timer.tuck("GPU search time for " + std::to_string(run_queries) + " queries.");
 
     std::vector<std::vector<size_t>> eval_ground_truth(
         ground_truth.begin() + warmup_queries,
         ground_truth.begin() + warmup_queries + run_queries);
-    compute_recall(eval_ground_truth, results, k);
+    compute_recall(eval_ground_truth, results, args.k);
 
     return 0;
 }

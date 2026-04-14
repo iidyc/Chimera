@@ -7,7 +7,14 @@
 
 // ======================== CONSTRUCTOR ========================
 
-gpu_mvr_index_baseline::gpu_mvr_index_baseline(const std::string& filename, const std::vector<int>& doc_lens) {
+gpu_mvr_index_baseline::gpu_mvr_index_baseline(
+    const std::string& filename,
+    const std::vector<int>& doc_lens,
+    const gpu_search_runtime_options& runtime_options) {
+    nprobe = runtime_options.nprobe;
+    k_rank_cluster = runtime_options.k_rank_cluster;
+    k_rank_all_tokens = runtime_options.k_rank_all_tokens;
+    itopk_size = runtime_options.itopk_size;
     const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
 
     std::ifstream inf(resolved_paths.quantized_data_path, std::ios::binary);
@@ -247,8 +254,14 @@ void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
     size_t matrix_size = (size_t)num_docs * Q_DOCLEN;
     CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_query_max, 0, matrix_size * sizeof(float), stream));
 
-    ivf->search_batch_gpu(ws_.d_queries, Q_DOCLEN, nprobe,
-                          ws_.d_cagra_dists, ws_.d_cagra_labels, stream);
+    ivf->search_batch_gpu(
+        ws_.d_queries,
+        Q_DOCLEN,
+        nprobe,
+        ws_.d_cagra_dists,
+        ws_.d_cagra_labels,
+        stream,
+        static_cast<size_t>(itopk_size));
 
     compute_query_expansion_sizes_baseline_kernel<<<(Q_DOCLEN + 255) / 256, 256, 0, stream>>>(
         ws_.d_cagra_labels, d_cluster_pos_,

@@ -20,6 +20,7 @@
 #include <cfloat>
 #include <limits>
 #include <fstream>
+#include "gpu_search_options.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
 #include "quantization.hpp"
@@ -77,6 +78,7 @@ struct gpu_mvr_index_baseline {
     int nprobe = 128;
     int k_rank_cluster = 5000;
     int k_rank_all_tokens = 300;
+    int itopk_size = 150;
 
     struct Workspace {
         float* d_queries;
@@ -130,7 +132,10 @@ struct gpu_mvr_index_baseline {
         int    max_embs_per_query_bound;
     } ws_{};
 
-    gpu_mvr_index_baseline(const std::string& filename, const std::vector<int>& doc_lens);
+    gpu_mvr_index_baseline(
+        const std::string& filename,
+        const std::vector<int>& doc_lens,
+        const gpu_search_runtime_options& runtime_options);
     ~gpu_mvr_index_baseline();
 
     void set_doc_mapping(const std::vector<int>& doc_lens);

@@ -377,7 +377,15 @@ inline void combine_refined_scores_cpu(
 }  // namespace v2
 }  // namespace gpu_mvr
 
-gpu_mvr_index::gpu_mvr_index(const std::string& filename, const std::vector<int>& doc_lens) {
+gpu_mvr_index::gpu_mvr_index(
+        const std::string& filename,
+        const std::vector<int>& doc_lens,
+        const gpu_search_runtime_options& runtime_options) {
+        nprobe = runtime_options.nprobe;
+        k_rank_cluster = runtime_options.k_rank_cluster;
+        k_rank_all_tokens = runtime_options.k_rank_all_tokens;
+        itopk_size = runtime_options.itopk_size;
+        overlap_chunks = runtime_options.overlap_chunks;
         gpu_mvr::StartupProfile startup("index_ctor");
         const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
         startup.mark("resolve_index_paths");
@@ -1058,7 +1066,8 @@ void gpu_mvr_index::rank_cluster_dists_gpu(
                 nprobe,
                 ws_.d_cagra_dists,
                 ws_.d_cagra_labels,
-                stream);
+                stream,
+                static_cast<size_t>(itopk_size));
         }
 
 #ifdef GPU_MVR_PROFILE
@@ -1610,11 +1619,11 @@ void gpu_mvr_index::rank_stage23_persistent(
         score_threads = std::min(score_threads, 256);
 
         // Chunk boundaries (candidates are sorted by Stage 1 score descending)
-        int actual_chunks = std::min((int)N_OVERLAP_CHUNKS, num_candidates);
+        int actual_chunks = std::min(overlap_chunks, num_candidates);
         int cand_chunk_size = (num_candidates + actual_chunks - 1) / actual_chunks;
 
         // Create per-chunk compute events
-        cudaEvent_t chunk_compute_done[N_OVERLAP_CHUNKS];
+        std::vector<cudaEvent_t> chunk_compute_done(actual_chunks);
         for (int c = 0; c < actual_chunks; c++)
             CUDA_CHECK(cudaEventCreateWithFlags(&chunk_compute_done[c], cudaEventDisableTiming));
 
