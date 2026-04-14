@@ -6,9 +6,40 @@
 #include <fstream>
 #include <stdexcept>
 
+#include <rmm/cuda_stream_view.hpp>
+
 namespace {
 
 using cagra_index_t = cuvs::neighbors::cagra::index<float, uint32_t>;
+
+void save_graph_file(const PG* pg_index, const std::string& graph_path) {
+    if (const auto* cagra = dynamic_cast<const PG_CAGRA*>(pg_index)) {
+        cuvs::neighbors::cagra::serialize(cagra->res_, graph_path, *cagra->index_cagra);
+        return;
+    }
+
+    if (const auto* hnsw = dynamic_cast<const PG_HNSW*>(pg_index)) {
+        hnsw->hnsw_index->saveIndex(graph_path);
+        return;
+    }
+
+    throw std::runtime_error("Unsupported PG type in save_graph_file()");
+}
+
+void load_graph_file(PG* pg_index, const std::string& graph_path) {
+    if (auto* cagra = dynamic_cast<PG_CAGRA*>(pg_index)) {
+        cagra->index_cagra = std::make_unique<cagra_index_t>(cagra->res_);
+        cuvs::neighbors::cagra::deserialize(cagra->res_, graph_path, cagra->index_cagra.get());
+        return;
+    }
+
+    if (auto* hnsw = dynamic_cast<PG_HNSW*>(pg_index)) {
+        hnsw->hnsw_index->loadIndex(graph_path, &hnsw->space_, hnsw->n);
+        return;
+    }
+
+    throw std::runtime_error("Unsupported PG type in load_graph_file()");
+}
 
 }  // namespace
 
@@ -69,7 +100,9 @@ void PG_CAGRA::build_index(const float* data) {
 void PG_CAGRA::search(const float* /*query*/, size_t /*k*/, std::vector<size_t>& /*results*/) {}
 
 void PG_CAGRA::search_batch_gpu(const float* d_queries, size_t n_queries, size_t k,
-                                float* d_dists, uint32_t* d_labels, cudaStream_t /*stream*/) {
+                                float* d_dists, uint32_t* d_labels, cudaStream_t stream) {
+    raft::resource::set_cuda_stream(res_, rmm::cuda_stream_view(stream));
+
     auto queries = raft::make_device_matrix_view(
         d_queries,
         static_cast<std::int64_t>(n_queries),
@@ -121,7 +154,7 @@ void IVF_PG::search(const float* query, size_t n_probe, std::vector<size_t>& res
         size_t start = cluster_pos[id];
         size_t end = cluster_pos[id + 1];
         for (size_t i = start; i < end; ++i) {
-            results.push_back(inv_list[i]);
+            results.push_back(static_cast<size_t>(inv_list[i]));
         }
     }
 }
@@ -138,33 +171,34 @@ void IVF_PG::search_batch_gpu(const float* d_queries, size_t n_queries, size_t n
 
 void IVF_PG::build_index(const float* /*data*/) {}
 
-void IVF_PG::build_from_assignments(const int64_t* list_nos, size_t n_vectors) {
-    std::vector<std::vector<int>> clusters(n_clusters);
+void IVF_PG::build_from_assignments(const uint32_t* list_nos, size_t n_vectors) {
+    cluster_pos.assign(n_clusters + 1, 0);
     for (size_t i = 0; i < n_vectors; ++i) {
-        clusters[list_nos[i]].push_back(static_cast<int>(i));
+        ++cluster_pos[list_nos[i] + 1];
     }
-    inv_list.clear();
-    cluster_pos.clear();
-    cluster_pos.reserve(n_clusters + 1);
-    size_t cumu_size = 0;
+
     for (size_t i = 0; i < n_clusters; ++i) {
-        cluster_pos.push_back(cumu_size);
-        cumu_size += clusters[i].size();
-        inv_list.insert(inv_list.end(), clusters[i].begin(), clusters[i].end());
+        cluster_pos[i + 1] += cluster_pos[i];
     }
-    cluster_pos.push_back(cumu_size);
+
+    inv_list.resize(n_vectors);
+    std::vector<size_t> write_pos = cluster_pos;
+    for (size_t i = 0; i < n_vectors; ++i) {
+        const auto cluster_id = list_nos[i];
+        inv_list[write_pos[cluster_id]++] = static_cast<uint32_t>(i);
+    }
 }
 
 void IVF_PG::build_from_existing() {
     std::ifstream list_no_in("list_nos.bin", std::ios::binary);
     int n;
     list_no_in.read((char*)&n, sizeof(int));
-    std::vector<int> list_nos(n);
-    list_no_in.read((char*)list_nos.data(), n * sizeof(int));
+    std::vector<uint32_t> list_nos(n);
+    list_no_in.read((char*)list_nos.data(), n * sizeof(uint32_t));
 
-    std::vector<std::vector<int>> clusters(n_clusters);
+    std::vector<std::vector<uint32_t>> clusters(n_clusters);
     for (int i = 0; i < n; ++i) {
-        clusters[list_nos[i]].push_back(i);
+        clusters[list_nos[i]].push_back(static_cast<uint32_t>(i));
     }
     size_t cumu_size = 0;
     for (size_t i = 0; i < n_clusters; ++i) {
@@ -186,24 +220,32 @@ int IVF_PG::max_cluster_size() const {
 }
 
 void IVF_PG::save(const std::string& filename) const {
-    pg_index->save(filename + ".ivf");
-    std::ofstream of(filename + ".ivf", std::ios::binary);
+    save(filename + ".ivf", filename + ".ivf.cagra");
+}
+
+void IVF_PG::save(const std::string& ivf_path, const std::string& graph_path) const {
+    save_graph_file(pg_index, graph_path);
+    std::ofstream of(ivf_path, std::ios::binary);
     size_t n = inv_list.size();
     of.write((char*)&n, sizeof(size_t));
-    of.write((char*)inv_list.data(), n * sizeof(int));
+    of.write((char*)inv_list.data(), n * sizeof(uint32_t));
     of.write((char*)cluster_pos.data(), cluster_pos.size() * sizeof(size_t));
     of.close();
 }
 
 void IVF_PG::load(const std::string& filename) {
-    std::ifstream inf(filename + ".ivf", std::ios::binary);
+    load(filename + ".ivf", filename + ".ivf.cagra");
+}
+
+void IVF_PG::load(const std::string& ivf_path, const std::string& graph_path) {
+    std::ifstream inf(ivf_path, std::ios::binary);
     size_t n;
     inf.read((char*)&n, sizeof(size_t));
     inv_list.resize(n);
-    inf.read((char*)inv_list.data(), n * sizeof(int));
+    inf.read((char*)inv_list.data(), n * sizeof(uint32_t));
     cluster_pos.resize(n_clusters + 1);
     inf.read((char*)cluster_pos.data(), (n_clusters + 1) * sizeof(size_t));
     inf.close();
 
-    pg_index->load(filename + ".ivf");
+    load_graph_file(pg_index, graph_path);
 }

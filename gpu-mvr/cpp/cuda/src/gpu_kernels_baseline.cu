@@ -238,7 +238,7 @@ __global__ void compute_query_expansion_sizes_baseline_kernel(
 
 __global__ void expand_cluster_ids_baseline_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const int*          __restrict__ d_inv_list,
+    const uint32_t*     __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
     size_t*             d_emb_ids,

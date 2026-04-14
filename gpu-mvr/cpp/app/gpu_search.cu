@@ -1,4 +1,5 @@
 #include "gpu_index.cuh"
+#include "gpu_index_layout.hpp"
 #include "io.hpp"
 #include "utils.hpp"
 
@@ -7,7 +8,7 @@ int main(int argc, char** argv) {
     std::string query_file = "query_embeddings.bin";
     std::string doclens_file = "doclens.bin";
     std::string gt_file = "lotte-groundtruth-top1000--.tsv";
-    std::string index_file = "2097152_4_new.index";
+    std::string index_file = gpu_index_layout::kQuantizedDataFilename;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -21,7 +22,7 @@ int main(int argc, char** argv) {
             index_file = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0]
-                      << " [--query <file>] [--doclens <file>] [--gt <file>] [--index <file>]" << std::endl;
+                      << " [--query <file>] [--doclens <file>] [--gt <file>] [--index <index_dir|quantized_data.bin>]" << std::endl;
             return 0;
         }
     }

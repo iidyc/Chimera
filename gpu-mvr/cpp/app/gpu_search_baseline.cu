@@ -1,4 +1,5 @@
 #include "gpu_index_baseline.cuh"
+#include "gpu_index_layout.hpp"
 #include "io.hpp"
 #include "utils.hpp"
 
@@ -15,7 +16,7 @@ int main() {
         return 1;
     }
 
-    gpu_mvr_index_baseline index("2097152_4_new.index", doclens);
+    gpu_mvr_index_baseline index(gpu_index_layout::kQuantizedDataFilename, doclens);
 
     // warmup
     for (size_t i = 0; i < 5; ++i) {

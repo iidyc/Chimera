@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "gpu_index_layout.hpp"
+#include "mvr_index_file_format.hpp"
 #include "rabitqlib/quantization/rabitq_impl.hpp"
 #include "rabitqlib/utils/space.hpp"
 #include "quantization.hpp"
@@ -30,9 +32,6 @@ cpu_mvr_index::cpu_mvr_index(
 )
     : n(n), d(d), n_clusters(n_clusters), ex_bits(ex_bits), ivf_type_(ivf_type) {
     rotator_ = choose_rotator<float>(d, RotatorType::FhtKacRotator, round_up_to_multiple(d, 64));
-    std::ifstream rot_in("rotator.bin", std::ios::binary);
-    rotator_->load(rot_in);
-    rot_in.close();
     padded_dim_ = rotator_->size();
 
     one_bit_code_.resize(n * padded_dim_ / 8);
@@ -382,13 +381,15 @@ void cpu_mvr_index::rank_all_tokens_exbits(
 
 void cpu_mvr_index::save(const std::string& filename) const {
     std::ofstream of(filename, std::ios::binary);
-    size_t type_tag = static_cast<size_t>(ivf_type_);
-    of.write((char*)&type_tag, sizeof(size_t));
-    of.write((char*)&n, sizeof(size_t));
-    of.write((char*)&d, sizeof(size_t));
-    of.write((char*)&n_clusters, sizeof(size_t));
-    of.write((char*)&ex_bits, sizeof(size_t));
-    of.write((char*)&padded_dim_, sizeof(size_t));
+    mvr_index_file_format::Header header;
+    header.n = n;
+    header.d = d;
+    header.n_clusters = n_clusters;
+    header.ex_bits = ex_bits;
+    header.padded_dim = padded_dim_;
+    header.rotator_type = RotatorType::FhtKacRotator;
+    mvr_index_file_format::write_header(of, header, filename);
+    mvr_index_file_format::save_rotator(of, *rotator_, filename);
     of.write(one_bit_code_.data(), one_bit_code_.size());
     of.write(ex_code_.data(), ex_code_.size());
     of.write((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
@@ -401,12 +402,17 @@ void cpu_mvr_index::save(const std::string& filename) const {
 }
 
 void cpu_mvr_index::load(const std::string& filename) {
-    std::ifstream inf(filename, std::ios::binary);
-    inf.read((char*)&n, sizeof(size_t));
-    inf.read((char*)&d, sizeof(size_t));
-    inf.read((char*)&n_clusters, sizeof(size_t));
-    inf.read((char*)&ex_bits, sizeof(size_t));
-    inf.read((char*)&padded_dim_, sizeof(size_t));
+    const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
+
+    std::ifstream inf(resolved_paths.quantized_data_path, std::ios::binary);
+    const auto header =
+        mvr_index_file_format::read_header(inf, resolved_paths.quantized_data_path);
+    n = header.n;
+    d = header.d;
+    n_clusters = header.n_clusters;
+    ex_bits = header.ex_bits;
+    padded_dim_ = header.padded_dim;
+    rotator_ = mvr_index_file_format::load_rotator(inf, header, filename);
     one_bit_code_.resize(n * padded_dim_ / 8);
     ex_code_.resize(n * padded_dim_ * ex_bits / 8);
     one_bit_factor_.resize(n);
@@ -415,16 +421,16 @@ void cpu_mvr_index::load(const std::string& filename) {
     inf.read(ex_code_.data(), ex_code_.size());
     inf.read((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
     inf.read((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
-    rotator_ = choose_rotator<float>(d, RotatorType::FhtKacRotator, padded_dim_);
-    std::ifstream rot_in("rotator.bin", std::ios::binary);
-    rotator_->load(rot_in);
-    rot_in.close();
     inf.close();
     if (ivf_type_ == IVFType::DocKMeans) {
         std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
         exit(0);
     } else {
         ivf = new IVF_PG(n_clusters, d);
-        ivf->load(filename);
+        if (resolved_paths.split_layout) {
+            ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
+        } else {
+            ivf->load(filename);
+        }
     }
 }

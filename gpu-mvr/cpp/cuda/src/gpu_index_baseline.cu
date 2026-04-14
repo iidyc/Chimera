@@ -2,25 +2,31 @@
 
 #include <omp.h>
 
+#include "gpu_index_layout.hpp"
+#include "mvr_index_file_format.hpp"
+
 // ======================== CONSTRUCTOR ========================
 
 gpu_mvr_index_baseline::gpu_mvr_index_baseline(const std::string& filename, const std::vector<int>& doc_lens) {
-    std::ifstream inf(filename, std::ios::binary);
-    inf.read((char*)&n, sizeof(size_t));
-    inf.read((char*)&d, sizeof(size_t));
-    inf.read((char*)&n_clusters, sizeof(size_t));
-    inf.read((char*)&ex_bits, sizeof(size_t));
+    const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
 
-    size_t file_padded_dim;
-    inf.read((char*)&file_padded_dim, sizeof(size_t));
+    std::ifstream inf(resolved_paths.quantized_data_path, std::ios::binary);
+    const auto header =
+        mvr_index_file_format::read_header(inf, resolved_paths.quantized_data_path);
+    n = header.n;
+    d = header.d;
+    n_clusters = header.n_clusters;
+    ex_bits = header.ex_bits;
 
-    if (file_padded_dim != PADDED_DIM) {
+    if (header.padded_dim != PADDED_DIM) {
         inf.close();
         throw std::runtime_error(
-            "Index file padded_dim=" + std::to_string(file_padded_dim) +
+            "Index file padded_dim=" + std::to_string(header.padded_dim) +
             " does not match compiled PADDED_DIM=" + std::to_string(PADDED_DIM)
         );
     }
+
+    rotator_ = mvr_index_file_format::load_rotator(inf, header, filename);
 
     one_bit_code_.resize(n * PADDED_DIM / 8);
     full_code_.resize(n * PADDED_DIM * (1 + ex_bits) / 8);
@@ -33,16 +39,15 @@ gpu_mvr_index_baseline::gpu_mvr_index_baseline(const std::string& filename, cons
     inf.read((char*)ex_factor_.data(), n * sizeof(float));
     inf.close();
 
-    rotator_ = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);
-    std::ifstream rot_in("rotator.bin", std::ios::binary);
-    rotator_->load(rot_in);
-    rot_in.close();
-
     ip_func_ = select_excode_ipfunc(1 + ex_bits);
     unpack_func_ = select_excode_unpackfunc(1 + ex_bits);
 
     ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
-    ivf->load(filename);
+    if (resolved_paths.split_layout) {
+        ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
+    } else {
+        ivf->load(filename);
+    }
     max_cluster_size = ivf->max_cluster_size();
 
     set_doc_mapping(doc_lens);
@@ -54,11 +59,11 @@ gpu_mvr_index_baseline::gpu_mvr_index_baseline(const std::string& filename, cons
     CUDA_CHECK(cudaMalloc(&d_doc_ptrs_, (num_docs + 1) * sizeof(int)));
 
     size_t inv_list_size = ivf->inv_list.size();
-    CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_cluster_pos_, (ivf->n_clusters + 1) * sizeof(size_t)));
 
     CUDA_CHECK(cudaMemcpy(d_inv_list_, ivf->inv_list.data(),
-                          inv_list_size * sizeof(int), cudaMemcpyHostToDevice));
+                          inv_list_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_cluster_pos_, ivf->cluster_pos.data(),
                           (ivf->n_clusters + 1) * sizeof(size_t), cudaMemcpyHostToDevice));
 

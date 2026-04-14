@@ -69,7 +69,7 @@ struct IVF_PG {
     size_t d;
     PG* pg_index;
 
-    std::vector<int> inv_list;
+    std::vector<uint32_t> inv_list;
     std::vector<size_t> cluster_pos;
 
     IVF_PG(size_t n_clusters, size_t d, PGType type = PGType::HNSW);
@@ -84,7 +84,7 @@ struct IVF_PG {
     void build_index(const float* data);
 
     // Populate inv_list and cluster_pos from in-memory cluster assignments.
-    void build_from_assignments(const int64_t* list_nos, size_t n_vectors);
+    void build_from_assignments(const uint32_t* list_nos, size_t n_vectors);
 
     void build_from_existing();
 
@@ -92,4 +92,6 @@ struct IVF_PG {
 
     void save(const std::string& filename) const;
     void load(const std::string& filename);
+    void save(const std::string& ivf_path, const std::string& graph_path) const;
+    void load(const std::string& ivf_path, const std::string& graph_path);
 };

@@ -74,7 +74,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
-    const int*      __restrict__ d_inv_list,
+    const uint32_t* __restrict__ d_inv_list,
     float*       d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     int*         d_ht_keys,
@@ -150,7 +150,7 @@ __global__ void compute_query_expansion_sizes_kernel(
 
 __global__ void expand_cluster_ids_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const int*          __restrict__ d_inv_list,
+    const uint32_t*     __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
     size_t*             d_emb_ids,

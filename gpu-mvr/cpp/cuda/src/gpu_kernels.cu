@@ -365,7 +365,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
-    const int*      __restrict__ d_inv_list,
+    const uint32_t* __restrict__ d_inv_list,
     float*       d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     int*         d_ht_keys,
@@ -438,7 +438,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
         uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
 
         // inv_list indirection: map cluster position -> original vector ID
-        uint32_t orig_id = (uint32_t)__ldg(&d_inv_list[emb_pos]);
+        uint32_t orig_id = __ldg(&d_inv_list[emb_pos]);
 
         // __ldg() routes scattered reads through the read-only texture cache
         const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
@@ -748,7 +748,7 @@ __global__ void compute_query_expansion_sizes_kernel(
 
 __global__ void expand_cluster_ids_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const int*          __restrict__ d_inv_list,
+    const uint32_t*     __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
     size_t*             d_emb_ids,

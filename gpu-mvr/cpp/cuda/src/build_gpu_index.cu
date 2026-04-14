@@ -6,17 +6,31 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <fcntl.h>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
+#include <mutex>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
+#include "gpu_index_layout.hpp"
+#include "mvr_index_file_format.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
 #include "gpu_config.cuh"
@@ -25,203 +39,668 @@
 
 using namespace rabitqlib;
 
-void build_index(
-    const float* data,
-    size_t n,
-    size_t d,
-    size_t n_clusters,
-    size_t ex_bits,
-    const std::vector<int>& /*doc_lens*/,
-    const std::string& filename,
-    const std::string& bootstrap_centroids,
-    const std::string& bootstrap_list_nos)
+namespace {
+
+void build_cuda_check(cudaError_t status, const char* expr, const char* file, int line)
 {
-    const bool bootstrap = !bootstrap_centroids.empty() && !bootstrap_list_nos.empty();
+    if (status == cudaSuccess)
+    {
+        return;
+    }
 
-    std::vector<float> centroids;
-    std::vector<int64_t> list_nos;
+    throw std::runtime_error(
+        std::string("CUDA error at ") + file + ":" + std::to_string(line) +
+        " for " + expr + ": " + cudaGetErrorString(status));
+}
 
-    if (bootstrap) {
-        std::cout << "[build_index] Bootstrapping from "
-                  << bootstrap_centroids << " and " << bootstrap_list_nos
-                  << " (skipping steps 1 and 2)" << std::endl;
+#define BUILD_CUDA_CHECK(call) \
+    build_cuda_check((call), #call, __FILE__, __LINE__)
 
+double elapsed_ms(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end)
+{
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+std::string format_elapsed(double milliseconds)
+{
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+
+    constexpr double kMsPerSecond = 1000.0;
+    constexpr double kMsPerMinute = 60.0 * kMsPerSecond;
+    constexpr double kMsPerHour = 60.0 * kMsPerMinute;
+
+    if (milliseconds >= kMsPerHour)
+    {
+        out << (milliseconds / kMsPerHour) << " hours";
+    }
+    else if (milliseconds >= kMsPerMinute)
+    {
+        out << (milliseconds / kMsPerMinute) << " minutes";
+    }
+    else
+    {
+        out << (milliseconds / kMsPerSecond) << " seconds";
+    }
+
+    return out.str();
+}
+
+std::vector<int> visible_gpu_ids()
+{
+    int device_count = 0;
+    BUILD_CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    if (device_count <= 0)
+    {
+        throw std::runtime_error("No CUDA devices are visible for gpu_build");
+    }
+
+    std::vector<int> device_ids(static_cast<size_t>(device_count));
+    std::iota(device_ids.begin(), device_ids.end(), 0);
+    return device_ids;
+}
+
+struct QuantizedSectionLayout
+{
+    size_t prefix_bytes = 0;
+    size_t one_bit_offset = 0;
+    size_t full_code_offset = 0;
+    size_t one_bit_factor_offset = 0;
+    size_t ex_factor_offset = 0;
+    size_t one_bit_bytes_per_vector = 0;
+    size_t full_code_bytes_per_vector = 0;
+    size_t total_bytes = 0;
+};
+
+void write_all_at(
+    int fd,
+    const void* src,
+    size_t bytes,
+    size_t offset,
+    const std::string& filename)
+{
+    const auto* ptr = static_cast<const char*>(src);
+    size_t written_total = 0;
+    while (written_total < bytes)
+    {
+        const auto cur_offset = static_cast<off_t>(offset + written_total);
+        const auto cur_bytes = bytes - written_total;
+        const ssize_t written = pwrite(fd, ptr + written_total, cur_bytes, cur_offset);
+        if (written < 0)
         {
-            std::ifstream cf(bootstrap_centroids, std::ios::binary);
-            if (!cf.is_open()) {
-                throw std::runtime_error("Cannot open centroids file: " + bootstrap_centroids);
+            if (errno == EINTR)
+            {
+                continue;
             }
-            int32_t fnc = 0, fd = 0;
-            cf.read(reinterpret_cast<char*>(&fnc), sizeof(int32_t));
-            cf.read(reinterpret_cast<char*>(&fd), sizeof(int32_t));
-            if (static_cast<size_t>(fnc) != n_clusters || static_cast<size_t>(fd) != d) {
-                throw std::runtime_error(
-                    "Centroids file shape mismatch: got (" + std::to_string(fnc) + "," +
-                    std::to_string(fd) + "), expected (" + std::to_string(n_clusters) + "," +
-                    std::to_string(d) + ")");
-            }
-            centroids.resize(n_clusters * d);
-            cf.read(reinterpret_cast<char*>(centroids.data()),
-                    centroids.size() * sizeof(float));
+            throw std::runtime_error(
+                "Failed to write quantized batch to " + filename + ": " +
+                std::system_category().message(errno));
         }
+        written_total += static_cast<size_t>(written);
+    }
+}
 
+class QuantizedOutputWriter
+{
+   public:
+    QuantizedOutputWriter(
+        const std::string& path,
+        const mvr_index_file_format::Header& header,
+        const Rotator<float>& rotator,
+        size_t n,
+        size_t ex_bits)
+        : path_(path)
+    {
+        std::ofstream output(path_, std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
         {
-            std::ifstream lf(bootstrap_list_nos, std::ios::binary);
-            if (!lf.is_open()) {
-                throw std::runtime_error("Cannot open list_nos file: " + bootstrap_list_nos);
-            }
-            int32_t fn = 0;
-            lf.read(reinterpret_cast<char*>(&fn), sizeof(int32_t));
-            if (static_cast<size_t>(fn) != n) {
-                throw std::runtime_error(
-                    "list_nos length mismatch: got " + std::to_string(fn) +
-                    ", expected " + std::to_string(n));
-            }
-            list_nos.resize(n);
-            lf.read(reinterpret_cast<char*>(list_nos.data()), n * sizeof(int64_t));
+            throw std::runtime_error("Failed to open quantized output file: " + path_);
         }
 
-        std::cout << "[build_index] Bootstrap load done." << std::endl;
-    } else {
-        std::cout << "[build_index] Step 1: Randomly sampling " << n_clusters
-                  << " centroids from " << n << " vectors (d=" << d << ") ..." << std::endl;
+        mvr_index_file_format::write_header(output, header, path_);
+        mvr_index_file_format::save_rotator(output, rotator, path_);
 
-        std::vector<size_t> indices(n);
-        std::iota(indices.begin(), indices.end(), 0);
-        std::mt19937 rng(42);
-        std::shuffle(indices.begin(), indices.end(), rng);
-        indices.resize(n_clusters);
-
-        centroids.resize(n_clusters * d);
-        for (size_t i = 0; i < n_clusters; ++i) {
-            std::memcpy(&centroids[i * d], &data[indices[i] * d], d * sizeof(float));
+        const auto prefix_pos = output.tellp();
+        if (prefix_pos == std::streampos(-1))
+        {
+            throw std::runtime_error("Failed to determine quantized header size for: " + path_);
         }
 
-        std::cout << "[build_index] Step 1 done. Sampled centroids." << std::endl;
+        layout_.prefix_bytes = static_cast<size_t>(prefix_pos);
+        layout_.one_bit_bytes_per_vector = PADDED_DIM / 8;
+        layout_.full_code_bytes_per_vector = PADDED_DIM * (1 + ex_bits) / 8;
+        layout_.one_bit_offset = layout_.prefix_bytes;
+        layout_.full_code_offset =
+            layout_.one_bit_offset + n * layout_.one_bit_bytes_per_vector;
+        layout_.one_bit_factor_offset =
+            layout_.full_code_offset + n * layout_.full_code_bytes_per_vector;
+        layout_.ex_factor_offset =
+            layout_.one_bit_factor_offset + n * sizeof(float);
+        layout_.total_bytes =
+            layout_.ex_factor_offset + n * sizeof(float);
 
-        std::cout << "[build_index] Step 2: Building temporary non-rotated CAGRA graph"
-                  << " for centroid assignment ..." << std::endl;
+        output.close();
 
-        PG_CAGRA assignment_cagra(n_clusters, d);
+        fd_ = open(path_.c_str(), O_WRONLY);
+        if (fd_ < 0)
+        {
+            throw std::runtime_error(
+                "Failed to reopen quantized output file: " + path_);
+        }
+        if (ftruncate(fd_, static_cast<off_t>(layout_.total_bytes)) != 0)
+        {
+            const auto err = errno;
+            close(fd_);
+            fd_ = -1;
+            throw std::runtime_error(
+                "Failed to size quantized output file " + path_ + ": " +
+                std::system_category().message(err));
+        }
+    }
+
+    QuantizedOutputWriter(const QuantizedOutputWriter&) = delete;
+    QuantizedOutputWriter& operator=(const QuantizedOutputWriter&) = delete;
+
+    ~QuantizedOutputWriter()
+    {
+        if (fd_ >= 0)
+        {
+            close(fd_);
+        }
+    }
+
+    void write_batch(
+        size_t start,
+        size_t cur_batch,
+        const uint64_t* one_bit_code,
+        const uint8_t* full_code,
+        const float* one_bit_factor,
+        const float* ex_factor)
+    {
+        const size_t one_bit_bytes = cur_batch * layout_.one_bit_bytes_per_vector;
+        const size_t full_code_bytes = cur_batch * layout_.full_code_bytes_per_vector;
+        const size_t factor_bytes = cur_batch * sizeof(float);
+
+        write_all_at(
+            fd_,
+            one_bit_code,
+            one_bit_bytes,
+            layout_.one_bit_offset + start * layout_.one_bit_bytes_per_vector,
+            path_);
+        write_all_at(
+            fd_,
+            full_code,
+            full_code_bytes,
+            layout_.full_code_offset + start * layout_.full_code_bytes_per_vector,
+            path_);
+        write_all_at(
+            fd_,
+            one_bit_factor,
+            factor_bytes,
+            layout_.one_bit_factor_offset + start * sizeof(float),
+            path_);
+        write_all_at(
+            fd_,
+            ex_factor,
+            factor_bytes,
+            layout_.ex_factor_offset + start * sizeof(float),
+            path_);
+    }
+
+   private:
+    std::string path_;
+    int fd_ = -1;
+    QuantizedSectionLayout layout_;
+};
+
+struct Step2ProgressState
+{
+    size_t total_documents = 0;
+    std::atomic<size_t> handled_documents {0};
+    std::atomic<size_t> next_percent_to_report {1};
+    std::mutex output_mutex;
+};
+
+void report_step2_progress(Step2ProgressState& progress, size_t handled_now)
+{
+    if (progress.total_documents == 0 || handled_now == 0)
+    {
+        return;
+    }
+
+    const size_t handled =
+        progress.handled_documents.fetch_add(handled_now, std::memory_order_relaxed) +
+        handled_now;
+    const size_t percent =
+        std::min<size_t>(100, handled * 100 / progress.total_documents);
+
+    size_t next_percent =
+        progress.next_percent_to_report.load(std::memory_order_relaxed);
+    while (percent >= next_percent)
+    {
+        if (progress.next_percent_to_report.compare_exchange_weak(
+                next_percent,
+                percent + 1,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed))
+        {
+            std::lock_guard<std::mutex> lock(progress.output_mutex);
+            std::cout << "[build_index] Step 2 progress: " << percent
+                      << "% documents handled." << std::endl;
+            return;
+        }
+    }
+}
+
+void assign_shard_batches_on_device(
+    const MmapedEmbeddings& data,
+    const std::vector<float>& centroids,
+    size_t n_clusters,
+    size_t assign_batch,
+    int device_id,
+    std::atomic<size_t>& next_batch_start,
+    std::atomic<bool>& should_stop,
+    std::vector<uint32_t>& list_nos,
+    Step2ProgressState& progress)
+{
+    BUILD_CUDA_CHECK(cudaSetDevice(device_id));
+
+    struct BufferSlot
+    {
+        cudaStream_t stream = nullptr;
+        float* d_q_ptr = nullptr;
+        uint32_t* d_lab_ptr = nullptr;
+        float* d_dist_ptr = nullptr;
+        float* h_q_ptr = nullptr;
+        uint32_t* h_labels = nullptr;
+        size_t start = 0;
+        size_t cur = 0;
+        bool in_flight = false;
+    };
+
+    constexpr size_t kBufferCount = 2;
+    std::vector<BufferSlot> buffers(kBufferCount);
+
+    auto cleanup = [&]()
+    {
+        for (auto& buffer : buffers)
+        {
+            if (buffer.h_labels != nullptr)
+            {
+                cudaFreeHost(buffer.h_labels);
+            }
+            if (buffer.h_q_ptr != nullptr)
+            {
+                cudaFreeHost(buffer.h_q_ptr);
+            }
+            if (buffer.d_dist_ptr != nullptr)
+            {
+                cudaFree(buffer.d_dist_ptr);
+            }
+            if (buffer.d_lab_ptr != nullptr)
+            {
+                cudaFree(buffer.d_lab_ptr);
+            }
+            if (buffer.d_q_ptr != nullptr)
+            {
+                cudaFree(buffer.d_q_ptr);
+            }
+            if (buffer.stream != nullptr)
+            {
+                cudaStreamDestroy(buffer.stream);
+            }
+        }
+    };
+
+    try
+    {
+        PG_CAGRA assignment_cagra(n_clusters, data.d);
         assignment_cagra.build_index(centroids.data());
 
-        raft::resources res;
-        auto cuda_stream = raft::resource::get_cuda_stream(res);
-
-        list_nos.resize(n);
-        constexpr size_t assign_batch = 65536;
-        float* d_q_ptr;
-        uint32_t* d_lab_ptr;
-        float* d_dist_ptr;
-        cudaMalloc(&d_q_ptr, assign_batch * d * sizeof(float));
-        cudaMalloc(&d_lab_ptr, assign_batch * sizeof(uint32_t));
-        cudaMalloc(&d_dist_ptr, assign_batch * sizeof(float));
-        std::vector<uint32_t> batch_labels(assign_batch);
-
-        for (size_t start = 0; start < n; start += assign_batch) {
-            int64_t cur = std::min(assign_batch, n - start);
-            cudaMemcpy(d_q_ptr, data + start * d, cur * d * sizeof(float), cudaMemcpyHostToDevice);
-
-            assignment_cagra.search_batch_gpu(d_q_ptr, cur, 1, d_dist_ptr, d_lab_ptr, cuda_stream);
-
-            cudaMemcpy(batch_labels.data(), d_lab_ptr, cur * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-            for (int64_t i = 0; i < cur; ++i) {
-                list_nos[start + i] = static_cast<int64_t>(batch_labels[i]);
-            }
+        for (auto& buffer : buffers)
+        {
+            BUILD_CUDA_CHECK(cudaStreamCreate(&buffer.stream));
+            BUILD_CUDA_CHECK(cudaMalloc(&buffer.d_q_ptr, assign_batch * data.d * sizeof(float)));
+            BUILD_CUDA_CHECK(cudaMalloc(&buffer.d_lab_ptr, assign_batch * sizeof(uint32_t)));
+            BUILD_CUDA_CHECK(cudaMalloc(&buffer.d_dist_ptr, assign_batch * sizeof(float)));
+            BUILD_CUDA_CHECK(
+                cudaMallocHost(&buffer.h_q_ptr, assign_batch * data.d * sizeof(float)));
+            BUILD_CUDA_CHECK(cudaMallocHost(&buffer.h_labels, assign_batch * sizeof(uint32_t)));
         }
-        raft::resource::sync_stream(res);
 
-        cudaFree(d_q_ptr);
-        cudaFree(d_lab_ptr);
-        cudaFree(d_dist_ptr);
+        auto finalize_buffer = [&](BufferSlot& buffer)
+        {
+            if (!buffer.in_flight)
+            {
+                return;
+            }
 
-        std::cout << "[build_index] Step 2 done. Embeddings assigned with non-rotated CAGRA." << std::endl;
+            BUILD_CUDA_CHECK(cudaStreamSynchronize(buffer.stream));
+            std::memcpy(
+                list_nos.data() + buffer.start,
+                buffer.h_labels,
+                buffer.cur * sizeof(uint32_t));
+            report_step2_progress(progress, buffer.cur);
+            buffer.in_flight = false;
+        };
+
+        auto launch_buffer = [&](BufferSlot& buffer, size_t start, size_t cur)
+        {
+            data.copy_embeddings(start, cur, buffer.h_q_ptr);
+
+            BUILD_CUDA_CHECK(cudaMemcpyAsync(
+                buffer.d_q_ptr,
+                buffer.h_q_ptr,
+                cur * data.d * sizeof(float),
+                cudaMemcpyHostToDevice,
+                buffer.stream));
+
+            assignment_cagra.search_batch_gpu(
+                buffer.d_q_ptr,
+                cur,
+                1,
+                buffer.d_dist_ptr,
+                buffer.d_lab_ptr,
+                buffer.stream);
+
+            BUILD_CUDA_CHECK(cudaMemcpyAsync(
+                buffer.h_labels,
+                buffer.d_lab_ptr,
+                cur * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost,
+                buffer.stream));
+
+            buffer.start = start;
+            buffer.cur = cur;
+            buffer.in_flight = true;
+        };
+
+        size_t next_buffer = 0;
+        while (!should_stop.load(std::memory_order_relaxed))
+        {
+            BufferSlot& buffer = buffers[next_buffer];
+            finalize_buffer(buffer);
+
+            const size_t start =
+                next_batch_start.fetch_add(assign_batch, std::memory_order_relaxed);
+            if (start >= data.num_embeddings)
+            {
+                break;
+            }
+
+            const size_t cur = std::min(assign_batch, data.num_embeddings - start);
+            launch_buffer(buffer, start, cur);
+            next_buffer = (next_buffer + 1) % kBufferCount;
+        }
+
+        for (auto& buffer : buffers)
+        {
+            finalize_buffer(buffer);
+        }
+    }
+    catch (...)
+    {
+        cleanup();
+        throw;
     }
 
-    Rotator<float>* rotator = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);
-    std::ifstream rot_in("rotator.bin", std::ios::binary);
-    if (!rot_in.is_open()) {
-        throw std::runtime_error("Cannot open rotator.bin — please generate it first");
+    cleanup();
+}
+
+std::vector<uint32_t> assign_embeddings_multi_gpu(
+    const MmapedEmbeddings& data,
+    const std::vector<float>& centroids,
+    size_t n_clusters,
+    size_t assign_batch)
+{
+    auto device_ids = visible_gpu_ids();
+    const size_t total_batches = (data.num_embeddings + assign_batch - 1) / assign_batch;
+    const size_t worker_count = std::min(device_ids.size(), total_batches);
+    device_ids.resize(worker_count);
+
+    std::cout << "[build_index] Step 2: Assigning embeddings with " << worker_count
+              << " visible GPU(s)." << std::endl;
+
+    std::vector<uint32_t> list_nos(data.num_embeddings);
+    if (worker_count == 0)
+    {
+        return list_nos;
     }
-    rotator->load(rot_in);
-    rot_in.close();
+
+    std::atomic<size_t> next_batch_start {0};
+    std::atomic<bool> should_stop {false};
+    Step2ProgressState progress;
+    progress.total_documents = data.num_embeddings;
+    std::mutex error_mutex;
+    std::exception_ptr first_error;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+
+    for (const int device_id : device_ids)
+    {
+        workers.emplace_back([&, device_id]()
+        {
+            try
+            {
+                assign_shard_batches_on_device(
+                    data,
+                    centroids,
+                    n_clusters,
+                    assign_batch,
+                    device_id,
+                    next_batch_start,
+                    should_stop,
+                    list_nos,
+                    progress);
+            }
+            catch (...)
+            {
+                should_stop.store(true, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!first_error)
+                {
+                    first_error = std::current_exception();
+                }
+            }
+        });
+    }
+
+    for (auto& worker : workers)
+    {
+        worker.join();
+    }
+
+    if (first_error)
+    {
+        std::rethrow_exception(first_error);
+    }
+
+    BUILD_CUDA_CHECK(cudaSetDevice(device_ids.front()));
+    return list_nos;
+}
+
+}  // namespace
+
+void build_index(
+    const MmapedEmbeddings &data,
+    size_t n_clusters,
+    size_t ex_bits,
+    const std::vector<int> & /*doc_lens*/,
+    const std::string &index_dir)
+{
+    using Clock = std::chrono::steady_clock;
+
+    const size_t n = data.num_embeddings;
+    const size_t d = data.d;
+    const auto build_start = Clock::now();
+
+    std::filesystem::create_directories(index_dir);
+
+    const std::string ivf_path = gpu_index_layout::ivf_path(index_dir);
+    const std::string quantized_data_path = gpu_index_layout::quantized_data_path(index_dir);
+    const std::string centroids_path = gpu_index_layout::centroids_path(index_dir);
+
+    std::vector<float> centroids;
+
+    std::cout << "[build_index] Step 1: Randomly sampling " << n_clusters
+              << " centroids from " << n << " vectors (d=" << d << ") ..." << std::endl;
+    const auto step1_start = Clock::now();
+
+    std::vector<size_t> indices(n);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::mt19937 rng(42);
+    std::shuffle(indices.begin(), indices.end(), rng);
+    indices.resize(n_clusters);
+
+    centroids.resize(n_clusters * d);
+    for (size_t i = 0; i < n_clusters; ++i)
+    {
+        std::memcpy(&centroids[i * d], data.embedding_ptr(indices[i]), d * sizeof(float));
+    }
+
+    const auto step1_end = Clock::now();
+    std::cout << "[build_index] Step 1 done in "
+              << format_elapsed(elapsed_ms(step1_start, step1_end))
+              << ". Sampled centroids." << std::endl;
+
+    constexpr size_t assign_batch = 65536;
+    const auto step2_start = Clock::now();
+    auto list_nos = assign_embeddings_multi_gpu(data, centroids, n_clusters, assign_batch);
+    const auto step2_end = Clock::now();
+    std::cout << "[build_index] Step 2 done in "
+              << format_elapsed(elapsed_ms(step2_start, step2_end))
+              << ". Embeddings assigned with non-rotated CAGRA." << std::endl;
+
+    constexpr RotatorType kRotatorType = RotatorType::FhtKacRotator;
+    BUILD_CUDA_CHECK(cudaSetDevice(0));
+    Rotator<float> *rotator = choose_rotator<float>(d, kRotatorType, PADDED_DIM);
 
     std::cout << "[build_index] Step 3: Rotating centroids and building persisted CAGRA graph on "
               << n_clusters << " centroids ..." << std::endl;
+    const auto step3_start = Clock::now();
 
     std::vector<float> rotated_centroids(n_clusters * PADDED_DIM);
-    for (size_t i = 0; i < n_clusters; ++i) {
+    for (size_t i = 0; i < n_clusters; ++i)
+    {
         rotator->rotate(&centroids[i * d], &rotated_centroids[i * PADDED_DIM]);
     }
 
-    PG_CAGRA* pg_cagra = new PG_CAGRA(n_clusters, PADDED_DIM);
+    PG_CAGRA *pg_cagra = new PG_CAGRA(n_clusters, PADDED_DIM);
     pg_cagra->build_index(rotated_centroids.data());
 
-    std::cout << "[build_index] Step 3 done. Persisted rotated CAGRA graph built." << std::endl;
+    const auto step3_end = Clock::now();
+    std::cout << "[build_index] Step 3 done in "
+              << format_elapsed(elapsed_ms(step3_start, step3_end))
+              << ". Persisted rotated CAGRA graph built." << std::endl;
 
     std::cout << "[build_index] Step 4: Assembling IVF_PG ..." << std::endl;
+    const auto step4_start = Clock::now();
 
-    IVF_PG* ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
+    IVF_PG *ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
     delete ivf->pg_index;
     ivf->pg_index = pg_cagra;
     ivf->build_from_assignments(list_nos.data(), n);
-    ivf->save(filename);
+    ivf->save(ivf_path, centroids_path);
+    delete ivf;
+    ivf = nullptr;
+    list_nos.clear();
+    list_nos.shrink_to_fit();
+    centroids.clear();
+    centroids.shrink_to_fit();
+    rotated_centroids.clear();
+    rotated_centroids.shrink_to_fit();
 
-    std::cout << "[build_index] Step 4 done. IVF_PG assembled and saved." << std::endl;
+    const auto step4_end = Clock::now();
+    std::cout << "[build_index] Step 4 done in "
+              << format_elapsed(elapsed_ms(step4_start, step4_end))
+              << ". IVF_PG assembled and saved." << std::endl;
 
-//     std::cout << "[build_index] Step 5: Quantizing " << n << " vectors ..." << std::endl;
+    std::cout << "[build_index] Step 5: Quantizing " << n << " vectors ..." << std::endl;
 
-//     std::vector<char>  one_bit_code(n * PADDED_DIM / 8);
-//     std::vector<char>  full_code(n * PADDED_DIM * (1 + ex_bits) / 8);
-//     std::vector<float> one_bit_factor(n);
-//     std::vector<float> ex_factor(n);
+    mvr_index_file_format::Header header;
+    header.n = n;
+    header.d = d;
+    header.n_clusters = n_clusters;
+    header.ex_bits = ex_bits;
+    header.padded_dim = PADDED_DIM;
+    header.rotator_type = kRotatorType;
 
-//     size_t batch_size = 10240;
-//     for (size_t start = 0; start < n; start += batch_size) {
-//         size_t end = std::min(start + batch_size, n);
-//         size_t cur_batch = end - start;
+    std::cout << "[build_index] Step 6: Saving quantized payload to "
+              << quantized_data_path << " ..." << std::endl;
 
-//         std::vector<float> rotated(cur_batch * PADDED_DIM);
-// #pragma omp parallel for
-//         for (size_t i = 0; i < cur_batch; ++i) {
-//             rotator->rotate(&data[(start + i) * d], &rotated[i * PADDED_DIM]);
+    const auto step5_start = Clock::now();
+    double step5_quantize_ms = 0.0;
+    double step6_write_ms = 0.0;
 
-//             encode_one_bit(
-//                 &rotated[i * PADDED_DIM],
-//                 PADDED_DIM,
-//                 reinterpret_cast<uint64_t*>(&one_bit_code[(start + i) * PADDED_DIM / 8]),
-//                 &one_bit_factor[start + i]);
+    QuantizedOutputWriter quantized_writer(
+        quantized_data_path,
+        header,
+        *rotator,
+        n,
+        ex_bits);
 
-//             encode_full_code(
-//                 &rotated[i * PADDED_DIM],
-//                 PADDED_DIM,
-//                 ex_bits,
-//                 reinterpret_cast<uint8_t*>(&full_code[(start + i) * PADDED_DIM * (1 + ex_bits) / 8]),
-//                 &ex_factor[start + i]);
-//         }
-//     }
+    size_t batch_size = 10240;
+    std::vector<float> raw_batch(batch_size * d);
+    for (size_t start = 0; start < n; start += batch_size)
+    {
+        size_t end = std::min(start + batch_size, n);
+        size_t cur_batch = end - start;
 
-//     std::cout << "[build_index] Step 5 done. Quantization complete." << std::endl;
+        const auto quantize_batch_start = Clock::now();
+        data.copy_embeddings(start, cur_batch, raw_batch.data());
+        std::vector<float> rotated(cur_batch * PADDED_DIM);
+        std::vector<uint64_t> one_bit_code_batch(cur_batch * PADDED_DIM / 64);
+        std::vector<uint8_t> full_code_batch(cur_batch * PADDED_DIM * (1 + ex_bits) / 8);
+        std::vector<float> one_bit_factor_batch(cur_batch);
+        std::vector<float> ex_factor_batch(cur_batch);
+#pragma omp parallel for
+        for (size_t i = 0; i < cur_batch; ++i)
+        {
+            rotator->rotate(&raw_batch[i * d], &rotated[i * PADDED_DIM]);
 
-//     std::cout << "[build_index] Step 6: Saving index payload to " << filename << " ..." << std::endl;
+            encode_one_bit(
+                &rotated[i * PADDED_DIM],
+                PADDED_DIM,
+                one_bit_code_batch.data() + i * (PADDED_DIM / 64),
+                &one_bit_factor_batch[i]);
 
-//     {
-//         std::ofstream of(filename, std::ios::binary);
-//         size_t padded_dim = PADDED_DIM;
-//         of.write(reinterpret_cast<const char*>(&n), sizeof(size_t));
-//         of.write(reinterpret_cast<const char*>(&d), sizeof(size_t));
-//         of.write(reinterpret_cast<const char*>(&n_clusters), sizeof(size_t));
-//         of.write(reinterpret_cast<const char*>(&ex_bits), sizeof(size_t));
-//         of.write(reinterpret_cast<const char*>(&padded_dim), sizeof(size_t));
-//         of.write(one_bit_code.data(), one_bit_code.size());
-//         of.write(full_code.data(), full_code.size());
-//         of.write(reinterpret_cast<const char*>(one_bit_factor.data()), n * sizeof(float));
-//         of.write(reinterpret_cast<const char*>(ex_factor.data()), n * sizeof(float));
-//         of.close();
-//     }
+            encode_full_code(
+                &rotated[i * PADDED_DIM],
+                PADDED_DIM,
+                ex_bits,
+                full_code_batch.data() + i * (PADDED_DIM * (1 + ex_bits) / 8),
+                &ex_factor_batch[i]);
+        }
+        step5_quantize_ms += elapsed_ms(quantize_batch_start, Clock::now());
 
-    // delete ivf;
+        const auto write_batch_start = Clock::now();
+        quantized_writer.write_batch(
+            start,
+            cur_batch,
+            one_bit_code_batch.data(),
+            full_code_batch.data(),
+            one_bit_factor_batch.data(),
+            ex_factor_batch.data());
+        step6_write_ms += elapsed_ms(write_batch_start, Clock::now());
+    }
+
+    const auto step5_end = Clock::now();
+    std::cout << "[build_index] Step 5 done in "
+              << format_elapsed(step5_quantize_ms)
+              << ". Quantization complete." << std::endl;
+    std::cout << "[build_index] Step 6 done in "
+              << format_elapsed(step6_write_ms)
+              << ". Quantized payload saved to " << quantized_data_path
+              << "." << std::endl;
+    std::cout << "[build_index] Quantize pipeline total: "
+              << format_elapsed(elapsed_ms(step5_start, step5_end)) << "." << std::endl;
     delete rotator;
 
-    std::cout << "[build_index] Done. Index saved to: " << filename << std::endl;
+    const auto build_end = Clock::now();
+    std::cout << "[build_index][profile] Total build time: "
+              << format_elapsed(elapsed_ms(build_start, build_end)) << std::endl;
+
+    std::cout << "[build_index] Done. Index saved under: " << index_dir << std::endl;
 }

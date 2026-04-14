@@ -71,7 +71,7 @@ struct gpu_mvr_index_baseline {
     float*  d_one_bit_factor_;
     int*    d_doc_ids_;
     int*    d_doc_ptrs_;
-    int*    d_inv_list_;
+    uint32_t* d_inv_list_;
     size_t* d_cluster_pos_;
 
     int nprobe = 128;

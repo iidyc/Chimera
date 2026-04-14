@@ -1,5 +1,6 @@
 #include <omp.h>
 
+#include "gpu_index_layout.hpp"
 #include "index.hpp"
 #include "io.hpp"
 
@@ -11,7 +12,7 @@ int main() {
     size_t num_d, num_q, d, q_doclen, num_docs;
     std::vector<float> Q = load_query(q_doclen, num_q, d);
     std::vector<int> doclens = load_doclens();
-    cpu_mvr_index index("2097152_4_new.index");
+    cpu_mvr_index index(gpu_index_layout::kQuantizedDataFilename);
     index.set_doc_mapping(doclens);
 
     // std::vector<float> rotated_q(d);
