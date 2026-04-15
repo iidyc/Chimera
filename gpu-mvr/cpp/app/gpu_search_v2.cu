@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
 
     const int warmup_queries = std::min<int>(args.warmup, static_cast<int>(num_q));
     for (int i = 0; i < warmup_queries; ++i) {
-        index.search(&Q[i * Q_DOCLEN * d], args.k);
+        index.search_profiled(&Q[i * Q_DOCLEN * d], args.k);
     }
 
     const int remaining_queries = std::max<int>(0, static_cast<int>(num_q) - warmup_queries);
@@ -53,11 +53,19 @@ int main(int argc, char** argv) {
     Timer timer;
     timer.tick();
     std::vector<std::vector<size_t>> results(run_queries);
+    std::vector<double> query_latencies_ms;
+    query_latencies_ms.reserve(run_queries);
     for (int i = 0; i < run_queries; ++i) {
         const int query_idx = warmup_queries + i;
+        const auto query_start = std::chrono::high_resolution_clock::now();
         results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], args.k);
+        const auto query_end = std::chrono::high_resolution_clock::now();
+        query_latencies_ms.push_back(
+            std::chrono::duration<double, std::milli>(query_end - query_start).count());
     }
-    timer.tuck("GPU search time for " + std::to_string(run_queries) + " queries.");
+    const double total_seconds =
+        timer.tuck("GPU search time for " + std::to_string(run_queries) + " queries.");
+    print_query_latency_summary(query_latencies_ms, total_seconds);
 
     std::vector<std::vector<size_t>> eval_ground_truth(
         ground_truth.begin() + warmup_queries,

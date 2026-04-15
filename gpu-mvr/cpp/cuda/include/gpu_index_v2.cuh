@@ -203,8 +203,18 @@ struct gpu_mvr_index {
     size_t doc_len(size_t doc_id) const;
 
     std::vector<size_t> search(const float* queries, size_t k);
+    std::vector<size_t> search_profiled(const float* queries, size_t k);
+    template <bool kProfile>
+    std::vector<size_t> search_impl(const float* queries, size_t k);
 
     void rank_cluster_dists_gpu(
+        query_object* h_query_objs,
+        size_t nprobe,
+        size_t k,
+        int& actual_k_out,
+        cudaStream_t stream = 0);
+    template <bool kProfile>
+    void rank_cluster_dists_gpu_impl(
         query_object* h_query_objs,
         size_t nprobe,
         size_t k,
@@ -217,8 +227,22 @@ struct gpu_mvr_index {
         std::vector<size_t>& output_ids,
         std::vector<float>& one_bit_dists,
         cudaStream_t stream = 0);
+    template <bool kProfile>
+    void rank_all_tokens_1bit_gpu_impl(
+        int num_candidates,
+        size_t k,
+        std::vector<size_t>& output_ids,
+        std::vector<float>& one_bit_dists,
+        cudaStream_t stream = 0);
 
     void rank_stage23_persistent(
+        int num_candidates,
+        size_t k,
+        size_t k_stage2,
+        query_object* queries,
+        std::vector<size_t>& result);
+    template <bool kProfile>
+    void rank_stage23_persistent_impl(
         int num_candidates,
         size_t k,
         size_t k_stage2,
