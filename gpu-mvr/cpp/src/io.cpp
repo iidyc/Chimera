@@ -76,6 +76,43 @@ void MmapedEmbeddings::copy_embeddings(size_t start, size_t count, float* dst) c
     std::memcpy(dst, data_ + start * d, count * d * sizeof(float));
 }
 
+void MmapedEmbeddings::advise_sequential() const {
+#ifdef POSIX_FADV_SEQUENTIAL
+    if (fd_ != -1) {
+        (void)posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
+#endif
+#ifdef MADV_SEQUENTIAL
+    if (mapping_ != nullptr && mapping_size_ > 0) {
+        (void)madvise(mapping_, mapping_size_, MADV_SEQUENTIAL);
+    }
+#endif
+}
+
+void MmapedEmbeddings::prefetch_embeddings(size_t start, size_t count) const {
+    if (count == 0) {
+        return;
+    }
+    if (start + count > num_embeddings) {
+        throw std::out_of_range("Embedding range out of range in MmapedEmbeddings::prefetch_embeddings");
+    }
+
+#ifdef POSIX_FADV_WILLNEED
+    if (fd_ != -1) {
+        const size_t byte_offset = kEmbeddingHeaderBytes + start * d * sizeof(float);
+        const size_t byte_count = count * d * sizeof(float);
+        (void)posix_fadvise(
+            fd_,
+            static_cast<off_t>(byte_offset),
+            static_cast<off_t>(byte_count),
+            POSIX_FADV_WILLNEED);
+    }
+#else
+    (void)start;
+    (void)count;
+#endif
+}
+
 std::vector<float> load_data(size_t& num_embeddings, size_t& d, std::string filename) {
     int n_, d_;
     std::ifstream emb_file(filename, std::ios::binary);
@@ -141,6 +178,7 @@ MmapedEmbeddings load_data_mmap(std::string filename) {
     embeddings.d = dim;
     embeddings.data_ =
         reinterpret_cast<const float*>(mapped_bytes + kEmbeddingHeaderBytes);
+    embeddings.advise_sequential();
 
     std::cout << ">>> Memory-mapped " << embeddings.num_embeddings
               << " embeddings of dimension " << embeddings.d << std::endl;

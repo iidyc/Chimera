@@ -19,7 +19,7 @@ Description:
   It reads search configurations from profiling/gpu_mvr_config.csv and writes:
     profiling/<dataset>/<implementation>/benchmark_results.csv
     profiling/<dataset>/<implementation>/pareto_frontier.csv
-    log/<implementation>/<dataset>/benchmark.log
+    log/bench/<implementation>/<dataset>/benchmark.log
 
   Optional /tmp staging can copy dataset/<name>/gpu_mvr_index into local
   storage first and reuse the copy across subsequent runs.
@@ -34,7 +34,7 @@ Options:
   --binary <path>          Search binary. Overrides --build-dir and --version.
                            Default: <build-dir>/gpu_search_<version>
   --output-dir <path>      CSV output directory. Default: profiling
-  --log-dir <path>         Log output directory. Default: log
+  --log-dir <path>         Log output directory. Default: log/bench
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
   --nq <count>             Evaluation queries after warmup. Default: -1
   --warmup <count>         Warmup query count. Default: 5
@@ -493,7 +493,7 @@ config_file="${repo_root}/profiling/gpu_mvr_config.csv"
 build_dir="${repo_root}/gpu-mvr/build"
 binary=""
 output_dir="${repo_root}/profiling"
-log_dir="${repo_root}/log"
+log_dir="${repo_root}/log/bench"
 tmp_root="/tmp/${USER:-user}/gpu_mvr_benchmark"
 version="v3"
 implementation_label=""

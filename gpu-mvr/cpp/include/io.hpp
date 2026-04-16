@@ -21,6 +21,8 @@ struct MmapedEmbeddings {
 
     const float* embedding_ptr(size_t index) const;
     void copy_embeddings(size_t start, size_t count, float* dst) const;
+    void advise_sequential() const;
+    void prefetch_embeddings(size_t start, size_t count) const;
 };
 
 std::vector<float> load_data(size_t& num_embeddings, size_t& d, std::string filename = "embeddings.bin");

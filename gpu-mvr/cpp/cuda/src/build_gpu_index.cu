@@ -582,26 +582,29 @@ class ClusteredStage1Buffer
     size_t current_doc_end_ = 0;
 };
 
-struct Step2ProgressState
+struct ProgressState
 {
-    size_t total_documents = 0;
-    std::atomic<size_t> handled_documents {0};
+    const char* step_label = "";
+    const char* status_label = "";
+    size_t total_items = 0;
+    std::atomic<size_t> handled_items {0};
     std::atomic<size_t> next_percent_to_report {1};
+    std::chrono::steady_clock::time_point start_time {};
     std::mutex output_mutex;
 };
 
-void report_step2_progress(Step2ProgressState& progress, size_t handled_now)
+void report_progress(ProgressState& progress, size_t handled_now)
 {
-    if (progress.total_documents == 0 || handled_now == 0)
+    if (progress.total_items == 0 || handled_now == 0)
     {
         return;
     }
 
     const size_t handled =
-        progress.handled_documents.fetch_add(handled_now, std::memory_order_relaxed) +
+        progress.handled_items.fetch_add(handled_now, std::memory_order_relaxed) +
         handled_now;
     const size_t percent =
-        std::min<size_t>(100, handled * 100 / progress.total_documents);
+        std::min<size_t>(100, handled * 100 / progress.total_items);
 
     size_t next_percent =
         progress.next_percent_to_report.load(std::memory_order_relaxed);
@@ -614,8 +617,24 @@ void report_step2_progress(Step2ProgressState& progress, size_t handled_now)
                 std::memory_order_relaxed))
         {
             std::lock_guard<std::mutex> lock(progress.output_mutex);
-            std::cout << "[build_index] Step 2 progress: " << percent
-                      << "% documents handled." << std::endl;
+
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed = elapsed_ms(progress.start_time, now);
+
+            std::cout << "[build_index] " << progress.step_label
+                      << " progress: " << percent << "% "
+                      << progress.status_label << " (" << handled << "/"
+                      << progress.total_items << ")";
+            if (handled < progress.total_items && elapsed > 0.0)
+            {
+                const double remaining_ms =
+                    elapsed *
+                    (static_cast<double>(progress.total_items - handled) /
+                     static_cast<double>(handled));
+                std::cout << " elapsed " << format_elapsed(elapsed)
+                          << ", ETA " << format_elapsed(remaining_ms);
+            }
+            std::cout << "." << std::endl;
             return;
         }
     }
@@ -630,7 +649,7 @@ void assign_shard_batches_on_device(
     std::atomic<size_t>& next_batch_start,
     std::atomic<bool>& should_stop,
     std::vector<uint32_t>& list_nos,
-    Step2ProgressState& progress)
+    ProgressState& progress)
 {
     BUILD_CUDA_CHECK(cudaSetDevice(device_id));
 
@@ -709,7 +728,7 @@ void assign_shard_batches_on_device(
                 list_nos.data() + buffer.start,
                 buffer.h_labels,
                 buffer.cur * sizeof(uint32_t));
-            report_step2_progress(progress, buffer.cur);
+            report_progress(progress, buffer.cur);
             buffer.in_flight = false;
         };
 
@@ -798,8 +817,11 @@ std::vector<uint32_t> assign_embeddings_multi_gpu(
 
     std::atomic<size_t> next_batch_start {0};
     std::atomic<bool> should_stop {false};
-    Step2ProgressState progress;
-    progress.total_documents = data.num_embeddings;
+    ProgressState progress;
+    progress.step_label = "Step 2";
+    progress.status_label = "documents handled";
+    progress.total_items = data.num_embeddings;
+    progress.start_time = std::chrono::steady_clock::now();
     std::mutex error_mutex;
     std::exception_ptr first_error;
     std::vector<std::thread> workers;
@@ -961,6 +983,11 @@ void build_index(
               << quantized_data_path << " ..." << std::endl;
 
     const auto step5_start = Clock::now();
+    ProgressState step5_progress;
+    step5_progress.step_label = "Step 5";
+    step5_progress.status_label = "embeddings quantized";
+    step5_progress.total_items = n;
+    step5_progress.start_time = step5_start;
 
     QuantizedOutputBuffer quantized_buffer(n, ex_bits);
     ClusteredStage1Buffer clustered_stage1_buffer(
@@ -984,23 +1011,35 @@ void build_index(
         list_nos[orig_id] = static_cast<uint32_t>(pos);
     }
 
-    size_t batch_size = 10240;
-    std::vector<float> raw_batch(batch_size * d);
+    constexpr size_t kTargetInputBatchBytes = 64ULL * 1024ULL * 1024ULL;
+    const size_t raw_bytes_per_vector = std::max<size_t>(1, d * sizeof(float));
+    const size_t batch_size =
+        std::max<size_t>(1, kTargetInputBatchBytes / raw_bytes_per_vector);
+    std::vector<float> rotated(batch_size * PADDED_DIM);
+    std::vector<uint64_t> one_bit_code_batch(batch_size * PADDED_DIM / 64);
+    std::vector<uint8_t> full_code_batch(batch_size * PADDED_DIM * (1 + ex_bits) / 8);
+    std::vector<float> one_bit_factor_batch(batch_size);
+    std::vector<float> ex_factor_batch(batch_size);
+    if (n > 0)
+    {
+        data.prefetch_embeddings(0, std::min(batch_size, n));
+    }
     for (size_t start = 0; start < n; start += batch_size)
     {
         size_t end = std::min(start + batch_size, n);
         size_t cur_batch = end - start;
 
-        data.copy_embeddings(start, cur_batch, raw_batch.data());
-        std::vector<float> rotated(cur_batch * PADDED_DIM);
-        std::vector<uint64_t> one_bit_code_batch(cur_batch * PADDED_DIM / 64);
-        std::vector<uint8_t> full_code_batch(cur_batch * PADDED_DIM * (1 + ex_bits) / 8);
-        std::vector<float> one_bit_factor_batch(cur_batch);
-        std::vector<float> ex_factor_batch(cur_batch);
+        if (end < n)
+        {
+            data.prefetch_embeddings(end, std::min(batch_size, n - end));
+        }
+
+        const float* raw_batch = data.embedding_ptr(start);
 #pragma omp parallel for
         for (size_t i = 0; i < cur_batch; ++i)
         {
-            rotator->rotate(&raw_batch[i * d], &rotated[i * PADDED_DIM]);
+            const float* raw_vec = raw_batch + i * d;
+            rotator->rotate(raw_vec, &rotated[i * PADDED_DIM]);
 
             encode_one_bit(
                 &rotated[i * PADDED_DIM],
@@ -1029,6 +1068,7 @@ void build_index(
             one_bit_factor_batch.data(),
             list_nos.data(),
             doc_ptrs);
+        report_progress(step5_progress, cur_batch);
     }
 
     const auto step5_end = Clock::now();

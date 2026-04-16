@@ -20,7 +20,7 @@ Description:
     profiling/<dataset>/colbert/benchmark_results.csv
     profiling/<dataset>/colbert/pareto_frontier.csv
     profiling/<dataset>/colbert/search_py_output.csv
-    log/colbert/<dataset>/benchmark.log
+    log/bench/colbert/<dataset>/benchmark.log
 
   Optional /tmp staging can copy dataset/<name>/colbert into local storage
   first and run the benchmark from there to avoid NFS index reads.
@@ -35,7 +35,7 @@ Options:
   --implementation-label <label>
                            Output folder label. Default: colbert
   --output-dir <path>      CSV output directory. Default: profiling
-  --log-dir <path>         Log output directory. Default: log
+  --log-dir <path>         Log output directory. Default: log/bench
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
   --copy-index-to-tmp      Copy the ColBERT experiment directory into /tmp first.
   --refresh-tmp-index      Re-copy the /tmp index even if it already exists.
@@ -576,7 +576,7 @@ experiment_name="colbert"
 index_name_override=""
 implementation_label="colbert"
 output_dir="${repo_root}/profiling"
-log_dir="${repo_root}/log"
+log_dir="${repo_root}/log/bench"
 tmp_root="/tmp/${USER:-user}/colbert_benchmark"
 env_name="colbert"
 k=100

@@ -17,8 +17,8 @@ Expected dataset layout:
 
 Outputs:
   dataset/<name>/gpu_mvr_index/
-  log/<dataset>_gpu_build.log
-  log/<dataset>_gpu_build.timings.log
+  log/build/<dataset>_gpu_build.log
+  log/build/<dataset>_gpu_build.timings.log
 
 Arguments:
   dataset_name           Dataset name under dataset/. Defaults to hotpot.
@@ -113,7 +113,7 @@ raw_dir="${dataset_dir}/raw"
 data_file="${raw_dir}/data.bin"
 doclens_file="${raw_dir}/doclens.bin"
 index_dir="${dataset_dir}/gpu_mvr_index"
-log_dir="${repo_root}/log"
+log_dir="${repo_root}/log/build"
 
 [[ -x "$gpu_build_bin" ]] || die "gpu_build binary not found or not executable: ${gpu_build_bin}"
 [[ -d "$dataset_dir" ]] || die "dataset directory not found: ${dataset_dir}"
