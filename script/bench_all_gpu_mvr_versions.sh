@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  script/bench_all_gpu_mvr_versions.sh [options]
+
+Description:
+  Benchmark GPU-MVR gpu_search versions v0 through v3 across the default
+  dataset set:
+    lotte
+    hotpot
+    msmarco
+
+  This is a thin wrapper around script/bench_gpu_mvr.sh. It preserves the
+  per-version output layout from the single-version benchmark driver, e.g.:
+    profiling/<dataset>/gpu_search_v0/
+    profiling/<dataset>/gpu_search_v1/
+    profiling/<dataset>/gpu_search_v2/
+    profiling/<dataset>/gpu_search_v3/
+
+Options:
+  --dataset <name>         Dataset to benchmark. Repeatable.
+                           Accepts hotspot as an alias for hotpot.
+  --version <v0|v1|v2|v3>  Version to benchmark. Repeatable.
+                           Default: v0 v1 v2 v3
+  --config-file <path>     Passed through to bench_gpu_mvr.sh.
+  --build-dir <path>       Passed through to bench_gpu_mvr.sh.
+  --output-dir <path>      Passed through to bench_gpu_mvr.sh.
+  --log-dir <path>         Passed through to bench_gpu_mvr.sh.
+  --k <top_k>              Passed through to bench_gpu_mvr.sh.
+  --nq <count>             Passed through to bench_gpu_mvr.sh.
+  --warmup <count>         Passed through to bench_gpu_mvr.sh.
+  --copy-index-to-tmp      Passed through to bench_gpu_mvr.sh.
+  --refresh-tmp-index      Passed through to bench_gpu_mvr.sh.
+  --tmp-root <path>        Passed through to bench_gpu_mvr.sh.
+  --dry-run                Print commands without executing them.
+  -h, --help               Show this help message.
+EOF
+}
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+normalize_dataset_name() {
+    local dataset_name="$1"
+    case "$dataset_name" in
+        hotspot)
+            printf '%s' "hotpot"
+            ;;
+        *)
+            printf '%s' "$dataset_name"
+            ;;
+    esac
+}
+
+append_unique() {
+    local value="$1"
+    shift
+
+    local existing=""
+    for existing in "$@"; do
+        if [[ "$existing" == "$value" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+single_bench_script="${script_dir}/bench_gpu_mvr.sh"
+
+[[ -x "$single_bench_script" ]] || die "missing executable helper script: ${single_bench_script}"
+
+datasets=(lotte hotpot msmarco)
+versions=(v0 v1 v2 v3)
+dataset_set=0
+version_set=0
+dry_run=0
+pass_through_args=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dataset)
+            [[ $# -ge 2 ]] || die "missing value for --dataset"
+            normalized_dataset="$(normalize_dataset_name "$2")"
+            if [[ $dataset_set -eq 0 ]]; then
+                datasets=()
+                dataset_set=1
+            fi
+            if ! append_unique "$normalized_dataset" "${datasets[@]}"; then
+                datasets+=("$normalized_dataset")
+            fi
+            shift 2
+            ;;
+        --version)
+            [[ $# -ge 2 ]] || die "missing value for --version"
+            case "$2" in
+                v0|v1|v2|v3)
+                    ;;
+                *)
+                    die "--version must be one of: v0, v1, v2, v3"
+                    ;;
+            esac
+            if [[ $version_set -eq 0 ]]; then
+                versions=()
+                version_set=1
+            fi
+            if ! append_unique "$2" "${versions[@]}"; then
+                versions+=("$2")
+            fi
+            shift 2
+            ;;
+        --config-file|--build-dir|--output-dir|--log-dir|--k|--nq|--warmup|--tmp-root)
+            [[ $# -ge 2 ]] || die "missing value for $1"
+            pass_through_args+=("$1" "$2")
+            shift 2
+            ;;
+        --copy-index-to-tmp|--refresh-tmp-index)
+            pass_through_args+=("$1")
+            shift
+            ;;
+        --dry-run)
+            dry_run=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown option: $1"
+            ;;
+    esac
+done
+
+[[ ${#datasets[@]} -gt 0 ]] || die "no datasets selected"
+[[ ${#versions[@]} -gt 0 ]] || die "no versions selected"
+
+for version in "${versions[@]}"; do
+    cmd=(
+        "$single_bench_script"
+        --version "$version"
+    )
+
+    for dataset in "${datasets[@]}"; do
+        cmd+=(--dataset "$dataset")
+    done
+
+    if [[ ${#pass_through_args[@]} -gt 0 ]]; then
+        cmd+=("${pass_through_args[@]}")
+    fi
+
+    if [[ $dry_run -eq 1 ]]; then
+        cmd+=(--dry-run)
+    fi
+
+    echo "[batch] version=${version}"
+    echo "[batch] datasets=${datasets[*]}"
+    echo "[batch] command=$(printf '%q ' "${cmd[@]}")"
+    "${cmd[@]}"
+done

@@ -454,8 +454,8 @@ benchmark_dataset() {
             die "gpu_search_${version} failed for dataset=${dataset_name} label=${label}; see ${current_log_file}"
         fi
 
-        search_seconds="$(extract_last_match_or_die "$run_output" 's/^\[([0-9.]+) s\] GPU search time for [0-9]+ queries\.$/\1/p' 'search seconds')"
-        queries="$(extract_last_match_or_die "$run_output" 's/^\[[0-9.]+ s\] GPU search time for ([0-9]+) queries\.$/\1/p' 'query count')"
+        search_seconds="$(extract_last_match_or_die "$run_output" 's/^\[([0-9.]+) s\] (.* )?GPU search time for [0-9]+ queries\.$/\1/p' 'search seconds')"
+        queries="$(extract_last_match_or_die "$run_output" 's/^\[[0-9.]+ s\] (.* )?GPU search time for ([0-9]+) queries\.$/\2/p' 'query count')"
         end_to_end_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] End-to-end measured time: ([0-9.]+) ms$/\1/p' 'end-to-end time')"
         qps="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Throughput: ([0-9.]+) qps$/\1/p' 'throughput')"
         recall="$(extract_last_match_or_die "$run_output" 's/^Recall@[0-9]+: ([0-9.]+)$/\1/p' 'recall')"
