@@ -52,23 +52,6 @@ run_cmd() {
     fi
 }
 
-run_in_env_with_cuda() {
-    local env_prefix="$1"
-    shift
-
-    local ld_library_path="${env_prefix}/lib:${env_prefix}/lib64"
-    if [[ -n "${LD_LIBRARY_PATH-}" ]]; then
-        ld_library_path="${ld_library_path}:${LD_LIBRARY_PATH}"
-    fi
-
-    run_cmd \
-        "$env_manager" run -n "$env_name" env \
-        "CUDA_HOME=${env_prefix}" \
-        "PATH=${env_prefix}/bin:${PATH}" \
-        "LD_LIBRARY_PATH=${ld_library_path}" \
-        "$@"
-}
-
 find_env_manager() {
     if command -v micromamba >/dev/null 2>&1; then
         echo "micromamba"
@@ -86,11 +69,70 @@ find_env_manager() {
 }
 
 env_exists() {
-    "$env_manager" run -n "$env_name" python -c "import sys; print(sys.prefix)" >/dev/null 2>&1
+    if [[ $dry_run -eq 1 ]]; then
+        return 1
+    fi
+
+    [[ -n "$(resolve_env_prefix_from_list)" ]]
+}
+
+resolve_env_prefix_from_list() {
+    "$env_manager" env list 2>/dev/null | awk -v env="${env_name}" '
+        $1 == env || $2 == env { print $NF }
+    ' | tail -n 1
 }
 
 resolve_env_prefix() {
-    "$env_manager" run -n "$env_name" python -c "import sys; print(sys.prefix)"
+    local env_prefix
+    env_prefix="$(resolve_env_prefix_from_list)"
+    [[ -n "$env_prefix" ]] || die "failed to resolve prefix for env ${env_name}"
+    echo "$env_prefix"
+}
+
+resolve_env_binary() {
+    local env_prefix="$1"
+    local binary_name="$2"
+    local binary_path="${env_prefix}/bin/${binary_name}"
+
+    if [[ $dry_run -eq 0 && ! -x "$binary_path" ]]; then
+        die "missing executable ${binary_path}"
+    fi
+
+    echo "$binary_path"
+}
+
+run_in_env() {
+    local env_prefix="$1"
+    local binary_name="$2"
+    shift 2
+
+    local binary_path
+    binary_path="$(resolve_env_binary "$env_prefix" "$binary_name")"
+
+    run_cmd env \
+        "PATH=${env_prefix}/bin:${PATH}" \
+        "$binary_path" \
+        "$@"
+}
+
+run_in_env_with_cuda() {
+    local env_prefix="$1"
+    local binary_name="$2"
+    shift 2
+
+    local binary_path
+    local ld_library_path="${env_prefix}/lib:${env_prefix}/lib64"
+    if [[ -n "${LD_LIBRARY_PATH-}" ]]; then
+        ld_library_path="${ld_library_path}:${LD_LIBRARY_PATH}"
+    fi
+    binary_path="$(resolve_env_binary "$env_prefix" "$binary_name")"
+
+    run_cmd env \
+        "CUDA_HOME=${env_prefix}" \
+        "PATH=${env_prefix}/bin:${PATH}" \
+        "LD_LIBRARY_PATH=${ld_library_path}" \
+        "$binary_path" \
+        "$@"
 }
 
 install_cuda_activation_hooks() {
@@ -228,20 +270,20 @@ else
     run_cmd "$env_manager" create -n "$env_name" -y "python=${python_version}" pip
 fi
 
-run_cmd "$env_manager" install -n "$env_name" -y \
-    -c "nvidia/label/cuda-11.7.0" \
-    -c "conda-forge" \
-    "${conda_toolchain_deps[@]}"
-
-run_cmd "$env_manager" run -n "$env_name" pip install --upgrade "pip<25"
-run_cmd "$env_manager" run -n "$env_name" pip install "${pip_deps[@]}"
-run_cmd "$env_manager" run -n "$env_name" pip install -e "${repo_root}/ColBERT" --no-deps
-
 if [[ $dry_run -eq 1 ]]; then
     env_prefix="<resolved-env-prefix>"
 else
     env_prefix="$(resolve_env_prefix)"
 fi
+
+run_cmd "$env_manager" install -n "$env_name" -y \
+    -c "nvidia/label/cuda-11.7.0" \
+    -c "conda-forge" \
+    "${conda_toolchain_deps[@]}"
+
+run_in_env "$env_prefix" python -m pip install --upgrade "pip<25"
+run_in_env "$env_prefix" python -m pip install "${pip_deps[@]}"
+run_in_env "$env_prefix" python -m pip install -e "${repo_root}/ColBERT" --no-deps
 
 install_cuda_activation_hooks "$env_prefix"
 

@@ -119,11 +119,20 @@ find_env_manager() {
 }
 
 env_exists() {
-    "$env_manager" run -n "$env_name" python -c "import sys; print(sys.prefix)" >/dev/null 2>&1
+    [[ -n "$(resolve_env_prefix_from_list)" ]]
+}
+
+resolve_env_prefix_from_list() {
+    "$env_manager" env list 2>/dev/null | awk -v env="${env_name}" '
+        $1 == env || $2 == env { print $NF }
+    ' | tail -n 1
 }
 
 resolve_env_prefix() {
-    "$env_manager" run -n "$env_name" python -c "import sys; print(sys.prefix)"
+    local env_prefix
+    env_prefix="$(resolve_env_prefix_from_list)"
+    [[ -n "$env_prefix" ]] || die "failed to resolve prefix for env ${env_name}"
+    echo "$env_prefix"
 }
 
 run_in_env_with_cuda() {
@@ -131,23 +140,33 @@ run_in_env_with_cuda() {
     shift
 
     local ld_library_path="${env_prefix}/lib:${env_prefix}/lib64"
+    local host_cc="${env_prefix}/bin/x86_64-conda-linux-gnu-cc"
+    local host_cxx="${env_prefix}/bin/x86_64-conda-linux-gnu-c++"
     if [[ -n "${LD_LIBRARY_PATH-}" ]]; then
         ld_library_path="${ld_library_path}:${LD_LIBRARY_PATH}"
     fi
 
-    echo "+ $(printf '%q ' "$env_manager" run -n "$env_name" env \
+    echo "+ $(printf '%q ' env \
         "CUDA_HOME=${env_prefix}" \
         "PATH=${env_prefix}/bin:${PATH}" \
         "LD_LIBRARY_PATH=${ld_library_path}" \
         "PYTHONPATH=${repo_root}/ColBERT" \
+        "TORCH_EXTENSIONS_DIR=${torch_extensions_dir}" \
+        "CC=${host_cc}" \
+        "CXX=${host_cxx}" \
+        "CUDAHOSTCXX=${host_cxx}" \
         "$@")"
 
     if [[ $dry_run -eq 0 ]]; then
-        "$env_manager" run -n "$env_name" env \
+        env \
             "CUDA_HOME=${env_prefix}" \
             "PATH=${env_prefix}/bin:${PATH}" \
             "LD_LIBRARY_PATH=${ld_library_path}" \
             "PYTHONPATH=${repo_root}/ColBERT" \
+            "TORCH_EXTENSIONS_DIR=${torch_extensions_dir}" \
+            "CC=${host_cc}" \
+            "CXX=${host_cxx}" \
+            "CUDAHOSTCXX=${host_cxx}" \
             "$@"
     fi
 }
@@ -410,7 +429,7 @@ benchmark_dataset() {
     current_log_file="$log_file"
 
     if [[ $dry_run -eq 0 ]]; then
-        mkdir -p "$impl_output_dir" "$impl_log_dir"
+        mkdir -p "$impl_output_dir" "$impl_log_dir" "$torch_extensions_dir"
         : > "$log_file"
     fi
 
@@ -468,6 +487,7 @@ benchmark_dataset() {
     log_line "[driver] copy_index_to_tmp=${copy_index_to_tmp}"
     log_line "[driver] refresh_tmp_index=${refresh_tmp_index}"
     log_line "[driver] tmp_root=${tmp_root}"
+    log_line "[driver] torch_extensions_dir=${torch_extensions_dir}"
     print_hardware_info
 
     if [[ $dry_run -eq 0 ]]; then
@@ -585,6 +605,7 @@ refresh_tmp_index=0
 dry_run=0
 dataset_set=0
 current_log_file=""
+torch_extensions_dir=""
 datasets=()
 
 while [[ $# -gt 0 ]]; do
@@ -684,6 +705,7 @@ env_manager="$(find_env_manager)"
 [[ -n "$env_manager" ]] || die "none of micromamba, mamba, or conda is available on PATH"
 env_exists || die "environment ${env_name} is not available through ${env_manager}"
 env_prefix="$(resolve_env_prefix)"
+torch_extensions_dir="${repo_root}/.cache/torch_extensions/${env_name}"
 
 if [[ $dataset_set -eq 0 ]]; then
     while IFS= read -r dataset_name; do
