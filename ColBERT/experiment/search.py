@@ -1,6 +1,4 @@
 import os
-os.environ["CUDA_HOME"] = "/work/pi_ameliou_umass_edu/yanqichen/cuda12.8"
-
 import argparse
 import csv
 import time

@@ -25,9 +25,11 @@ Key directories:
 Important files:
 
 - [CMakeLists.txt](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/CMakeLists.txt)
-- [cmake.sh](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cmake.sh)
+- [cpp/app/gpu_build.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_build.cu)
+- [cpp/app/gpu_search_v3.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search_v3.cu)
 - [cpp/cuda/src/build_gpu_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/build_gpu_index.cu)
 - [cpp/cuda/src/gpu_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index.cu)
+- [cpp/cuda/src/gpu_index_v3.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index_v3.cu)
 - [cpp/src/ivf_pg.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/src/ivf_pg.cpp)
 - [cpp/include/gpu_index_layout.hpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/include/gpu_index_layout.hpp)
 - [cpp/include/mvr_index_file_format.hpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/include/mvr_index_file_format.hpp)
@@ -125,7 +127,7 @@ Recent behavior worth knowing:
 - Step 2 uses double buffering per GPU worker to overlap data loading and device work.
 - Step timings are printed as human-readable durations.
 - Step 2 progress is reported as `% documents handled`.
-- The helper script [build_index.sh](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/build_index.sh) runs the full from-scratch build and writes the raw build log plus extracted per-phase timings under `gpu-mvr/profiling/`.
+- The supported end-to-end entry point is `gpu_build`; it prints per-phase timings directly to stdout.
 
 ## Search Pipeline
 
@@ -148,33 +150,36 @@ There is also a `v0` comparison path in [cpp/cuda/src/gpu_index_baseline.cu](/da
 Create and activate the Conda environment first:
 
 ```bash
-conda env create -n gpu-mvr -y python=3.11 cmake ninja
+conda env create -n gpu-mvr -y python=3.11
 conda activate gpu-mvr
-conda install -c rapidsai -c conda-forge libcuvs 'cuda-version=12.9'
-conda install -c conda-forge cxx-compiler libsqlite
+conda install -c rapidsai -c conda-forge libcuvs=26.04 'cuda-version=12.9'
+conda install -c conda-forge cxx-compiler cmake ninja
 ```
 
-Use the provided CMake wrapper and source it so the Conda CUDA toolchain settings apply to the build command too:
+Configure directly with CMake/Ninja. The important part is to point CMake at the Conda toolchain and CUDA toolkit:
 
 ```bash
 cd gpu-mvr
-source ./cmake.sh
-cmake --build build -j 4
+
+CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc" \
+CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++" \
+CUDACXX="$CONDA_PREFIX/bin/nvcc" \
+cmake -S . -B build -G Ninja \
+-DCMAKE_BUILD_TYPE=Release \
+-DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
+
+cmake --build build -j
 ```
+
+If your shell exports a conflicting `CPATH` from another toolchain, unset it before configuring.
 
 If you only need specific binaries:
 
 ```bash
-source ./cmake.sh
 cmake --build build --target gpu_build gpu_search gpu_search_v0 gpu_search_v1 gpu_search_v2 gpu_search_v3 -j 4
 ```
 
-`cmake.sh` currently:
-
-- prefers Conda `gcc`/`g++`
-- prefers Conda `nvcc`
-- clears the conflicting `CPATH`
-- regenerates `build/`
+This direct configure command replaces the removed `cmake.sh` wrapper.
 
 ## Binaries
 
@@ -228,7 +233,6 @@ Operational notes:
 - It memory-maps the embedding file instead of loading the whole dataset eagerly.
 - It currently fixes `ex_bits = 3` in the app wrapper.
 - Search binaries can be pointed either at the index directory or directly at `cpu_index.bin`.
-- The repository helper [build_index.sh](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/build_index.sh) is the recommended way to rebuild the LOTTE index end to end.
 
 ### `gpu_search`
 
@@ -260,10 +264,44 @@ Notes:
 
 - `Q_DOCLEN` in `gpu_config.cuh` must match the `q_doclen` stored in `query_embeddings.bin`.
 - `--nq` and `--warmup` are clamped to the number of queries in the query file.
-- The GPU search binaries now share one standardized CLI parser. `gpu_search`, `gpu_search_v0`, `gpu_search_v1`, `gpu_search_v2`, and `gpu_search_v3` all accept the same search-tuning flags.
+- `gpu_search` is the default `v3` build target; [cpp/app/gpu_search.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search.cu) simply includes `gpu_search_v3.cu`.
+- The GPU search binaries share one standardized CLI parser, so `gpu_search`, `gpu_search_v0`, `gpu_search_v1`, `gpu_search_v2`, and `gpu_search_v3` accept the same search-tuning flags.
 - Default values still differ by binary where the code previously differed, especially `--k-rank-cluster`.
 - `--itopk-size` controls CAGRA's internal intermediate top-k during centroid search.
 - `--overlap-chunks` is used by the persistent overlap pipeline in `v1`/`v2`/`v3` and is ignored by `v0`.
+- For `gpu_search`/`gpu_search_v3`, `--index` must resolve to a split index directory: pass either the directory itself or its `cpu_index.bin`, and keep `gpu_index.bin` beside it. Older directories can still fall back to `clustered_stage1.bin`.
+
+### `gpu_search_v3`
+
+Source: [cpp/app/gpu_search_v3.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search_v3.cu)
+
+Purpose:
+
+- Run the explicit `v3` GPU search binary. This is the same implementation as `gpu_search`, but exposed as a versioned executable for comparisons and artifact runs.
+
+CLI:
+
+```bash
+./build/gpu_search_v3 \
+  --query <query_embeddings.bin> \
+  --doclens <doclens.bin> \
+  --gt <groundtruth.tsv> \
+  --index <index_dir_or_cpu_index.bin> \
+  [--k <top_k>] \
+  [--nprobe <num_probes>] \
+  [--k-rank-cluster <count>] \
+  [--k-rank-all-tokens <count>] \
+  [--itopk-size <count>] \
+  [--overlap-chunks <count>] \
+  [--nq <num_queries_to_run>] \
+  [--warmup <num_warmup_queries>]
+```
+
+Notes:
+
+- `gpu_search_v3` uses the same parser and defaults as `gpu_search`.
+- The v3 loader requires the split GPU layout because stage 1 and stage 2 both read `gpu_index.bin`.
+- Passing `--index <index_dir>` or `--index <index_dir>/cpu_index.bin` is supported. Passing only a monolithic legacy index file is not supported for `v3`.
 
 ### `gpu_search_v0`
 
@@ -424,16 +462,23 @@ Notes:
 
 If you are new to the repo, start here:
 
-1. Build with `source ./cmake.sh`.
-2. Use `build_index.sh` or `gpu_build` to generate a split-format index directory.
-3. Use `gpu_search` to run the main GPU search path.
+1. Configure and build with the direct CMake/Ninja commands above.
+2. Use `gpu_build` to generate a split-format index directory.
+3. Use `gpu_search_v3` for the explicit `v3` path, or `gpu_search` if you want the default alias.
 
 Example:
 
 ```bash
 cd gpu-mvr
-source ./cmake.sh
-cmake --build build --target gpu_build gpu_search -j 4
+
+CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc" \
+CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-c++" \
+CUDACXX="$CONDA_PREFIX/bin/nvcc" \
+cmake -S . -B build -G Ninja \
+-DCMAKE_BUILD_TYPE=Release \
+-DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
+
+cmake --build build --target gpu_build gpu_search_v3 -j 4
 
 ./build/gpu_build \
   --index_dir ./my_index \
@@ -441,7 +486,7 @@ cmake --build build --target gpu_build gpu_search -j 4
   --data ./embeddings.bin \
   --n_clusters 2097152
 
-./build/gpu_search \
+./build/gpu_search_v3 \
   --query ./query_embeddings.bin \
   --doclens ./doclens.bin \
   --gt ./lotte-groundtruth-top1000--.tsv \

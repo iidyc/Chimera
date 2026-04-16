@@ -3,6 +3,7 @@ MANIFEST.in
 README.md
 setup.py
 colbert/__init__.py
+colbert/embedding_indexer.py
 colbert/index.py
 colbert/index_updater.py
 colbert/indexer.py
@@ -22,6 +23,7 @@ colbert/evaluation/metrics.py
 colbert/indexing/__init__.py
 colbert/indexing/collection_encoder.py
 colbert/indexing/collection_indexer.py
+colbert/indexing/embedding_collection_indexer.py
 colbert/indexing/index_manager.py
 colbert/indexing/index_saver.py
 colbert/indexing/loaders.py
