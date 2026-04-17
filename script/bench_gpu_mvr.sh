@@ -26,7 +26,7 @@ Description:
 
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
-  --version <v0|v1|v2|v3>  GPU-MVR search version. Default: v3
+  --version <v0|v1|v2|v3|v4>  GPU-MVR search version. Default: v3
   --implementation-label <label>
                            Output folder label. Default: gpu_search_<version>
   --config-file <path>     Config CSV. Default: profiling/gpu_mvr_config.csv
@@ -189,6 +189,177 @@ extract_last_match_or_die() {
     printf '%s' "$value"
 }
 
+count_gpu_search_configs() {
+    local config_path="$1"
+    awk -F, '
+        {
+            gsub(/\r/, "", $0)
+            if ($0 ~ /^[[:space:]]*$/) {
+                next
+            }
+            label = $1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", label)
+            if (label == "" || label == "label" || substr(label, 1, 1) == "#") {
+                next
+            }
+            count++
+        }
+        END {
+            print count + 0
+        }
+    ' "$config_path"
+}
+
+parse_batched_gpu_search_output() {
+    local run_output="$1"
+    local dataset_name="$2"
+    local active_index_dir="$3"
+    local index_source="$4"
+
+    awk \
+        -v implementation_label="$implementation_label" \
+        -v dataset_name="$dataset_name" \
+        -v index_source="$index_source" \
+        -v index_path="$active_index_dir" \
+        -v k="$k" \
+        -v warmup="$warmup" '
+        function fail(message) {
+            print "error: " message > "/dev/stderr"
+            exit 1
+        }
+
+        function reset_metrics() {
+            search_seconds = ""
+            queries = ""
+            end_to_end_ms = ""
+            qps = ""
+            recall = ""
+            avg_latency_ms = ""
+            p50_ms = ""
+            p90_ms = ""
+            p95_ms = ""
+            p99_ms = ""
+            max_ms = ""
+            stddev_ms = ""
+        }
+
+        function flush_row() {
+            if (current_label == "") {
+                fail("missing config label before metric emission")
+            }
+            if (search_seconds == "" || queries == "" || end_to_end_ms == "" ||
+                qps == "" || recall == "" || avg_latency_ms == "" ||
+                p50_ms == "" || p90_ms == "" || p95_ms == "" ||
+                p99_ms == "" || max_ms == "" || stddev_ms == "") {
+                fail("incomplete metric block for label=" current_label)
+            }
+
+            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                   implementation_label, dataset_name, current_label,
+                   nprobe, k_rank_cluster, k_rank_all_tokens, itopk_size, overlap_chunks,
+                   index_source, index_path, queries, k, warmup, search_seconds,
+                   end_to_end_ms, qps, recall, avg_latency_ms, p50_ms, p90_ms,
+                   p95_ms, p99_ms, max_ms, stddev_ms
+            parsed_rows++
+            reset_metrics()
+        }
+
+        BEGIN {
+            current_label = ""
+            parsed_rows = 0
+            reset_metrics()
+        }
+
+        /^\[CONFIG\] / {
+            if (match($0, /^\[CONFIG\] label=([^ ]+) nprobe=([0-9]+) k_rank_cluster=([0-9]+) k_rank_all_tokens=([0-9]+) itopk_size=([0-9]+) overlap_chunks=([0-9]+)/, m)) {
+                current_label = m[1]
+                nprobe = m[2]
+                k_rank_cluster = m[3]
+                k_rank_all_tokens = m[4]
+                itopk_size = m[5]
+                overlap_chunks = m[6]
+                reset_metrics()
+                next
+            }
+            fail("unable to parse config banner: " $0)
+        }
+
+        /^\[[0-9.]+ s\] / && /GPU search time for [0-9]+ queries\.$/ {
+            if (current_label == "") {
+                fail("saw timing line before config banner")
+            }
+            if (match($0, /^\[([0-9.]+) s\] label=([^ ]+) (v0 )?GPU search time for ([0-9]+) queries\.$/, m)) {
+                if (m[2] != current_label) {
+                    fail("timing label mismatch: expected " current_label ", got " m[2])
+                }
+                search_seconds = m[1]
+                queries = m[4]
+                next
+            }
+            fail("unable to parse timing line: " $0)
+        }
+
+        /^\[SEARCH\] End-to-end measured time: / {
+            if (match($0, /^\[SEARCH\] End-to-end measured time: ([0-9.]+) ms$/, m)) {
+                end_to_end_ms = m[1]
+                next
+            }
+            fail("unable to parse end-to-end line: " $0)
+        }
+
+        /^\[SEARCH\] Throughput: / {
+            if (match($0, /^\[SEARCH\] Throughput: ([0-9.]+) qps$/, m)) {
+                qps = m[1]
+                next
+            }
+            fail("unable to parse throughput line: " $0)
+        }
+
+        /^\[SEARCH\] Average latency per query: / {
+            if (match($0, /^\[SEARCH\] Average latency per query: ([0-9.]+) ms$/, m)) {
+                avg_latency_ms = m[1]
+                next
+            }
+            fail("unable to parse average latency line: " $0)
+        }
+
+        /^\[SEARCH\] Query latency distribution \(ms\): / {
+            if (match($0, /^\[SEARCH\] Query latency distribution \(ms\): p50=([0-9.]+), p90=([0-9.]+), p95=([0-9.]+), p99=([0-9.]+), max=([0-9.]+), stddev=([0-9.]+)$/, m)) {
+                p50_ms = m[1]
+                p90_ms = m[2]
+                p95_ms = m[3]
+                p99_ms = m[4]
+                max_ms = m[5]
+                stddev_ms = m[6]
+                next
+            }
+            fail("unable to parse latency distribution line: " $0)
+        }
+
+        /^Recall@[0-9]+: / {
+            if (match($0, /^Recall@[0-9]+: ([0-9.]+)$/, m)) {
+                recall = m[1]
+                flush_row()
+                next
+            }
+            fail("unable to parse recall line: " $0)
+        }
+
+        END {
+            if (current_label != "" &&
+                (search_seconds != "" || queries != "" || end_to_end_ms != "" ||
+                 qps != "" || recall != "" || avg_latency_ms != "" ||
+                 p50_ms != "" || p90_ms != "" || p95_ms != "" ||
+                 p99_ms != "" || max_ms != "" || stddev_ms != "")) {
+                fail("incomplete trailing metric block for label=" current_label)
+            }
+            if (parsed_rows == 0) {
+                fail("no benchmark rows parsed from " FILENAME)
+            }
+        }
+    ' "$run_output"
+}
+
 copy_index_to_tmp_if_needed() {
     local dataset_name="$1"
     local source_index_dir="$2"
@@ -200,8 +371,10 @@ copy_index_to_tmp_if_needed() {
     fi
 
     if [[ -d "$dest_index_dir" && $refresh_tmp_index -eq 0 \
-        && -f "$dest_index_dir/cpu_index.bin" \
-        && -f "$dest_index_dir/gpu_index.bin" \
+        && -f "$dest_index_dir/doc_1bit.bin" \
+        && -f "$dest_index_dir/doc_4bit.bin" \
+        && -f "$dest_index_dir/cluster_1bit.bin" \
+        && -f "$dest_index_dir/doclens.bin" \
         && -f "$dest_index_dir/ivf.bin" \
         && -f "$dest_index_dir/centroids.carga" ]]; then
         log_capture_safe_line "[driver] reusing_tmp_index=${dest_index_dir}"
@@ -311,7 +484,7 @@ benchmark_dataset() {
     local raw_dir="${dataset_dir}/raw"
     local source_index_dir="${dataset_dir}/gpu_mvr_index"
     local query_file="${raw_dir}/query.bin"
-    local doclens_file="${raw_dir}/doclens.bin"
+    local index_doclens_file="${source_index_dir}/doclens.bin"
     local gt_file="${raw_dir}/gt.tsv"
     local impl_output_dir="${output_dir}/${dataset_name}/${implementation_label}"
     local impl_log_dir="${log_dir}/${implementation_label}/${dataset_name}"
@@ -320,12 +493,20 @@ benchmark_dataset() {
     local log_file="${impl_log_dir}/benchmark.log"
     local index_source="nfs"
     local active_index_dir=""
+    local config_count=""
+    local run_output=""
+    local status=0
+    local run_start_utc=""
+    local run_end_utc=""
+    local parsed_rows=""
+    local parsed_count=""
+    local command=()
 
     [[ -d "$dataset_dir" ]] || die "dataset directory not found: ${dataset_dir}"
     [[ -f "$query_file" ]] || die "missing query file: ${query_file}"
-    [[ -f "$doclens_file" ]] || die "missing doclens file: ${doclens_file}"
     [[ -f "$gt_file" ]] || die "missing ground truth file: ${gt_file}"
     [[ -d "$source_index_dir" ]] || die "missing index directory: ${source_index_dir}"
+    [[ -f "$index_doclens_file" ]] || die "missing index doclens file: ${index_doclens_file}"
 
     current_log_file="$log_file"
 
@@ -346,7 +527,7 @@ benchmark_dataset() {
     log_line "[driver] build_dir=${build_dir}"
     log_line "[driver] binary=${binary}"
     log_line "[driver] query_file=${query_file}"
-    log_line "[driver] doclens_file=${doclens_file}"
+    log_line "[driver] index_doclens_file=${index_doclens_file}"
     log_line "[driver] gt_file=${gt_file}"
     log_line "[driver] source_index_dir=${source_index_dir}"
     log_line "[driver] active_index_dir=${active_index_dir}"
@@ -360,6 +541,8 @@ benchmark_dataset() {
     log_line "[driver] refresh_tmp_index=${refresh_tmp_index}"
     log_line "[driver] tmp_root=${tmp_root}"
     print_hardware_info
+    config_count="$(count_gpu_search_configs "$config_file")"
+    log_line "[driver] config_count=${config_count}"
 
     if [[ $dry_run -eq 0 ]]; then
         printf '%s\n' \
@@ -367,113 +550,57 @@ benchmark_dataset() {
             > "$results_csv"
     fi
 
-    while IFS=, read -r raw_label raw_nprobe raw_k_rank_cluster raw_k_rank_all_tokens raw_itopk_size raw_overlap_chunks; do
-        local label=""
-        local nprobe=""
-        local k_rank_cluster=""
-        local k_rank_all_tokens=""
-        local itopk_size=""
-        local overlap_chunks=""
-        local run_output=""
-        local status=0
-        local run_start_utc=""
-        local run_end_utc=""
-        local search_seconds=""
-        local queries=""
-        local end_to_end_ms=""
-        local qps=""
-        local recall=""
-        local avg_latency_ms=""
-        local p50_ms=""
-        local p90_ms=""
-        local p95_ms=""
-        local p99_ms=""
-        local max_ms=""
-        local stddev_ms=""
-        local command=()
+    command=(
+        "$binary"
+        --query "$query_file"
+        --gt "$gt_file"
+        --index "$active_index_dir"
+        --k "$k"
+        --nq "$nq"
+        --warmup "$warmup"
+        --config-file "$config_file"
+    )
 
-        label="$(trim_field "$raw_label")"
-        [[ -z "$label" || "$label" == "label" || "$label" == \#* ]] && continue
+    log_line "[run] dataset=${dataset_name} batched_configs=${config_count}"
+    log_line "[run] command=$(printf '%q ' "${command[@]}")"
 
-        nprobe="$(trim_field "$raw_nprobe")"
-        k_rank_cluster="$(trim_field "$raw_k_rank_cluster")"
-        k_rank_all_tokens="$(trim_field "$raw_k_rank_all_tokens")"
-        itopk_size="$(trim_field "$raw_itopk_size")"
-        overlap_chunks="$(trim_field "$raw_overlap_chunks")"
+    if [[ $dry_run -eq 1 ]]; then
+        return
+    fi
 
-        require_positive_int "nprobe" "$nprobe"
-        require_positive_int "k_rank_cluster" "$k_rank_cluster"
-        require_positive_int "k_rank_all_tokens" "$k_rank_all_tokens"
-        require_positive_int "itopk_size" "$itopk_size"
-        require_positive_int "overlap_chunks" "$overlap_chunks"
-        (( nprobe > 0 )) || die "nprobe must be > 0"
-        (( k_rank_cluster > 0 )) || die "k_rank_cluster must be > 0"
-        (( k_rank_all_tokens > 0 )) || die "k_rank_all_tokens must be > 0"
-        (( itopk_size > 0 )) || die "itopk_size must be > 0"
-        (( overlap_chunks > 0 )) || die "overlap_chunks must be > 0"
+    run_output="$(mktemp "${TMPDIR:-/tmp}/gpu_search_${version}.${dataset_name}.XXXXXX.log")"
+    run_start_utc="$(date -u +%Y%m%dT%H%M%SZ)"
+    log_line "[run] start_utc=${run_start_utc}"
 
-        command=(
-            "$binary"
-            --query "$query_file"
-            --doclens "$doclens_file"
-            --gt "$gt_file"
-            --index "$active_index_dir"
-            --k "$k"
-            --nq "$nq"
-            --warmup "$warmup"
-            --nprobe "$nprobe"
-            --k-rank-cluster "$k_rank_cluster"
-            --k-rank-all-tokens "$k_rank_all_tokens"
-            --itopk-size "$itopk_size"
-            --overlap-chunks "$overlap_chunks"
-        )
+    set +e
+    "${command[@]}" > "$run_output" 2>&1
+    status=$?
+    set -e
 
-        log_line "[run] dataset=${dataset_name} label=${label}"
-        log_line "[run] command=$(printf '%q ' "${command[@]}")"
+    tee -a "$current_log_file" < "$run_output"
+    run_end_utc="$(date -u +%Y%m%dT%H%M%SZ)"
+    log_line "[run] end_utc=${run_end_utc}"
+    log_line "[run] exit_code=${status}"
 
-        if [[ $dry_run -eq 1 ]]; then
-            continue
-        fi
-
-        run_output="$(mktemp "${TMPDIR:-/tmp}/gpu_search_${version}.${dataset_name}.${label}.XXXXXX.log")"
-        run_start_utc="$(date -u +%Y%m%dT%H%M%SZ)"
-        log_line "[run] start_utc=${run_start_utc}"
-
-        set +e
-        "${command[@]}" > "$run_output" 2>&1
-        status=$?
-        set -e
-
-        cat "$run_output" | tee -a "$current_log_file"
-        run_end_utc="$(date -u +%Y%m%dT%H%M%SZ)"
-        log_line "[run] end_utc=${run_end_utc}"
-        log_line "[run] exit_code=${status}"
-
-        if [[ $status -ne 0 ]]; then
-            rm -f "$run_output"
-            die "gpu_search_${version} failed for dataset=${dataset_name} label=${label}; see ${current_log_file}"
-        fi
-
-        search_seconds="$(extract_last_match_or_die "$run_output" 's/^\[([0-9.]+) s\] (.* )?GPU search time for [0-9]+ queries\.$/\1/p' 'search seconds')"
-        queries="$(extract_last_match_or_die "$run_output" 's/^\[[0-9.]+ s\] (.* )?GPU search time for ([0-9]+) queries\.$/\2/p' 'query count')"
-        end_to_end_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] End-to-end measured time: ([0-9.]+) ms$/\1/p' 'end-to-end time')"
-        qps="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Throughput: ([0-9.]+) qps$/\1/p' 'throughput')"
-        recall="$(extract_last_match_or_die "$run_output" 's/^Recall@[0-9]+: ([0-9.]+)$/\1/p' 'recall')"
-        avg_latency_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Average latency per query: ([0-9.]+) ms$/\1/p' 'average latency')"
-        p50_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Query latency distribution \(ms\): .*p50=([0-9.]+),.*$/\1/p' 'p50 latency')"
-        p90_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Query latency distribution \(ms\): .*p90=([0-9.]+),.*$/\1/p' 'p90 latency')"
-        p95_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Query latency distribution \(ms\): .*p95=([0-9.]+),.*$/\1/p' 'p95 latency')"
-        p99_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Query latency distribution \(ms\): .*p99=([0-9.]+),.*$/\1/p' 'p99 latency')"
-        max_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Query latency distribution \(ms\): .*max=([0-9.]+),.*$/\1/p' 'max latency')"
-        stddev_ms="$(extract_last_match_or_die "$run_output" 's/^\[SEARCH\] Query latency distribution \(ms\): .*stddev=([0-9.]+)$/\1/p' 'latency stddev')"
-
-        printf '%s\n' \
-            "${implementation_label},${dataset_name},${label},${nprobe},${k_rank_cluster},${k_rank_all_tokens},${itopk_size},${overlap_chunks},${index_source},${active_index_dir},${queries},${k},${warmup},${search_seconds},${end_to_end_ms},${qps},${recall},${avg_latency_ms},${p50_ms},${p90_ms},${p95_ms},${p99_ms},${max_ms},${stddev_ms}" \
-            >> "$results_csv"
-
-        log_line "[run] parsed_metrics label=${label} qps=${qps} recall=${recall} avg_latency_ms=${avg_latency_ms}"
+    if [[ $status -ne 0 ]]; then
         rm -f "$run_output"
-    done < <(tr -d '\r' < "$config_file")
+        die "gpu_search_${version} failed for dataset=${dataset_name}; see ${current_log_file}"
+    fi
+
+    parsed_rows="$(parse_batched_gpu_search_output "$run_output" "$dataset_name" "$active_index_dir" "$index_source")" || {
+        rm -f "$run_output"
+        die "failed to parse batched gpu_search_${version} output for dataset=${dataset_name}; see ${current_log_file}"
+    }
+    parsed_count="$(printf '%s\n' "$parsed_rows" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+    [[ "$parsed_count" == "$config_count" ]] || die "parsed ${parsed_count} result rows but expected ${config_count} configs for dataset=${dataset_name}"
+    printf '%s\n' "$parsed_rows" >> "$results_csv"
+
+    while IFS=, read -r _ _ parsed_label _ _ _ _ _ _ _ _ _ _ _ _ parsed_qps parsed_recall parsed_avg_latency_ms _; do
+        [[ -n "$parsed_label" ]] || continue
+        log_line "[run] parsed_metrics label=${parsed_label} qps=${parsed_qps} recall=${parsed_recall} avg_latency_ms=${parsed_avg_latency_ms}"
+    done <<< "$parsed_rows"
+
+    rm -f "$run_output"
 
     if [[ $dry_run -eq 0 ]]; then
         write_pareto_frontier "$results_csv" "$pareto_csv"
@@ -606,10 +733,10 @@ if [[ $dataset_set -eq 0 ]]; then
 fi
 
 case "$version" in
-    v0|v1|v2|v3)
+    v0|v1|v2|v3|v4)
         ;;
     *)
-        die "--version must be one of: v0, v1, v2, v3"
+        die "--version must be one of: v0, v1, v2, v3, v4"
         ;;
 esac
 

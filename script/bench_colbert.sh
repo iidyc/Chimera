@@ -440,7 +440,7 @@ benchmark_dataset() {
     active_root_path="$(dirname "$active_experiment_dir")"
     active_index_name="$(resolve_index_name "$dataset_name" "$source_experiment_dir")"
 
-    while IFS=, read -r raw_label raw_ncells raw_ndocs; do
+    while IFS=, read -r raw_label raw_ncells raw_ndocs || [[ -n "${raw_label}${raw_ncells}${raw_ndocs}" ]]; do
         local label=""
         local ncells=""
         local ndocs=""

@@ -15,7 +15,7 @@ void print_input_help(const char* program) {
         << "  --query <query_embeddings.bin>\n"
         << "  --doclens <doclens.bin>\n"
         << "  --gt <groundtruth.tsv>\n"
-        << "  --index <index_dir|quantized_data.bin>\n"
+        << "  --index <index_dir|doc_1bit.bin>\n"
         << "  --output <gather_recall.csv>\n"
         << "  [--k <top_k>]\n"
         << "  [--nq <num_queries_to_run>]\n"

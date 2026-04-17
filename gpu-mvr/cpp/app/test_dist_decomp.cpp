@@ -17,7 +17,7 @@ void print_input_help(const char* program) {
         << "  --data <embeddings.bin>\n"
         << "  --query <query_embeddings.bin>\n"
         << "  --doclens <doclens.bin>\n"
-        << "  --index <index_dir|quantized_data.bin>\n"
+        << "  --index <index_dir|doc_1bit.bin>\n"
         << "  --output <dist_decomp.csv>\n"
         << "  [--nq <num_queries_to_run>]\n"
         << "  [--nprobe <num_probes>]\n"

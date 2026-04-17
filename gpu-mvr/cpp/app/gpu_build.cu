@@ -1,5 +1,6 @@
 #include "arg_utils.hpp"
 #include "build_gpu_index.hpp"
+#include "gpu_index_layout.hpp"
 #include "io.hpp"
 
 #include <filesystem>
@@ -9,6 +10,25 @@
 
 namespace {
 
+void copy_doclens_into_index_dir(
+    const std::string& index_dir,
+    const std::string& doclens_filename)
+{
+    std::filesystem::create_directories(index_dir);
+    const auto dest_doclens_path = gpu_index_layout::doclens_path(index_dir);
+    const auto source_path = std::filesystem::path(doclens_filename);
+    const auto dest_path = std::filesystem::path(dest_doclens_path);
+    if (std::filesystem::exists(source_path) &&
+        std::filesystem::exists(dest_path) &&
+        std::filesystem::equivalent(source_path, dest_path)) {
+        return;
+    }
+    std::filesystem::copy_file(
+        source_path,
+        dest_path,
+        std::filesystem::copy_options::overwrite_existing);
+}
+
 void print_input_help(const char* program) {
     std::cout
         << "Usage: " << program
@@ -16,16 +36,18 @@ void print_input_help(const char* program) {
         << "Arguments:\n"
         << "  --index_dir   Output index directory.\n"
         << "                The builder writes three files into this directory:\n"
-        << "                ivf.bin, cpu_index.bin, centroids.carga, and gpu_index.bin.\n"
+        << "                ivf.bin, doc_1bit.bin, doc_4bit.bin, cluster_1bit.bin,\n"
+        << "                index_metadata.json, and centroids.carga.\n"
         << "  --doclens     Input doclens file.\n"
         << "                Each value is the length of one document, i.e. the number of\n"
         << "                token embeddings belonging to that document.\n"
         << "                This is required to recover document embeddings from token embeddings.\n"
+        << "                The file is copied into <index_dir>/doclens.bin.\n"
         << "  --data        Input token embedding file.\n"
         << "                This contains the token embeddings used to build the index.\n"
         << "  --source_index Existing split index directory to clone before generating\n"
-        << "                gpu_index.bin only.\n"
-        << "  --clustered_only Generate only gpu_index.bin from an existing index.\n"
+        << "                cluster_1bit.bin only.\n"
+        << "  --clustered_only Generate only cluster_1bit.bin from an existing index.\n"
         << "  --n_clusters  Number of randomly sampled centroids used to build the CAGRA graph.\n\n"
         << "Summary:\n"
         << "  Full build mode needs doclens, data, and n_clusters.\n"
@@ -94,6 +116,7 @@ int main(int argc, char* argv[]) {
     }
 
     auto doc_lens = load_doclens(doclens_filename);
+    copy_doclens_into_index_dir(index_dir, doclens_filename);
 
     if (clustered_only) {
         if (source_index_dir.empty()) {

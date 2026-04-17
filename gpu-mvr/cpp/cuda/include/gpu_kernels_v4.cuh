@@ -24,10 +24,10 @@ __global__ void stage1_binary_ip_kernel_v2(
 
 __global__ void stage2_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
-    const char*  __restrict__ d_clustered_code,
-    const float* __restrict__ d_clustered_factor,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const uint32_t* __restrict__ d_clustered_pos,
+    const size_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -74,7 +74,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
-    const uint32_t* __restrict__ d_inv_list,
+    const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     int*         d_ht_keys,
@@ -94,10 +94,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
 
 __global__ void stage2_binary_ip_lut_kernel(
     const float* __restrict__ d_lut,
-    const char*  __restrict__ d_clustered_code,
-    const float* __restrict__ d_clustered_factor,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const uint32_t* __restrict__ d_clustered_pos,
+    const size_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -131,12 +131,11 @@ __global__ void extract_one_bit_dists_kernel_v2(
     size_t k
 );
 
-__global__ void gather_clustered_positions_kernel(
+__global__ void gather_token_ids_kernel(
     const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
-    const uint32_t* __restrict__ d_token_to_cluster_pos,
     const size_t* __restrict__ d_candidate_offsets,
-    uint32_t*     d_out_clustered_pos,
+    size_t*       d_out_token_ids,
     size_t num_candidates
 );
 
@@ -151,7 +150,7 @@ __global__ void compute_query_expansion_sizes_kernel(
 
 __global__ void expand_cluster_ids_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const uint32_t*     __restrict__ d_inv_list,
+    const int*          __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
     size_t*             d_emb_ids,

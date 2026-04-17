@@ -307,34 +307,48 @@ class QuantizedOutputBuffer
             cur_batch * sizeof(float));
     }
 
-    void write_to_file(
-        const std::string& path,
+    void write_to_files(
+        const std::string& doc_1bit_path,
+        const std::string& doc_4bit_path,
         const mvr_index_file_format::Header& header,
         const Rotator<float>& rotator) const
     {
-        std::ofstream output(path, std::ios::binary | std::ios::trunc);
-        if (!output.is_open())
+        std::ofstream doc_1bit_output(doc_1bit_path, std::ios::binary | std::ios::trunc);
+        if (!doc_1bit_output.is_open())
         {
-            throw std::runtime_error("Failed to open quantized output file: " + path);
+            throw std::runtime_error("Failed to open quantized output file: " + doc_1bit_path);
+        }
+        std::ofstream doc_4bit_output(doc_4bit_path, std::ios::binary | std::ios::trunc);
+        if (!doc_4bit_output.is_open())
+        {
+            throw std::runtime_error("Failed to open quantized output file: " + doc_4bit_path);
         }
 
-        mvr_index_file_format::write_header(output, header, path);
-        mvr_index_file_format::save_rotator(output, rotator, path);
-        output.write(
+        mvr_index_file_format::write_header(doc_1bit_output, header, doc_1bit_path);
+        mvr_index_file_format::save_rotator(doc_1bit_output, rotator, doc_1bit_path);
+        mvr_index_file_format::write_header(doc_4bit_output, header, doc_4bit_path);
+        mvr_index_file_format::save_rotator(doc_4bit_output, rotator, doc_4bit_path);
+
+        doc_1bit_output.write(
             reinterpret_cast<const char*>(one_bit_code_.data()),
             static_cast<std::streamsize>(one_bit_code_.size() * sizeof(uint64_t)));
-        output.write(
-            reinterpret_cast<const char*>(full_code_.data()),
-            static_cast<std::streamsize>(full_code_.size()));
-        output.write(
+        doc_1bit_output.write(
             reinterpret_cast<const char*>(one_bit_factor_.data()),
             static_cast<std::streamsize>(one_bit_factor_.size() * sizeof(float)));
-        output.write(
+        doc_1bit_output.write(
             reinterpret_cast<const char*>(ex_factor_.data()),
             static_cast<std::streamsize>(ex_factor_.size() * sizeof(float)));
-        if (!output)
+
+        doc_4bit_output.write(
+            reinterpret_cast<const char*>(full_code_.data()),
+            static_cast<std::streamsize>(full_code_.size()));
+        if (!doc_1bit_output)
         {
-            throw std::runtime_error("Failed to write quantized output file: " + path);
+            throw std::runtime_error("Failed to write quantized output file: " + doc_1bit_path);
+        }
+        if (!doc_4bit_output)
+        {
+            throw std::runtime_error("Failed to write quantized output file: " + doc_4bit_path);
         }
     }
 
@@ -581,6 +595,98 @@ class ClusteredStage1Buffer
     size_t current_doc_id_ = 0;
     size_t current_doc_end_ = 0;
 };
+
+void write_index_metadata_json(
+    const std::string& path,
+    const mvr_index_file_format::Header& header)
+{
+    std::ofstream output(path, std::ios::trunc);
+    if (!output.is_open())
+    {
+        throw std::runtime_error("Failed to open metadata output file: " + path);
+    }
+
+    output
+        << "{\n"
+        << "  \"format\": \"gpu_mvr_split_index_v1\",\n"
+        << "  \"doc_1bit\": \"" << gpu_index_layout::kDoc1BitFilename << "\",\n"
+        << "  \"doc_4bit\": \"" << gpu_index_layout::kDoc4BitFilename << "\",\n"
+        << "  \"cluster_1bit\": \"" << gpu_index_layout::kCluster1BitFilename << "\",\n"
+        << "  \"ivf\": \"" << gpu_index_layout::kIvfFilename << "\",\n"
+        << "  \"centroids\": \"" << gpu_index_layout::kCentroidsFilename << "\",\n"
+        << "  \"n\": " << header.n << ",\n"
+        << "  \"d\": " << header.d << ",\n"
+        << "  \"n_clusters\": " << header.n_clusters << ",\n"
+        << "  \"ex_bits\": " << header.ex_bits << ",\n"
+        << "  \"padded_dim\": " << header.padded_dim << ",\n"
+        << "  \"rotator_type\": \"" << mvr_index_file_format::rotator_type_name(header.rotator_type) << "\"\n"
+        << "}\n";
+    if (!output)
+    {
+        throw std::runtime_error("Failed to write metadata output file: " + path);
+    }
+}
+
+void copy_stream_bytes(
+    std::ifstream& input,
+    std::ofstream& output,
+    size_t bytes,
+    const std::string& input_path,
+    const std::string& output_path)
+{
+    constexpr size_t kCopyBufferBytes = 8ULL * 1024ULL * 1024ULL;
+    std::vector<char> buffer(std::min(kCopyBufferBytes, std::max<size_t>(bytes, 1)));
+    size_t remaining = bytes;
+    while (remaining > 0)
+    {
+        const size_t cur_bytes = std::min(remaining, buffer.size());
+        input.read(buffer.data(), static_cast<std::streamsize>(cur_bytes));
+        if (!input)
+        {
+            throw std::runtime_error(
+                "Failed to read " + std::to_string(cur_bytes) + " bytes from " + input_path);
+        }
+        output.write(buffer.data(), static_cast<std::streamsize>(cur_bytes));
+        if (!output)
+        {
+            throw std::runtime_error(
+                "Failed to write " + std::to_string(cur_bytes) + " bytes to " + output_path);
+        }
+        remaining -= cur_bytes;
+    }
+}
+
+void copy_split_quantized_layout(
+    const gpu_index_layout::ResolvedPaths& source_paths,
+    const std::string& target_doc_1bit_path,
+    const std::string& target_doc_4bit_path,
+    const std::string& target_metadata_path)
+{
+    if (source_paths.doc_4bit_path.empty())
+    {
+        throw std::runtime_error(
+            "Missing doc_4bit.bin next to " + source_paths.quantized_data_path);
+    }
+
+    if (source_paths.quantized_data_path != target_doc_1bit_path)
+    {
+        std::filesystem::copy_file(
+            source_paths.quantized_data_path,
+            target_doc_1bit_path,
+            std::filesystem::copy_options::overwrite_existing);
+    }
+    if (source_paths.doc_4bit_path != target_doc_4bit_path)
+    {
+        std::filesystem::copy_file(
+            source_paths.doc_4bit_path,
+            target_doc_4bit_path,
+            std::filesystem::copy_options::overwrite_existing);
+    }
+
+    std::ifstream inf(target_doc_1bit_path, std::ios::binary);
+    const auto header = mvr_index_file_format::read_header(inf, target_doc_1bit_path);
+    write_index_metadata_json(target_metadata_path, header);
+}
 
 struct ProgressState
 {
@@ -888,15 +994,29 @@ void build_index(
     std::filesystem::create_directories(index_dir);
     std::error_code cleanup_ec;
     std::filesystem::remove(
-        gpu_index_layout::legacy_quantized_data_path(index_dir), cleanup_ec);
+        gpu_index_layout::doc_1bit_path(index_dir), cleanup_ec);
     cleanup_ec.clear();
     std::filesystem::remove(
-        gpu_index_layout::legacy_clustered_stage1_path(index_dir), cleanup_ec);
+        gpu_index_layout::doc_4bit_path(index_dir), cleanup_ec);
+    cleanup_ec.clear();
+    std::filesystem::remove(
+        gpu_index_layout::cluster_1bit_path(index_dir), cleanup_ec);
+    cleanup_ec.clear();
+    std::filesystem::remove(
+        gpu_index_layout::metadata_path(index_dir), cleanup_ec);
+    cleanup_ec.clear();
+    std::filesystem::remove(
+        gpu_index_layout::cpu_index_path(index_dir), cleanup_ec);
+    cleanup_ec.clear();
+    std::filesystem::remove(
+        gpu_index_layout::gpu_index_path(index_dir), cleanup_ec);
 
     const std::string ivf_path = gpu_index_layout::ivf_path(index_dir);
-    const std::string quantized_data_path = gpu_index_layout::cpu_index_path(index_dir);
+    const std::string doc_1bit_path = gpu_index_layout::doc_1bit_path(index_dir);
+    const std::string doc_4bit_path = gpu_index_layout::doc_4bit_path(index_dir);
     const std::string centroids_path = gpu_index_layout::centroids_path(index_dir);
-    const std::string clustered_stage1_path = gpu_index_layout::gpu_index_path(index_dir);
+    const std::string clustered_stage1_path = gpu_index_layout::cluster_1bit_path(index_dir);
+    const std::string metadata_path = gpu_index_layout::metadata_path(index_dir);
 
     std::vector<float> centroids;
 
@@ -980,7 +1100,7 @@ void build_index(
     header.rotator_type = kRotatorType;
 
     std::cout << "[build_index] Step 6: Saving quantized payload to "
-              << quantized_data_path << " ..." << std::endl;
+              << doc_1bit_path << " and " << doc_4bit_path << " ..." << std::endl;
 
     const auto step5_start = Clock::now();
     ProgressState step5_progress;
@@ -1073,10 +1193,12 @@ void build_index(
 
     const auto step5_end = Clock::now();
     const auto flush_start = Clock::now();
-    quantized_buffer.write_to_file(
-        quantized_data_path,
+    quantized_buffer.write_to_files(
+        doc_1bit_path,
+        doc_4bit_path,
         header,
         *rotator);
+    write_index_metadata_json(metadata_path, header);
     clustered_stage1_buffer.write_to_file(clustered_stage1_path);
     const auto flush_end = Clock::now();
 
@@ -1085,11 +1207,16 @@ void build_index(
               << ". Quantization complete." << std::endl;
     std::cout << "[build_index] Step 6 done in "
               << format_elapsed(elapsed_ms(flush_start, flush_end))
-              << ". Quantized payload saved to " << quantized_data_path
+              << ". Quantized payload saved to " << doc_1bit_path
+              << " and " << doc_4bit_path
               << "." << std::endl;
     std::cout << "[build_index] Step 6b done in "
               << format_elapsed(elapsed_ms(flush_start, flush_end))
               << ". Clustered stage-1 payload saved to " << clustered_stage1_path
+              << "." << std::endl;
+    std::cout << "[build_index] Step 6c done in "
+              << format_elapsed(elapsed_ms(flush_start, flush_end))
+              << ". Metadata saved to " << metadata_path
               << "." << std::endl;
     std::cout << "[build_index] Quantize pipeline total: "
               << format_elapsed(elapsed_ms(step5_start, step5_end)) << "." << std::endl;
@@ -1115,60 +1242,82 @@ void build_clustered_stage1_sidecar(
 
     const auto build_start = Clock::now();
     std::filesystem::create_directories(index_dir);
+    bool in_place_rebuild = false;
+    std::error_code equivalent_ec;
+    if (std::filesystem::exists(source_index_dir) &&
+        std::filesystem::exists(index_dir)) {
+        in_place_rebuild =
+            std::filesystem::equivalent(source_index_dir, index_dir, equivalent_ec);
+    }
     std::error_code cleanup_ec;
+    if (!in_place_rebuild) {
+        std::filesystem::remove(
+            gpu_index_layout::doc_1bit_path(index_dir), cleanup_ec);
+        cleanup_ec.clear();
+        std::filesystem::remove(
+            gpu_index_layout::doc_4bit_path(index_dir), cleanup_ec);
+        cleanup_ec.clear();
+        std::filesystem::remove(
+            gpu_index_layout::metadata_path(index_dir), cleanup_ec);
+        cleanup_ec.clear();
+        std::filesystem::remove(
+            gpu_index_layout::cpu_index_path(index_dir), cleanup_ec);
+    }
     std::filesystem::remove(
-        gpu_index_layout::legacy_quantized_data_path(index_dir), cleanup_ec);
+        gpu_index_layout::cluster_1bit_path(index_dir), cleanup_ec);
     cleanup_ec.clear();
     std::filesystem::remove(
-        gpu_index_layout::legacy_clustered_stage1_path(index_dir), cleanup_ec);
+        gpu_index_layout::gpu_index_path(index_dir), cleanup_ec);
 
-    const auto source_quantized_path =
-        gpu_index_layout::resolve_existing_cpu_index_path(source_index_dir);
+    const auto source_paths = gpu_index_layout::resolve_index_paths(source_index_dir);
     const auto source_ivf_path = gpu_index_layout::ivf_path(source_index_dir);
     const auto source_centroids_path = gpu_index_layout::centroids_path(source_index_dir);
 
-    const auto target_quantized_path = gpu_index_layout::cpu_index_path(index_dir);
+    const auto target_doc_1bit_path = gpu_index_layout::doc_1bit_path(index_dir);
+    const auto target_doc_4bit_path = gpu_index_layout::doc_4bit_path(index_dir);
     const auto target_ivf_path = gpu_index_layout::ivf_path(index_dir);
     const auto target_centroids_path = gpu_index_layout::centroids_path(index_dir);
-    const auto target_clustered_stage1_path = gpu_index_layout::gpu_index_path(index_dir);
+    const auto target_clustered_stage1_path = gpu_index_layout::cluster_1bit_path(index_dir);
+    const auto target_metadata_path = gpu_index_layout::metadata_path(index_dir);
 
     std::cout << "[build_index] Fast sidecar mode: cloning base index from "
               << source_index_dir << " to " << index_dir << std::endl;
 
     const auto copy_start = Clock::now();
-    std::filesystem::copy_file(
-        source_quantized_path,
-        target_quantized_path,
-        std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(
-        source_ivf_path,
-        target_ivf_path,
-        std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(
-        source_centroids_path,
-        target_centroids_path,
-        std::filesystem::copy_options::overwrite_existing);
+    copy_split_quantized_layout(
+        source_paths,
+        target_doc_1bit_path,
+        target_doc_4bit_path,
+        target_metadata_path);
+    if (source_ivf_path != target_ivf_path) {
+        std::filesystem::copy_file(
+            source_ivf_path,
+            target_ivf_path,
+            std::filesystem::copy_options::overwrite_existing);
+    }
+    if (source_centroids_path != target_centroids_path) {
+        std::filesystem::copy_file(
+            source_centroids_path,
+            target_centroids_path,
+            std::filesystem::copy_options::overwrite_existing);
+    }
     std::cout << "[build_index] Base index cloned in "
               << format_elapsed(elapsed_ms(copy_start, Clock::now())) << std::endl;
 
-    std::ifstream inf(target_quantized_path, std::ios::binary);
-    const auto header = mvr_index_file_format::read_header(inf, target_quantized_path);
+    std::ifstream inf(target_doc_1bit_path, std::ios::binary);
+    const auto header = mvr_index_file_format::read_header(inf, target_doc_1bit_path);
     const size_t n = header.n;
-    const size_t code_bytes_per_vector = PADDED_DIM / 8;
+    const size_t code_bytes_per_vector = mvr_index_file_format::one_bit_bytes_per_vector(header);
     if (header.padded_dim != PADDED_DIM) {
         throw std::runtime_error(
             "Index file padded_dim=" + std::to_string(header.padded_dim) +
             " does not match compiled PADDED_DIM=" + std::to_string(PADDED_DIM));
     }
 
-    auto* rotator = mvr_index_file_format::load_rotator(inf, header, target_quantized_path);
+    auto* rotator = mvr_index_file_format::load_rotator(inf, header, target_doc_1bit_path);
     delete rotator;
     rotator = nullptr;
     const auto prefix_bytes = static_cast<size_t>(inf.tellg());
-
-    const size_t one_bit_bytes = n * code_bytes_per_vector;
-    const size_t full_code_bytes = n * PADDED_DIM * (1 + header.ex_bits) / 8;
-    const size_t factor_offset = prefix_bytes + one_bit_bytes + full_code_bytes;
     inf.close();
 
     if (doc_lens.empty()) {
@@ -1197,13 +1346,14 @@ void build_clustered_stage1_sidecar(
         ivf.inv_list.size(),
         code_bytes_per_vector);
 
-    std::ifstream code_file(target_quantized_path, std::ios::binary);
-    std::ifstream factor_file(target_quantized_path, std::ios::binary);
+    std::ifstream code_file(target_doc_1bit_path, std::ios::binary);
+    std::ifstream factor_file(target_doc_1bit_path, std::ios::binary);
     code_file.seekg(static_cast<std::streamoff>(prefix_bytes));
-    factor_file.seekg(static_cast<std::streamoff>(factor_offset));
+    factor_file.seekg(static_cast<std::streamoff>(
+        prefix_bytes + mvr_index_file_format::one_bit_code_bytes(header)));
     if (!code_file || !factor_file) {
         throw std::runtime_error(
-            "Failed to position cpu index while generating gpu_index.bin");
+            "Failed to position doc_1bit.bin while generating cluster_1bit.bin");
     }
 
     const auto sidecar_start = Clock::now();
@@ -1239,7 +1389,7 @@ void build_clustered_stage1_sidecar(
     code_file.close();
     factor_file.close();
 
-    std::cout << "[build_index] gpu_index.bin generated in "
+    std::cout << "[build_index] cluster_1bit.bin generated in "
               << format_elapsed(elapsed_ms(sidecar_start, Clock::now())) << std::endl;
     std::cout << "[build_index][profile] Fast sidecar build total: "
               << format_elapsed(elapsed_ms(build_start, Clock::now())) << std::endl;

@@ -13,7 +13,8 @@
 // 2. Build a temporary non-rotated CAGRA graph for fast centroid assignment
 // 3. Build the persisted CAGRA graph on rotated centroids
 // 4. Assemble IVF_PG, quantize data, and serialize everything into `index_dir`
-//    as `ivf.bin`, `cpu_index.bin`, and `centroids.carga`
+//    as `ivf.bin`, `doc_1bit.bin`, `doc_4bit.bin`, `cluster_1bit.bin`,
+//    `index_metadata.json`, and `centroids.carga`
 //
 // ---------------------------------------------------------------------------
 void build_index(

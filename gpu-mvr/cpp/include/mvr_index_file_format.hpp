@@ -23,6 +23,66 @@ struct Header {
     rabitqlib::RotatorType rotator_type = rabitqlib::RotatorType::FhtKacRotator;
 };
 
+inline const char* rotator_type_name(rabitqlib::RotatorType rotator_type) {
+    switch (rotator_type) {
+        case rabitqlib::RotatorType::MatrixRotator:
+            return "MatrixRotator";
+        case rabitqlib::RotatorType::FhtKacRotator:
+            return "FhtKacRotator";
+        default:
+            return "Unknown";
+    }
+}
+
+inline size_t one_bit_bytes_per_vector(const Header& header) {
+    return header.padded_dim / 8;
+}
+
+inline size_t full_code_bytes_per_vector(const Header& header) {
+    return header.padded_dim * (1 + header.ex_bits) / 8;
+}
+
+inline size_t legacy_ex_code_bytes_per_vector(const Header& header) {
+    return header.padded_dim * header.ex_bits / 8;
+}
+
+inline size_t one_bit_code_bytes(const Header& header) {
+    return header.n * one_bit_bytes_per_vector(header);
+}
+
+inline size_t full_code_bytes(const Header& header) {
+    return header.n * full_code_bytes_per_vector(header);
+}
+
+inline size_t legacy_ex_code_bytes(const Header& header) {
+    return header.n * legacy_ex_code_bytes_per_vector(header);
+}
+
+inline size_t one_bit_factor_bytes(const Header& header) {
+    return header.n * sizeof(float);
+}
+
+inline size_t ex_factor_bytes(const Header& header) {
+    return header.n * sizeof(float);
+}
+
+inline size_t doc_1bit_payload_bytes(const Header& header) {
+    return one_bit_code_bytes(header) +
+           one_bit_factor_bytes(header) +
+           ex_factor_bytes(header);
+}
+
+inline size_t doc_4bit_payload_bytes(const Header& header) {
+    return full_code_bytes(header);
+}
+
+inline size_t combined_quantized_payload_bytes(const Header& header) {
+    return one_bit_code_bytes(header) +
+           full_code_bytes(header) +
+           one_bit_factor_bytes(header) +
+           ex_factor_bytes(header);
+}
+
 template <typename T>
 inline void write_value(
     std::ofstream& output,
@@ -98,6 +158,24 @@ inline Header read_header(std::ifstream& input, const std::string& filename) {
     header.rotator_type =
         read_value<rabitqlib::RotatorType>(input, "rotator_type", filename);
     return header;
+}
+
+inline void validate_matching_header(
+    const Header& expected,
+    const Header& actual,
+    const std::string& expected_filename,
+    const std::string& actual_filename)
+{
+    if (expected.n != actual.n ||
+        expected.d != actual.d ||
+        expected.n_clusters != actual.n_clusters ||
+        expected.ex_bits != actual.ex_bits ||
+        expected.padded_dim != actual.padded_dim ||
+        expected.rotator_type != actual.rotator_type) {
+        throw std::runtime_error(
+            "Quantized index metadata mismatch between " +
+            expected_filename + " and " + actual_filename);
+    }
 }
 
 inline void save_rotator(

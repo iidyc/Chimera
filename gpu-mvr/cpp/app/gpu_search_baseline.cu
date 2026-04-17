@@ -28,13 +28,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    gpu_mvr_index_baseline index(args.index_file, doclens, args.runtime);
-
+    const auto runtime_configs = load_gpu_search_runtime_configs(args);
+    const auto allocation_runtime = max_gpu_search_runtime_options(runtime_configs);
     const int warmup_queries = std::min<int>(args.warmup, static_cast<int>(num_q));
-    for (int i = 0; i < warmup_queries; ++i) {
-        index.search(&Q[i * Q_DOCLEN * d], args.k);
-    }
-
     const int remaining_queries = std::max<int>(0, static_cast<int>(num_q) - warmup_queries);
     const int run_queries =
         (args.nq < 0) ? remaining_queries : std::min<int>(args.nq, remaining_queries);
@@ -43,27 +39,42 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    Timer timer;
-    timer.tick();
-    std::vector<std::vector<size_t>> results(run_queries);
-    std::vector<double> query_latencies_ms;
-    query_latencies_ms.reserve(run_queries);
-    for (int i = 0; i < run_queries; ++i) {
-        const int query_idx = warmup_queries + i;
-        const auto query_start = std::chrono::high_resolution_clock::now();
-        results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], args.k);
-        const auto query_end = std::chrono::high_resolution_clock::now();
-        query_latencies_ms.push_back(
-            std::chrono::duration<double, std::milli>(query_end - query_start).count());
-    }
-    const double total_seconds =
-        timer.tuck("v0 GPU search time for " + std::to_string(run_queries) + " queries.");
-    print_query_latency_summary(query_latencies_ms, total_seconds);
-
     std::vector<std::vector<size_t>> eval_ground_truth(
         ground_truth.begin() + warmup_queries,
         ground_truth.begin() + warmup_queries + run_queries);
-    compute_recall(eval_ground_truth, results, args.k);
+
+    gpu_mvr_index_baseline index(args.index_file, doclens, allocation_runtime);
+
+    for (const auto& runtime_config : runtime_configs) {
+        print_gpu_search_runtime_config_banner(runtime_config);
+        index.nprobe = runtime_config.runtime.nprobe;
+        index.k_rank_cluster = runtime_config.runtime.k_rank_cluster;
+        index.k_rank_all_tokens = runtime_config.runtime.k_rank_all_tokens;
+        index.itopk_size = runtime_config.runtime.itopk_size;
+
+        for (int i = 0; i < warmup_queries; ++i) {
+            index.search(&Q[i * Q_DOCLEN * d], args.k);
+        }
+
+        Timer timer;
+        timer.tick();
+        std::vector<std::vector<size_t>> results(run_queries);
+        std::vector<double> query_latencies_ms;
+        query_latencies_ms.reserve(run_queries);
+        for (int i = 0; i < run_queries; ++i) {
+            const int query_idx = warmup_queries + i;
+            const auto query_start = std::chrono::high_resolution_clock::now();
+            results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], args.k);
+            const auto query_end = std::chrono::high_resolution_clock::now();
+            query_latencies_ms.push_back(
+                std::chrono::duration<double, std::milli>(query_end - query_start).count());
+        }
+        const double total_seconds = timer.tuck(
+            "label=" + runtime_config.label + " v0 GPU search time for " +
+            std::to_string(run_queries) + " queries.");
+        print_query_latency_summary(query_latencies_ms, total_seconds);
+        compute_recall(eval_ground_truth, results, args.k);
+    }
 
     return 0;
 }

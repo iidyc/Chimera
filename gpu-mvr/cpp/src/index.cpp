@@ -418,19 +418,72 @@ void cpu_mvr_index::load(const std::string& filename) {
     one_bit_factor_.resize(n);
     ex_factor_.resize(n);
     inf.read(one_bit_code_.data(), one_bit_code_.size());
-    inf.read(ex_code_.data(), ex_code_.size());
+    if (!inf) {
+        throw std::runtime_error(
+            "Failed to read one-bit codes from index file: " +
+            resolved_paths.quantized_data_path);
+    }
+
     inf.read((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
     inf.read((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
+    if (!inf) {
+        throw std::runtime_error(
+            "Failed to read scaling factors from index file: " +
+            resolved_paths.quantized_data_path);
+    }
     inf.close();
+
+    std::ifstream doc4(resolved_paths.doc_4bit_path, std::ios::binary);
+    const auto doc4_header =
+        mvr_index_file_format::read_header(doc4, resolved_paths.doc_4bit_path);
+    mvr_index_file_format::validate_matching_header(
+        header,
+        doc4_header,
+        resolved_paths.quantized_data_path,
+        resolved_paths.doc_4bit_path);
+    auto* doc4_rotator =
+        mvr_index_file_format::load_rotator(doc4, doc4_header, resolved_paths.doc_4bit_path);
+    delete doc4_rotator;
+
+    const size_t full_code_stride = padded_dim_ * (1 + ex_bits) / 8;
+    const size_t ex_code_stride = padded_dim_ * ex_bits / 8;
+    auto full_unpack = select_excode_unpackfunc(1 + ex_bits);
+    const uint8_t ex_mask = static_cast<uint8_t>((1u << ex_bits) - 1u);
+    const size_t batch_vectors = 8192;
+    std::vector<char> full_batch(batch_vectors * full_code_stride);
+    std::vector<float> unpacked(padded_dim_);
+    std::vector<uint8_t> raw_ex(padded_dim_);
+
+    for (size_t start = 0; start < n; start += batch_vectors) {
+        const size_t batch_count = std::min(batch_vectors, n - start);
+        const size_t batch_bytes = batch_count * full_code_stride;
+        doc4.read(full_batch.data(), batch_bytes);
+        if (!doc4) {
+            throw std::runtime_error(
+                "Failed to read doc_4bit payload from index file: " +
+                resolved_paths.doc_4bit_path);
+        }
+
+        for (size_t i = 0; i < batch_count; ++i) {
+            full_unpack(
+                reinterpret_cast<const uint8_t*>(full_batch.data() + i * full_code_stride),
+                unpacked.data(),
+                padded_dim_);
+            for (size_t dim_idx = 0; dim_idx < padded_dim_; ++dim_idx) {
+                raw_ex[dim_idx] = static_cast<uint8_t>(unpacked[dim_idx]) & ex_mask;
+            }
+            quant::rabitq_impl::ex_bits::packing_rabitqplus_code(
+                raw_ex.data(),
+                reinterpret_cast<uint8_t*>(ex_code_.data() + (start + i) * ex_code_stride),
+                padded_dim_,
+                ex_bits);
+        }
+    }
     if (ivf_type_ == IVFType::DocKMeans) {
         std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
         exit(0);
     } else {
         ivf = new IVF_PG(n_clusters, d);
-        if (resolved_paths.split_layout) {
-            ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
-        } else {
-            ivf->load(filename);
-        }
+        ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
     }
 }

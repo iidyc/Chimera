@@ -1,4 +1,4 @@
-#include "gpu_kernels_v3.cuh"
+#include "gpu_kernels_v4.cuh"
 
 #include <cfloat>
 
@@ -108,10 +108,10 @@ __global__ void stage1_binary_ip_kernel_v2(
 
 __global__ void stage2_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
-    const char*  __restrict__ d_clustered_code,
-    const float* __restrict__ d_clustered_factor,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const uint32_t* __restrict__ d_clustered_pos,
+    const size_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -132,11 +132,11 @@ __global__ void stage2_binary_ip_kernel_v2(
          tok_idx < batch_tokens;
          tok_idx += (size_t)blockDim.x * gridDim.x)
     {
-        const uint32_t clustered_pos = d_clustered_pos[tok_idx];
-        const float factor = d_clustered_factor[clustered_pos];
+        const size_t token_id = d_token_ids[tok_idx];
+        const float factor = d_one_bit_factor[token_id];
 
         const uint64_t* code_ptr =
-            (const uint64_t*)(d_clustered_code + static_cast<size_t>(clustered_pos) * CODE_BYTES);
+            (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
         uint64_t code_regs[NUM_U64];
         code_regs[0] = code_ptr[0];
         code_regs[1] = code_ptr[1];
@@ -365,7 +365,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
-    const uint32_t* __restrict__ d_inv_list,
+    const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     int*         d_ht_keys,
@@ -438,7 +438,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
         uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
 
         // inv_list indirection: map cluster position -> original vector ID
-        uint32_t orig_id = __ldg(&d_inv_list[emb_pos]);
+        uint32_t orig_id = (uint32_t)__ldg(&d_inv_list[emb_pos]);
 
         // __ldg() routes scattered reads through the read-only texture cache
         const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
@@ -494,10 +494,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
 
 __global__ void stage2_binary_ip_lut_kernel(
     const float* __restrict__ d_lut,
-    const char*  __restrict__ d_clustered_code,
-    const float* __restrict__ d_clustered_factor,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const uint32_t* __restrict__ d_clustered_pos,
+    const size_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -515,16 +515,16 @@ __global__ void stage2_binary_ip_lut_kernel(
         size_t tok_idx = tok_batch_start + threadIdx.x;
         bool valid = tok_idx < batch_tokens;
 
-        uint32_t clustered_pos = 0;
+        size_t token_id = 0;
         float factor = 0.0f;
         int nibbles[NUM_CHUNKS];
 
         if (valid) {
-            clustered_pos = d_clustered_pos[tok_idx];
-            factor = d_clustered_factor[clustered_pos];
+            token_id = d_token_ids[tok_idx];
+            factor = d_one_bit_factor[token_id];
 
             const uint64_t* code_ptr =
-                (const uint64_t*)(d_clustered_code + static_cast<size_t>(clustered_pos) * CODE_BYTES);
+                (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
             uint64_t code_regs[NUM_U64];
             code_regs[0] = code_ptr[0];
             code_regs[1] = code_ptr[1];
@@ -703,12 +703,11 @@ __global__ void extract_one_bit_dists_kernel_v2(
     }
 }
 
-__global__ void gather_clustered_positions_kernel(
+__global__ void gather_token_ids_kernel(
     const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
-    const uint32_t* __restrict__ d_token_to_cluster_pos,
     const size_t* __restrict__ d_candidate_offsets,
-    uint32_t*     d_out_clustered_pos,
+    size_t*       d_out_token_ids,
     size_t num_candidates
 ) {
     size_t cand_idx = blockIdx.x;
@@ -720,8 +719,7 @@ __global__ void gather_clustered_positions_kernel(
     size_t out_offset = d_candidate_offsets[cand_idx];
 
     for (int t = threadIdx.x; t < (doc_end - doc_start); t += blockDim.x) {
-        const size_t token_id = static_cast<size_t>(doc_start + t);
-        d_out_clustered_pos[out_offset + t] = d_token_to_cluster_pos[token_id];
+        d_out_token_ids[out_offset + t] = doc_start + t;
     }
 }
 
@@ -750,7 +748,7 @@ __global__ void compute_query_expansion_sizes_kernel(
 
 __global__ void expand_cluster_ids_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const uint32_t*     __restrict__ d_inv_list,
+    const int*          __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
     size_t*             d_emb_ids,

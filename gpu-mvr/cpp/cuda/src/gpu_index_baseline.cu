@@ -41,20 +41,40 @@ gpu_mvr_index_baseline::gpu_mvr_index_baseline(
     ex_factor_.resize(n);
 
     inf.read(one_bit_code_.data(), one_bit_code_.size());
-    inf.read(full_code_.data(), full_code_.size());
     inf.read((char*)one_bit_factor_.data(), n * sizeof(float));
     inf.read((char*)ex_factor_.data(), n * sizeof(float));
+    if (!inf) {
+        throw std::runtime_error(
+            "Failed to read doc_1bit payload from index file: " +
+            resolved_paths.quantized_data_path
+        );
+    }
     inf.close();
+
+    std::ifstream doc4(resolved_paths.doc_4bit_path, std::ios::binary);
+    const auto doc4_header =
+        mvr_index_file_format::read_header(doc4, resolved_paths.doc_4bit_path);
+    mvr_index_file_format::validate_matching_header(
+        header,
+        doc4_header,
+        resolved_paths.quantized_data_path,
+        resolved_paths.doc_4bit_path);
+    auto* doc4_rotator =
+        mvr_index_file_format::load_rotator(doc4, doc4_header, resolved_paths.doc_4bit_path);
+    delete doc4_rotator;
+    doc4.read(full_code_.data(), full_code_.size());
+    if (!doc4) {
+        throw std::runtime_error(
+            "Failed to read doc_4bit payload from index file: " +
+            resolved_paths.doc_4bit_path
+        );
+    }
 
     ip_func_ = select_excode_ipfunc(1 + ex_bits);
     unpack_func_ = select_excode_unpackfunc(1 + ex_bits);
 
     ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
-    if (resolved_paths.split_layout) {
-        ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
-    } else {
-        ivf->load(filename);
-    }
+    ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
     max_cluster_size = ivf->max_cluster_size();
 
     set_doc_mapping(doc_lens);

@@ -41,7 +41,7 @@
 #include "query.hpp"
 #include "ivf_pg.hpp"
 #include "gpu_config.cuh"
-#include "gpu_kernels_v3.cuh"
+#include "gpu_kernels_v4.cuh"
 
 using namespace rabitqlib;
 
@@ -79,39 +79,42 @@ struct cast_int_size_t {
 
 struct gpu_mvr_index {
     // Scalar metadata
-    size_t n = 0;
-    size_t d = 0;
-    size_t n_clusters = 0;
-    size_t ex_bits = 0;
-    size_t num_docs = 0;
+    size_t n;
+    size_t d;
+    size_t n_clusters;
+    size_t ex_bits;
+    size_t num_docs;
 
     int max_doc_len = 0;
     int max_cluster_size = 0;
 
     // CPU-side data
-    Rotator<float>* rotator_ = nullptr;
-    IVF_PG* ivf = nullptr;
+    Rotator<float>* rotator_;
+    IVF_PG* ivf;
+    std::vector<char> one_bit_code_;
     std::vector<char> full_code_;
+    std::vector<float> one_bit_factor_;
     std::vector<float> ex_factor_;
+    std::vector<int> doc_ids_;
     std::vector<int> doc_ptrs_;
     float (*ip_func_)(const float*, const uint8_t*, size_t);
     void (*unpack_func_)(const uint8_t*, float*, size_t);
 
     // GPU persistent data
-    int*   d_doc_ptrs_ = nullptr;
-    uint32_t* d_inv_list_ = nullptr;
-    size_t* d_cluster_pos_ = nullptr;
+    char*  d_one_bit_code_;
+    float* d_one_bit_factor_;
+    int*   d_doc_ids_;
+    int*   d_doc_ptrs_;
+    int*   d_inv_list_;
+    size_t* d_cluster_pos_;
 
     // Cluster-ordered copies: data reordered by inv_list so that vectors
     // in the same cluster are contiguous in memory. Stage-1 reads these
     // instead of the original arrays for coalesced global memory access.
-    // token_to_cluster_pos maps original token ids to the cluster-ordered
-    // position so stage-2 can also address the clustered layout directly.
-    char*  d_clustered_code_ = nullptr;
-    float* d_clustered_factor_ = nullptr;
-    int*   d_clustered_doc_ids_ = nullptr;
-    uint32_t* d_token_to_cluster_pos_ = nullptr;
-    bool   use_clustered_ = true;
+    char*  d_clustered_code_;
+    float* d_clustered_factor_;
+    int*   d_clustered_doc_ids_;
+    bool   use_clustered_ = true;  // false = fallback to non-clustered + inv_list indirection
 
     // Search parameters
     int nprobe = 128;
@@ -188,7 +191,7 @@ struct gpu_mvr_index {
         int    max_embs_per_query_bound;
 
         size_t* d_pst_candidate_offsets;
-        uint32_t* d_pst_clustered_pos;
+        size_t* d_pst_token_ids;
 
         float*        h_mapped_doc_scores;
 
@@ -298,6 +301,8 @@ struct gpu_mvr_index {
         size_t nprobe, size_t k,
         int& actual_k_out,
         cudaStream_t stream = 0);
+
+    static constexpr int N_OVERLAP_CHUNKS = 64;
 
     void rank_stage23_persistent(
         int num_candidates,

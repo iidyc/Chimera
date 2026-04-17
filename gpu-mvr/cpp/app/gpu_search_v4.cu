@@ -1,12 +1,12 @@
 #include "gpu_search_cli.hpp"
-#include "gpu_index_v2.cuh"
+#include "gpu_index_v4.cuh"
 #include "io.hpp"
 #include "startup_profile.hpp"
 #include "utils.hpp"
 
 int main(int argc, char** argv) {
     gpu_search_cli_args args;
-    args.runtime.k_rank_cluster = 1800;
+    args.runtime.k_rank_cluster = 3000;
 
     try {
         args = parse_gpu_search_args(argc, argv, args);
@@ -25,12 +25,13 @@ int main(int argc, char** argv) {
     startup.mark("load_query");
     std::vector<int> doclens = load_doclens(args.doclens_file);
     startup.mark("load_doclens");
-    auto ground_truth = read_gt_tsv(static_cast<int>(num_q), 1000, args.gt_file);
+    auto ground_truth = read_gt_tsv(num_q, 1000, args.gt_file);
     startup.mark("read_gt_tsv");
 
     if (q_doclen_file != Q_DOCLEN) {
         std::cerr << "ERROR: Query file q_doclen=" << q_doclen_file
                   << " does not match compiled Q_DOCLEN=" << Q_DOCLEN << std::endl;
+        std::cerr << "Please recompile with matching Q_DOCLEN in gpu_config.cuh" << std::endl;
         return 1;
     }
 
