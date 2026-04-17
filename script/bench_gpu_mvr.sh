@@ -21,7 +21,7 @@ Description:
     profiling/<dataset>/<implementation>/pareto_frontier.csv
     log/bench/<implementation>/<dataset>/benchmark.log
 
-  Optional /tmp staging can copy dataset/<name>/gpu_mvr_index into local
+  Optional /tmp staging can copy dataset/<name>/gpu_mvr into local
   storage first and reuse the copy across subsequent runs.
 
 Options:
@@ -38,7 +38,7 @@ Options:
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
   --nq <count>             Evaluation queries after warmup. Default: -1
   --warmup <count>         Warmup query count. Default: 5
-  --copy-index-to-tmp      Copy gpu_mvr_index into /tmp before benchmarking.
+  --copy-index-to-tmp      Copy gpu_mvr into /tmp before benchmarking.
   --refresh-tmp-index      Re-copy the /tmp index even if it already exists.
   --tmp-root <path>        Root directory for /tmp index copies.
                            Default: /tmp/$USER/gpu_mvr_benchmark
@@ -363,7 +363,9 @@ parse_batched_gpu_search_output() {
 copy_index_to_tmp_if_needed() {
     local dataset_name="$1"
     local source_index_dir="$2"
-    local dest_index_dir="${tmp_root}/${dataset_name}/gpu_mvr_index"
+    local source_index_name
+    source_index_name="$(basename "$source_index_dir")"
+    local dest_index_dir="${tmp_root}/${dataset_name}/${source_index_name}"
 
     if [[ $copy_index_to_tmp -eq 0 ]]; then
         printf '%s' "$source_index_dir"
@@ -482,7 +484,7 @@ benchmark_dataset() {
 
     local dataset_dir="${repo_root}/dataset/${dataset_name}"
     local raw_dir="${dataset_dir}/raw"
-    local source_index_dir="${dataset_dir}/gpu_mvr_index"
+    local source_index_dir="${dataset_dir}/gpu_mvr"
     local query_file="${raw_dir}/query.bin"
     local index_doclens_file="${source_index_dir}/doclens.bin"
     local gt_file="${raw_dir}/gt.tsv"
@@ -505,7 +507,12 @@ benchmark_dataset() {
     [[ -d "$dataset_dir" ]] || die "dataset directory not found: ${dataset_dir}"
     [[ -f "$query_file" ]] || die "missing query file: ${query_file}"
     [[ -f "$gt_file" ]] || die "missing ground truth file: ${gt_file}"
-    [[ -d "$source_index_dir" ]] || die "missing index directory: ${source_index_dir}"
+    if [[ ! -d "$source_index_dir" ]]; then
+        source_index_dir="${dataset_dir}/gpu_mvr_index"
+        index_doclens_file="${source_index_dir}/doclens.bin"
+    fi
+
+    [[ -d "$source_index_dir" ]] || die "missing index directory: ${dataset_dir}/gpu_mvr (or legacy gpu_mvr_index)"
     [[ -f "$index_doclens_file" ]] || die "missing index doclens file: ${index_doclens_file}"
 
     current_log_file="$log_file"

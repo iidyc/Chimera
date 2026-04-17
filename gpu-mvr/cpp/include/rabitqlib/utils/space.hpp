@@ -1031,11 +1031,9 @@ inline size_t popcount(const uint64_t* __restrict__ d, size_t length) {
     return ret;
 }
 
-template <typename T>
-RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
+template <typename T, class Generator>
+RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols, Generator& gen) {
     RowMajorMatrix<T> rand(rows, cols);
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
     std::normal_distribution<T> dist(0, 1);
 
     for (size_t i = 0; i < rows; ++i) {
@@ -1045,5 +1043,12 @@ RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
     }
 
     return rand;
+}
+
+template <typename T>
+RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    return random_gaussian_matrix<T>(rows, cols, gen);
 }
 }  // namespace rabitqlib

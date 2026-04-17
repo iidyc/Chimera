@@ -66,6 +66,29 @@ inline size_t ex_factor_bytes(const Header& header) {
     return header.n * sizeof(float);
 }
 
+inline size_t header_bytes() {
+    return sizeof(kMagic) +
+           sizeof(std::uint32_t) +
+           5 * sizeof(size_t) +
+           sizeof(rabitqlib::RotatorType);
+}
+
+inline size_t rotator_bytes(const Header& header) {
+    switch (header.rotator_type) {
+        case rabitqlib::RotatorType::MatrixRotator:
+            return header.d * header.padded_dim * sizeof(float);
+        case rabitqlib::RotatorType::FhtKacRotator:
+            return header.padded_dim / 2;
+        default:
+            throw std::runtime_error(
+                "Unsupported rotator type while computing serialized size");
+    }
+}
+
+inline size_t prefix_bytes(const Header& header) {
+    return header_bytes() + rotator_bytes(header);
+}
+
 inline size_t doc_1bit_payload_bytes(const Header& header) {
     return one_bit_code_bytes(header) +
            one_bit_factor_bytes(header) +

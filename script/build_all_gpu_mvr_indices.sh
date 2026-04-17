@@ -13,8 +13,8 @@ Description:
     hotpot
     msmarco
 
-  This is a thin wrapper around script/build_gpu_mvr_index.sh and keeps the
-  per-dataset output locations and log files unchanged.
+  This is a thin wrapper around script/build_gpu_mvr_index.sh and writes the
+  default per-dataset output under dataset/<name>/gpu_mvr/.
 
 Arguments:
   --n-clusters <count> Number of IVF/CAGRA centroids to pass through.

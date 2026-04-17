@@ -9,16 +9,18 @@ Usage:
   script/build_gpu_mvr_index.sh --dataset <name> [options]
 
 Description:
-  Build a GPU-MVR index from raw dataset files using gpu-mvr/build/gpu_build.
+  Build a GPU-MVR index from raw dataset files using gpu-mvr/build/gpu_build_fast.
+  By default the builder is executed via micromamba in the gpu-mvr env when
+  micromamba is available.
 
 Expected dataset layout:
   dataset/<name>/raw/data.bin
   dataset/<name>/raw/doclens.bin
 
 Outputs:
-  dataset/<name>/gpu_mvr_index/
-  log/build/<dataset>_gpu_build.log
-  log/build/<dataset>_gpu_build.timings.log
+  dataset/<name>/gpu_mvr/
+  log/build/<dataset>_gpu_build_fast.log
+  log/build/<dataset>_gpu_build_fast.timings.log
 
 Arguments:
   dataset_name           Dataset name under dataset/. Defaults to hotpot.
@@ -107,12 +109,14 @@ esac
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-gpu_build_bin="${repo_root}/gpu-mvr/build/gpu_build"
+gpu_build_bin="${repo_root}/gpu-mvr/build/gpu_build_fast"
+micromamba_bin="$(command -v micromamba || true)"
+builder_env_name="${GPU_MVR_MICROMAMBA_ENV:-gpu-mvr}"
 dataset_dir="${repo_root}/dataset/${dataset_name}"
 raw_dir="${dataset_dir}/raw"
 data_file="${raw_dir}/data.bin"
 doclens_file="${raw_dir}/doclens.bin"
-index_dir="${dataset_dir}/gpu_mvr_index"
+index_dir="${dataset_dir}/gpu_mvr"
 log_dir="${repo_root}/log/build"
 
 [[ -x "$gpu_build_bin" ]] || die "gpu_build binary not found or not executable: ${gpu_build_bin}"
@@ -123,8 +127,8 @@ log_dir="${repo_root}/log/build"
 mkdir -p "$index_dir" "$log_dir"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-full_log="${log_dir}/${dataset_name}_gpu_build.log"
-timing_log="${log_dir}/${dataset_name}_gpu_build.timings.log"
+full_log="${log_dir}/${dataset_name}_gpu_build_fast.log"
+timing_log="${log_dir}/${dataset_name}_gpu_build_fast.timings.log"
 
 if [[ $dry_run -eq 0 ]]; then
     : > "$full_log"
@@ -137,6 +141,15 @@ build_cmd=(
     --data "$data_file"
     --n_clusters "$n_clusters"
 )
+
+if [[ -n "$micromamba_bin" ]]; then
+    build_cmd=(
+        "$micromamba_bin"
+        run
+        -n "$builder_env_name"
+        "${build_cmd[@]}"
+    )
+fi
 
 log_capture_safe_line() {
     local line="$1"
@@ -231,6 +244,8 @@ print_run_plan() {
     cat <<EOF
 [driver] repo_root=${repo_root}
 [driver] dataset=${dataset_name}
+[driver] micromamba_bin=${micromamba_bin:-<not-found>}
+[driver] builder_env_name=${builder_env_name}
 [driver] raw_dir=${raw_dir}
 [driver] active_raw_dir=${active_raw_dir}
 [driver] raw_source=${raw_source}
@@ -252,8 +267,92 @@ extract_timing_summary() {
     local source_log="$1"
     {
         echo "[driver] extracted_timing_summary_from=${source_log}"
-        grep -E '^\[build_index\] Step [0-9]+(b)? done in |^\[build_index\] Quantize pipeline total: |^\[build_index\]\[profile\] ' "$source_log" || true
+        grep -E '^\[(build_index|build_fast)\] Step [0-9]+(b)? done in |^\[build_index\] Quantize pipeline total: |^\[(build_index|build_fast)\]\[profile\] ' "$source_log" || true
     } > "$timing_log"
+}
+
+file_size_bytes() {
+    stat -c '%s' "$1"
+}
+
+tmp_raw_file_matches() {
+    local source_file="$1"
+    local dest_file="$2"
+
+    [[ -f "$dest_file" ]] || return 1
+    [[ "$(file_size_bytes "$source_file")" == "$(file_size_bytes "$dest_file")" ]]
+}
+
+tmp_raw_required_bytes() {
+    local source_file="$1"
+    local dest_file="$2"
+    local source_size
+    local dest_size=0
+
+    source_size="$(file_size_bytes "$source_file")"
+    if [[ -f "$dest_file" ]]; then
+        dest_size="$(file_size_bytes "$dest_file")"
+    fi
+
+    if (( dest_size == source_size )); then
+        echo 0
+    elif (( dest_size > 0 && dest_size < source_size )); then
+        echo $((source_size - dest_size))
+    else
+        echo "$source_size"
+    fi
+}
+
+sync_tmp_raw_file() {
+    local source_file="$1"
+    local dest_file="$2"
+    local label="$3"
+    local source_size
+    local dest_size=0
+    local rsync_cmd=(
+        rsync
+        --inplace
+        --partial
+        --no-times
+    )
+
+    source_size="$(file_size_bytes "$source_file")"
+    if [[ -f "$dest_file" ]]; then
+        dest_size="$(file_size_bytes "$dest_file")"
+    fi
+
+    if (( dest_size == source_size )); then
+        log_capture_safe_line "[driver] reusing_tmp_${label}=${dest_file}"
+        return
+    fi
+
+    if (( dest_size > 0 && dest_size < source_size )); then
+        rsync_cmd+=(--append-verify)
+        log_capture_safe_line \
+            "[driver] resuming_tmp_${label}=${dest_file} bytes_present=${dest_size}/${source_size}"
+    else
+        if (( dest_size > source_size )); then
+            log_capture_safe_line \
+                "[driver] replacing_tmp_${label}=${dest_file} bytes_present=${dest_size}/${source_size}"
+            rm -f "$dest_file"
+        else
+            log_capture_safe_line "[driver] copying_tmp_${label}=${dest_file}"
+        fi
+    fi
+
+    rsync_cmd+=("$source_file" "$dest_file")
+
+    if [[ $dry_run -eq 1 ]]; then
+        echo "+ $(printf '%q ' "${rsync_cmd[@]}")" >&2
+        return
+    fi
+
+    echo "+ $(printf '%q ' "${rsync_cmd[@]}")" | tee -a "$full_log" >&2
+    "${rsync_cmd[@]}"
+
+    if ! tmp_raw_file_matches "$source_file" "$dest_file"; then
+        die "tmp ${label} copy incomplete after rsync: ${dest_file}"
+    fi
 }
 
 stage_raw_to_tmp_if_needed() {
@@ -269,8 +368,9 @@ stage_raw_to_tmp_if_needed() {
         return
     fi
 
-    if [[ -d "$dest_raw_dir" && $refresh_tmp_raw -eq 0 \
-        && -f "$dest_data_file" && -f "$dest_doclens_file" ]]; then
+    if [[ $refresh_tmp_raw -eq 0 ]] \
+        && tmp_raw_file_matches "$source_data_file" "$dest_data_file" \
+        && tmp_raw_file_matches "$source_doclens_file" "$dest_doclens_file"; then
         log_capture_safe_line "[driver] reusing_tmp_raw=${dest_raw_dir}"
         printf '%s\n%s\n%s\n' "$dest_raw_dir" "$dest_data_file" "$dest_doclens_file"
         return
@@ -280,10 +380,12 @@ stage_raw_to_tmp_if_needed() {
     log_capture_safe_line "[driver] tmp_raw_target=${dest_raw_dir}"
 
     if [[ $dry_run -eq 1 ]]; then
-        echo "+ rm -rf ${dest_raw_dir}" >&2
+        if [[ $refresh_tmp_raw -eq 1 ]]; then
+            echo "+ rm -rf ${dest_raw_dir}" >&2
+        fi
         echo "+ mkdir -p ${dest_raw_dir}" >&2
-        echo "+ cp -a ${source_data_file} ${dest_data_file}" >&2
-        echo "+ cp -a ${source_doclens_file} ${dest_doclens_file}" >&2
+        sync_tmp_raw_file "$source_data_file" "$dest_data_file" "data_file"
+        sync_tmp_raw_file "$source_doclens_file" "$dest_doclens_file" "doclens_file"
         printf '%s\n%s\n%s\n' "$dest_raw_dir" "$dest_data_file" "$dest_doclens_file"
         return
     fi
@@ -292,11 +394,19 @@ stage_raw_to_tmp_if_needed() {
     parent_dir="$(dirname "$dest_raw_dir")"
     mkdir -p "$parent_dir"
 
-    local source_size_bytes
+    local required_bytes
     local available_bytes
-    source_size_bytes="$(( $(stat -c '%s' "$source_data_file") + $(stat -c '%s' "$source_doclens_file") ))"
+    required_bytes=0
+    if [[ $refresh_tmp_raw -eq 1 ]]; then
+        required_bytes="$(( $(file_size_bytes "$source_data_file") + $(file_size_bytes "$source_doclens_file") ))"
+    else
+        required_bytes="$(( \
+            $(tmp_raw_required_bytes "$source_data_file" "$dest_data_file") + \
+            $(tmp_raw_required_bytes "$source_doclens_file" "$dest_doclens_file") \
+        ))"
+    fi
     available_bytes="$(df -B1 "$parent_dir" | awk 'NR==2 {print $4}')"
-    if (( available_bytes < source_size_bytes )); then
+    if (( available_bytes < required_bytes )); then
         die "not enough free space under ${parent_dir} to copy raw files"
     fi
 
@@ -308,14 +418,14 @@ stage_raw_to_tmp_if_needed() {
     copy_start_s="$(date +%s)"
     log_capture_safe_line "[driver] tmp_copy_start_utc=${copy_start_utc}"
 
-    echo "+ $(printf '%q ' rm -rf "$dest_raw_dir")" | tee -a "$full_log" >&2
-    rm -rf "$dest_raw_dir"
+    if [[ $refresh_tmp_raw -eq 1 ]]; then
+        echo "+ $(printf '%q ' rm -rf "$dest_raw_dir")" | tee -a "$full_log" >&2
+        rm -rf "$dest_raw_dir"
+    fi
     echo "+ $(printf '%q ' mkdir -p "$dest_raw_dir")" | tee -a "$full_log" >&2
     mkdir -p "$dest_raw_dir"
-    echo "+ $(printf '%q ' cp -a "$source_data_file" "$dest_data_file")" | tee -a "$full_log" >&2
-    cp -a "$source_data_file" "$dest_data_file"
-    echo "+ $(printf '%q ' cp -a "$source_doclens_file" "$dest_doclens_file")" | tee -a "$full_log" >&2
-    cp -a "$source_doclens_file" "$dest_doclens_file"
+    sync_tmp_raw_file "$source_data_file" "$dest_data_file" "data_file"
+    sync_tmp_raw_file "$source_doclens_file" "$dest_doclens_file" "doclens_file"
 
     copy_end_utc="$(date -u +%Y%m%dT%H%M%SZ)"
     copy_end_s="$(date +%s)"
@@ -350,6 +460,15 @@ build_cmd=(
     --data "$data_file"
     --n_clusters "$n_clusters"
 )
+
+if [[ -n "$micromamba_bin" ]]; then
+    build_cmd=(
+        "$micromamba_bin"
+        run
+        -n "$builder_env_name"
+        "${build_cmd[@]}"
+    )
+fi
 
 if [[ $dry_run -eq 1 ]]; then
     print_run_plan

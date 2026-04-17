@@ -202,6 +202,20 @@ target_include_directories(gpu_build PRIVATE
 set_target_properties(gpu_build PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(gpu_build PRIVATE gpu_mvr_core)
 
+add_executable(gpu_build_fast
+    cpp/app/gpu_build_fast.cpp
+    cpp/cuda/src/build_gpu_index_fast.cu
+)
+target_include_directories(gpu_build_fast PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_source_files_properties(
+    cpp/cuda/src/build_gpu_index_fast.cu
+    PROPERTIES LANGUAGE CXX
+)
+target_link_libraries(gpu_build_fast PRIVATE gpu_mvr_core)
+
 add_executable(gpu_search_v0
     cpp/app/gpu_search_baseline.cu
     cpp/cuda/src/gpu_index_baseline.cu

@@ -180,13 +180,27 @@ gpu_mvr_index::gpu_mvr_index(
             const auto clustered_header =
                 clustered_stage1_file_format::read_header(
                     clustered_header_file, resolved_paths.gpu_index_path);
-            clustered_header_file.close();
             if (clustered_header.n_entries != inv_n ||
                 clustered_header.code_bytes_per_vector != code_per_vec) {
                 throw std::runtime_error(
                     "GPU index metadata mismatch for " +
                     resolved_paths.gpu_index_path);
             }
+            if (clustered_stage1_file_format::has_embedded_rotator(clustered_header)) {
+                if (clustered_header.source_dim != header.d ||
+                    clustered_header.padded_dim != header.padded_dim ||
+                    clustered_header.rotator_type != header.rotator_type) {
+                    throw std::runtime_error(
+                        "cluster_1bit rotator metadata mismatch for " +
+                        resolved_paths.gpu_index_path);
+                }
+                auto* clustered_rotator = clustered_stage1_file_format::load_rotator(
+                    clustered_header_file,
+                    clustered_header,
+                    resolved_paths.gpu_index_path);
+                delete clustered_rotator;
+            }
+            clustered_header_file.close();
 
             struct stat clustered_stat {};
             const int clustered_fd = open(resolved_paths.gpu_index_path.c_str(), O_RDONLY);
@@ -204,7 +218,7 @@ gpu_mvr_index::gpu_mvr_index(
 
             const size_t mapping_size = static_cast<size_t>(clustered_stat.st_size);
             const size_t expected_size =
-                clustered_stage1_file_format::header_bytes() +
+                clustered_stage1_file_format::prefix_bytes(clustered_header) +
                 inv_n * code_per_vec +
                 inv_n * sizeof(float) +
                 inv_n * sizeof(int) +
@@ -227,8 +241,10 @@ gpu_mvr_index::gpu_mvr_index(
             }
 
             const auto* clustered_base = static_cast<const char*>(clustered_mapping);
+            const size_t clustered_prefix_bytes =
+                clustered_stage1_file_format::prefix_bytes(clustered_header);
             const auto* clustered_code =
-                clustered_base + clustered_stage1_file_format::header_bytes();
+                clustered_base + clustered_prefix_bytes;
             const auto* clustered_factor = reinterpret_cast<const float*>(
                 clustered_code + inv_n * code_per_vec);
             const auto* clustered_doc_ids = reinterpret_cast<const int*>(

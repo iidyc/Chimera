@@ -24,6 +24,8 @@ class Rotator {
    protected:
     size_t dim_;
     size_t padded_dim_;
+    bool has_seed_ = false;
+    uint64_t seed_ = 0;
 
    public:
     explicit Rotator() = default;
@@ -33,9 +35,21 @@ class Rotator {
     virtual void load(std::ifstream&) = 0;
     virtual void save(std::ofstream&) const = 0;
     [[nodiscard]] size_t size() const { return this->padded_dim_; }
+    [[nodiscard]] size_t dim() const { return this->dim_; }
+    [[nodiscard]] size_t padded_dim() const { return this->padded_dim_; }
+    [[nodiscard]] bool has_seed() const { return this->has_seed_; }
+    [[nodiscard]] uint64_t seed() const { return this->seed_; }
 };
 
 namespace rotator_impl {
+
+inline std::mt19937 make_seeded_generator(uint64_t seed) {
+    std::seed_seq seq {
+        static_cast<uint32_t>(seed & 0xFFFFFFFFu),
+        static_cast<uint32_t>(seed >> 32)
+    };
+    return std::mt19937(seq);
+}
 
 // get padding requirement for different rotator
 inline size_t padding_requirement(size_t dim, RotatorType type) {
@@ -65,12 +79,28 @@ class MatrixRotator : public Rotator<T> {
         // the vector to be rotated to padded dimension
         std::memcpy(&rand_mat_(0, 0), &q_inv(0, 0), sizeof(T) * dim * padded_dim);
     }
+    explicit MatrixRotator(size_t dim, size_t padded_dim, uint64_t seed)
+        : Rotator<T>(dim, padded_dim), rand_mat_(dim, padded_dim) {
+        this->has_seed_ = true;
+        this->seed_ = seed;
+        auto gen = make_seeded_generator(seed);
+        RowMajorMatrix<T> rand = random_gaussian_matrix<T>(padded_dim, padded_dim, gen);
+        Eigen::HouseholderQR<RowMajorMatrix<T>> qr(rand);
+        RowMajorMatrix<T> q_inv =
+            qr.householderQ().transpose();  // inverse of orthogonal mat is its inverse
+
+        // the random matrix only need the first dim rows, since we just pad zeros for
+        // the vector to be rotated to padded dimension
+        std::memcpy(&rand_mat_(0, 0), &q_inv(0, 0), sizeof(T) * dim * padded_dim);
+    }
     MatrixRotator() = default;
     ~MatrixRotator() = default;
 
     MatrixRotator& operator=(const MatrixRotator& other) {
         this->dim_ = other.dim_;
         this->padded_dim_ = other.padded_dim_;
+        this->has_seed_ = other.has_seed_;
+        this->seed_ = other.seed_;
         this->rand_mat_ = other.rand_mat_;
         return *this;
     }
@@ -150,22 +180,17 @@ class FhtKacRotator : public Rotator<float> {
 
     static constexpr size_t kByteLen = 8;
 
-   public:
-    explicit FhtKacRotator(size_t dim, size_t padded_dim)
-        : Rotator<float>(dim, padded_dim), flip_(4 * padded_dim / kByteLen) {
-        std::random_device rd;   // Seed
-        std::mt19937 gen(rd());  // Mersenne Twister RNG
-
-        // Uniform distribution in the range [0, 255]
+    template <class Generator>
+    void fill_flip(Generator& gen) {
         std::uniform_int_distribution<int> dist(0, 255);
-
-        // Generate a single random uint8_t value
         for (auto& i : flip_) {
             i = static_cast<uint8_t>(dist(gen));
         }
+    }
 
+    void initialize_transform() {
         // TODO(lib): is it portable?
-        size_t bottom_log_dim = floor_log2(dim);
+        size_t bottom_log_dim = floor_log2(this->dim_);
         trunc_dim_ = 1 << bottom_log_dim;
         fac_ = 1.0F / std::sqrt(static_cast<float>(trunc_dim_));
 
@@ -189,10 +214,26 @@ class FhtKacRotator : public Rotator<float> {
                 this->fht_float_ = helper_float_11;
                 break;
             default:
-                // TODO(lib): should we do more?
                 std::cerr << "dimension of vector is too big\n";
                 exit(1);
         }
+    }
+
+   public:
+    explicit FhtKacRotator(size_t dim, size_t padded_dim)
+        : Rotator<float>(dim, padded_dim), flip_(4 * padded_dim / kByteLen) {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        fill_flip(gen);
+        initialize_transform();
+    }
+    explicit FhtKacRotator(size_t dim, size_t padded_dim, uint64_t seed)
+        : Rotator<float>(dim, padded_dim), flip_(4 * padded_dim / kByteLen) {
+        this->has_seed_ = true;
+        this->seed_ = seed;
+        auto gen = make_seeded_generator(seed);
+        fill_flip(gen);
+        initialize_transform();
     }
     FhtKacRotator() = default;
     ~FhtKacRotator() override = default;
@@ -214,6 +255,8 @@ class FhtKacRotator : public Rotator<float> {
     FhtKacRotator& operator=(const FhtKacRotator& other) {
         this->dim_ = other.dim_;
         this->padded_dim_ = other.padded_dim_;
+        this->has_seed_ = other.has_seed_;
+        this->seed_ = other.seed_;
         this->flip_ = other.flip_;
         this->fht_float_ = other.fht_float_;
         this->trunc_dim_ = other.trunc_dim_;
@@ -327,6 +370,40 @@ Rotator<T>* choose_rotator(
     }
 
     std::cerr << "Invaid rotator type in choose_rotator()\n";
+    exit(1);
+}
+
+template <typename T>
+Rotator<T>* choose_rotator_with_seed(
+    size_t dim,
+    RotatorType type,
+    size_t padded_dim,
+    uint64_t seed
+) {
+    if (padded_dim == 0) {
+        padded_dim = rotator_impl::padding_requirement(dim, type);
+    }
+
+    if (padded_dim != rotator_impl::padding_requirement(padded_dim, type)) {
+        std::cerr << "Invalid padded dim for the given rotator type\n" << std::flush;
+        exit(1);
+    }
+
+    if (type == RotatorType::FhtKacRotator) {
+        if (!std::is_same_v<T, float>) {
+            std::cerr << "FhtKacRotator is only for float type currently\n";
+            exit(1);
+        }
+        std::cerr << "FhtKacRotator is selected with deterministic seed\n";
+        return ::new rotator_impl::FhtKacRotator(dim, padded_dim, seed);
+    }
+
+    if (type == RotatorType::MatrixRotator) {
+        std::cerr << "MatrixRotator is selected with deterministic seed\n";
+        return ::new rotator_impl::MatrixRotator<T>(dim, padded_dim, seed);
+    }
+
+    std::cerr << "Invalid rotator type in choose_rotator_with_seed()\n";
     exit(1);
 }
 }  // namespace rabitqlib

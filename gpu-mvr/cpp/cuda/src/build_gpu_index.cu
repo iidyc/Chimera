@@ -371,6 +371,7 @@ class ClusteredStage1OutputWriter
         : path_(path)
     {
         clustered_stage1_file_format::Header header;
+        header.version = 2;
         header.n_entries = n_entries;
         header.code_bytes_per_vector = code_bytes_per_vector;
 
@@ -558,6 +559,7 @@ class ClusteredStage1Buffer
     void write_to_file(const std::string& path) const
     {
         clustered_stage1_file_format::Header header;
+        header.version = 2;
         header.n_entries = factor_.size();
         header.code_bytes_per_vector = code_bytes_per_vector_;
 
