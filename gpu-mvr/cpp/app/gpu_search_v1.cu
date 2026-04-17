@@ -1,4 +1,5 @@
 #include "gpu_search_cli.hpp"
+#include "gpu_memory_tracker.hpp"
 #include "gpu_index_v1.cuh"
 #include "io.hpp"
 #include "startup_profile.hpp"
@@ -51,6 +52,8 @@ int main(int argc, char** argv) {
 
     gpu_mvr_index index(args.index_file, doclens, allocation_runtime);
     startup.mark("construct_index");
+    gpu_mvr::GpuMemoryTracker gpu_memory;
+    gpu_memory.sample("after_index_construct");
 
     for (const auto& runtime_config : runtime_configs) {
         print_gpu_search_runtime_config_banner(runtime_config);
@@ -59,9 +62,14 @@ int main(int argc, char** argv) {
         index.k_rank_all_tokens = runtime_config.runtime.k_rank_all_tokens;
         index.itopk_size = runtime_config.runtime.itopk_size;
         index.overlap_chunks = runtime_config.runtime.overlap_chunks;
+        gpu_memory.sample("config_begin:" + runtime_config.label);
 
         for (int i = 0; i < warmup_queries; ++i) {
             index.search_profiled(&Q[i * Q_DOCLEN * d], args.k);
+            gpu_memory.sample_query_if_needed(
+                "warmup:" + runtime_config.label,
+                static_cast<size_t>(i),
+                static_cast<size_t>(warmup_queries));
         }
 
         Timer timer;
@@ -76,13 +84,20 @@ int main(int argc, char** argv) {
             const auto query_end = std::chrono::high_resolution_clock::now();
             query_latencies_ms.push_back(
                 std::chrono::duration<double, std::milli>(query_end - query_start).count());
+            gpu_memory.sample_query_if_needed(
+                "eval:" + runtime_config.label,
+                static_cast<size_t>(i),
+                static_cast<size_t>(run_queries));
         }
+        gpu_memory.sample("config_end:" + runtime_config.label);
         const double total_seconds = timer.tuck(
             "label=" + runtime_config.label + " GPU search time for " +
             std::to_string(run_queries) + " queries.");
         print_query_latency_summary(query_latencies_ms, total_seconds);
         compute_recall(eval_ground_truth, results, args.k);
     }
+
+    gpu_memory.print_summary();
 
     return 0;
 }

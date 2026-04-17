@@ -34,7 +34,9 @@ find_package(rmm REQUIRED)
 find_package(OpenMP REQUIRED)
 
 enable_language(CUDA)
-set(CMAKE_CUDA_ARCHITECTURES native)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
 
 add_compile_options(
     -fopenmp
@@ -129,8 +131,27 @@ target_include_directories(gpu_search_v4 PRIVATE
     cpp/cuda/include
 )
 set_target_properties(gpu_search_v4 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_definitions(gpu_search_v4 PRIVATE GPU_MVR_IMPL_NAME=\"v4\")
+target_compile_definitions(gpu_search_v4 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v4\"
+    GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
+)
 target_link_libraries(gpu_search_v4 PRIVATE gpu_mvr_core)
+
+add_executable(gpu_search_v5
+    cpp/app/gpu_search_v4.cu
+    cpp/cuda/src/gpu_index_v4.cu
+    cpp/cuda/src/gpu_kernels_v4.cu
+)
+target_include_directories(gpu_search_v5 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v5 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v5 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v5\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+)
+target_link_libraries(gpu_search_v5 PRIVATE gpu_mvr_core)
 
 add_executable(gpu_search_v2
     cpp/app/gpu_search_v2.cu

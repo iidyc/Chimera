@@ -15,6 +15,11 @@
 #include "mvr_index_file_format.hpp"
 #include "startup_profile.hpp"
 
+#if defined(GPU_MVR_CLUSTERED_LAYOUT_DISABLED) && \
+    defined(GPU_MVR_CLUSTERED_LAYOUT_REQUIRED)
+#error "GPU_MVR_CLUSTERED_LAYOUT_DISABLED and GPU_MVR_CLUSTERED_LAYOUT_REQUIRED are mutually exclusive"
+#endif
+
 // ======================== CONSTRUCTOR ========================
 
 gpu_mvr_index::gpu_mvr_index(
@@ -27,7 +32,7 @@ gpu_mvr_index::gpu_mvr_index(
     itopk_size = runtime_options.itopk_size;
     overlap_chunks = runtime_options.overlap_chunks;
 
-    gpu_mvr::StartupProfile startup("index_ctor_v4");
+    gpu_mvr::StartupProfile startup("index_ctor");
     const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
     startup.mark("resolve_index_paths");
 
@@ -138,151 +143,7 @@ gpu_mvr_index::gpu_mvr_index(
         const size_t clustered_bytes =
             inv_n * (code_per_vec + sizeof(float) + sizeof(int));
 
-        size_t free_mem = 0;
-        size_t total_mem = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-
-        const bool force_nonclustered =
-            [] {
-                const char* env = std::getenv("GPU_MVR_FORCE_NONCLUSTERED");
-                return env != nullptr && env[0] != '\0' && std::string(env) != "0";
-            }();
-
-        if (!force_nonclustered && free_mem > clustered_bytes) {
-            use_clustered_ = true;
-
-            if (!resolved_paths.gpu_index_path.empty() &&
-                std::filesystem::exists(resolved_paths.gpu_index_path)) {
-                std::ifstream clustered_header_file(
-                    resolved_paths.gpu_index_path, std::ios::binary);
-                const auto clustered_header =
-                    clustered_stage1_file_format::read_header(
-                        clustered_header_file, resolved_paths.gpu_index_path);
-                clustered_header_file.close();
-                if (clustered_header.n_entries != inv_n ||
-                    clustered_header.code_bytes_per_vector != code_per_vec) {
-                    throw std::runtime_error(
-                        "GPU index metadata mismatch for " +
-                        resolved_paths.gpu_index_path);
-                }
-
-                struct stat clustered_stat {};
-                const int clustered_fd = open(resolved_paths.gpu_index_path.c_str(), O_RDONLY);
-                if (clustered_fd < 0) {
-                    throw std::runtime_error(
-                        "Failed to open GPU index: " + resolved_paths.gpu_index_path);
-                }
-                if (fstat(clustered_fd, &clustered_stat) != 0) {
-                    const auto err = errno;
-                    close(clustered_fd);
-                    throw std::runtime_error(
-                        "Failed to stat GPU index " + resolved_paths.gpu_index_path +
-                        ": " + std::system_category().message(err));
-                }
-
-                const size_t mapping_size = static_cast<size_t>(clustered_stat.st_size);
-                const size_t expected_size =
-                    clustered_stage1_file_format::header_bytes() +
-                    inv_n * code_per_vec +
-                    inv_n * sizeof(float) +
-                    inv_n * sizeof(int) +
-                    inv_n * sizeof(uint32_t);
-                if (mapping_size != expected_size) {
-                    close(clustered_fd);
-                    throw std::runtime_error(
-                        "Unexpected GPU index size for " +
-                        resolved_paths.gpu_index_path);
-                }
-
-                void* clustered_mapping =
-                    mmap(nullptr, mapping_size, PROT_READ, MAP_PRIVATE, clustered_fd, 0);
-                if (clustered_mapping == MAP_FAILED) {
-                    const auto err = errno;
-                    close(clustered_fd);
-                    throw std::runtime_error(
-                        "Failed to mmap GPU index " + resolved_paths.gpu_index_path +
-                        ": " + std::system_category().message(err));
-                }
-
-                const auto* clustered_base = static_cast<const char*>(clustered_mapping);
-                const auto* clustered_code =
-                    clustered_base + clustered_stage1_file_format::header_bytes();
-                const auto* clustered_factor = reinterpret_cast<const float*>(
-                    clustered_code + inv_n * code_per_vec);
-                const auto* clustered_doc_ids = reinterpret_cast<const int*>(
-                    reinterpret_cast<const char*>(clustered_factor) +
-                    inv_n * sizeof(float));
-
-                CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
-                CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
-                CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
-
-                CUDA_CHECK(cudaMemcpy(
-                    d_clustered_code_,
-                    clustered_code,
-                    inv_n * code_per_vec,
-                    cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(
-                    d_clustered_factor_,
-                    clustered_factor,
-                    inv_n * sizeof(float),
-                    cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(
-                    d_clustered_doc_ids_,
-                    clustered_doc_ids,
-                    inv_n * sizeof(int),
-                    cudaMemcpyHostToDevice));
-
-                munmap(clustered_mapping, mapping_size);
-                close(clustered_fd);
-                startup.note("clustered_layout_source", "persisted");
-            } else {
-                std::vector<char> clustered_code(inv_n * code_per_vec);
-                std::vector<float> clustered_factor(inv_n);
-                std::vector<int> clustered_doc_ids(inv_n);
-
-                for (size_t i = 0; i < inv_n; ++i) {
-                    const int orig_id = ivf->inv_list[i];
-                    std::memcpy(
-                        clustered_code.data() + i * code_per_vec,
-                        one_bit_code_.data() + static_cast<size_t>(orig_id) * code_per_vec,
-                        code_per_vec);
-                    clustered_factor[i] = one_bit_factor_[orig_id];
-                    clustered_doc_ids[i] = doc_ids_[orig_id];
-                }
-
-                CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
-                CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
-                CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
-
-                CUDA_CHECK(cudaMemcpy(
-                    d_clustered_code_,
-                    clustered_code.data(),
-                    inv_n * code_per_vec,
-                    cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(
-                    d_clustered_factor_,
-                    clustered_factor.data(),
-                    inv_n * sizeof(float),
-                    cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(
-                    d_clustered_doc_ids_,
-                    clustered_doc_ids.data(),
-                    inv_n * sizeof(int),
-                    cudaMemcpyHostToDevice));
-
-                startup.note("clustered_layout_source", "rebuilt");
-            }
-
-            std::cout << "[gpu_mvr] Using cluster-ordered layout ("
-                      << (clustered_bytes / (1024.0 * 1024.0)) << " MB)\n";
-            startup.mark("load_clustered_layout");
-        } else {
-            use_clustered_ = false;
-            d_clustered_code_ = nullptr;
-            d_clustered_factor_ = nullptr;
-            d_clustered_doc_ids_ = nullptr;
-
+        auto ensure_inv_list_on_gpu = [&]() {
 #ifdef GPU_MVR_USE_LUT
             if (d_inv_list_ == nullptr) {
                 const size_t inv_list_size = ivf->inv_list.size();
@@ -294,18 +155,164 @@ gpu_mvr_index::gpu_mvr_index(
                     cudaMemcpyHostToDevice));
             }
 #endif
+        };
 
-            if (force_nonclustered) {
-                std::cout << "[gpu_mvr] GPU_MVR_FORCE_NONCLUSTERED is set. "
-                          << "Using original-order layout with inv_list indirection.\n";
-            } else {
-                std::cout << "[gpu_mvr] Insufficient GPU memory for cluster-ordered layout ("
-                          << (clustered_bytes / (1024.0 * 1024.0)) << " MB needed, "
-                          << (free_mem / (1024.0 * 1024.0)) << " MB free). "
-                          << "Falling back to inv_list indirection.\n";
+        auto disable_clustered_layout = [&](const std::string& reason, const char* startup_label) {
+            use_clustered_ = false;
+            d_clustered_code_ = nullptr;
+            d_clustered_factor_ = nullptr;
+            d_clustered_doc_ids_ = nullptr;
+            ensure_inv_list_on_gpu();
+            std::cout << reason << std::endl;
+            startup.mark(startup_label);
+        };
+
+        auto load_persisted_clustered_layout = [&]() {
+            if (resolved_paths.gpu_index_path.empty() ||
+                !std::filesystem::exists(resolved_paths.gpu_index_path)) {
+                throw std::runtime_error(
+                    "Required clustered sidecar is missing: " +
+                    resolved_paths.gpu_index_path);
             }
-            startup.mark("skip_clustered_layout");
+
+            std::ifstream clustered_header_file(
+                resolved_paths.gpu_index_path, std::ios::binary);
+            const auto clustered_header =
+                clustered_stage1_file_format::read_header(
+                    clustered_header_file, resolved_paths.gpu_index_path);
+            clustered_header_file.close();
+            if (clustered_header.n_entries != inv_n ||
+                clustered_header.code_bytes_per_vector != code_per_vec) {
+                throw std::runtime_error(
+                    "GPU index metadata mismatch for " +
+                    resolved_paths.gpu_index_path);
+            }
+
+            struct stat clustered_stat {};
+            const int clustered_fd = open(resolved_paths.gpu_index_path.c_str(), O_RDONLY);
+            if (clustered_fd < 0) {
+                throw std::runtime_error(
+                    "Failed to open GPU index: " + resolved_paths.gpu_index_path);
+            }
+            if (fstat(clustered_fd, &clustered_stat) != 0) {
+                const auto err = errno;
+                close(clustered_fd);
+                throw std::runtime_error(
+                    "Failed to stat GPU index " + resolved_paths.gpu_index_path +
+                    ": " + std::system_category().message(err));
+            }
+
+            const size_t mapping_size = static_cast<size_t>(clustered_stat.st_size);
+            const size_t expected_size =
+                clustered_stage1_file_format::header_bytes() +
+                inv_n * code_per_vec +
+                inv_n * sizeof(float) +
+                inv_n * sizeof(int) +
+                inv_n * sizeof(uint32_t);
+            if (mapping_size != expected_size) {
+                close(clustered_fd);
+                throw std::runtime_error(
+                    "Unexpected GPU index size for " +
+                    resolved_paths.gpu_index_path);
+            }
+
+            void* clustered_mapping =
+                mmap(nullptr, mapping_size, PROT_READ, MAP_PRIVATE, clustered_fd, 0);
+            if (clustered_mapping == MAP_FAILED) {
+                const auto err = errno;
+                close(clustered_fd);
+                throw std::runtime_error(
+                    "Failed to mmap GPU index " + resolved_paths.gpu_index_path +
+                    ": " + std::system_category().message(err));
+            }
+
+            const auto* clustered_base = static_cast<const char*>(clustered_mapping);
+            const auto* clustered_code =
+                clustered_base + clustered_stage1_file_format::header_bytes();
+            const auto* clustered_factor = reinterpret_cast<const float*>(
+                clustered_code + inv_n * code_per_vec);
+            const auto* clustered_doc_ids = reinterpret_cast<const int*>(
+                reinterpret_cast<const char*>(clustered_factor) +
+                inv_n * sizeof(float));
+
+            CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
+            CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
+
+            CUDA_CHECK(cudaMemcpy(
+                d_clustered_code_,
+                clustered_code,
+                inv_n * code_per_vec,
+                cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(
+                d_clustered_factor_,
+                clustered_factor,
+                inv_n * sizeof(float),
+                cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(
+                d_clustered_doc_ids_,
+                clustered_doc_ids,
+                inv_n * sizeof(int),
+                cudaMemcpyHostToDevice));
+
+            munmap(clustered_mapping, mapping_size);
+            close(clustered_fd);
+            use_clustered_ = true;
+            startup.note("clustered_layout_source", "persisted");
+            std::cout << "[gpu_mvr] Using cluster-ordered layout ("
+                      << (clustered_bytes / (1024.0 * 1024.0)) << " MB)"
+                      << std::endl;
+            startup.mark("load_clustered_layout");
+        };
+
+#ifdef GPU_MVR_CLUSTERED_LAYOUT_DISABLED
+        disable_clustered_layout(
+            "[gpu_mvr] Clustered layout disabled for this build. "
+            "Using original-order layout with inv_list indirection.",
+            "disable_clustered_layout");
+#elif defined(GPU_MVR_CLUSTERED_LAYOUT_REQUIRED)
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+        if (free_mem <= clustered_bytes) {
+            throw std::runtime_error(
+                "Insufficient GPU memory for required cluster_1bit.bin layout: need " +
+                std::to_string(clustered_bytes / (1024 * 1024)) +
+                " MB, have " +
+                std::to_string(free_mem / (1024 * 1024)) +
+                " MB free");
         }
+        load_persisted_clustered_layout();
+#else
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+
+        const bool force_nonclustered =
+            [] {
+                const char* env = std::getenv("GPU_MVR_FORCE_NONCLUSTERED");
+                return env != nullptr && env[0] != '\0' && std::string(env) != "0";
+            }();
+
+        if (!force_nonclustered && free_mem > clustered_bytes) {
+            load_persisted_clustered_layout();
+        } else {
+            if (force_nonclustered) {
+                disable_clustered_layout(
+                    "[gpu_mvr] GPU_MVR_FORCE_NONCLUSTERED is set. "
+                    "Using original-order layout with inv_list indirection.",
+                    "skip_clustered_layout");
+            } else {
+                disable_clustered_layout(
+                    "[gpu_mvr] Insufficient GPU memory for cluster-ordered layout (" +
+                    std::to_string(clustered_bytes / (1024 * 1024)) +
+                    " MB needed, " +
+                    std::to_string(free_mem / (1024 * 1024)) +
+                    " MB free). Falling back to inv_list indirection.",
+                    "skip_clustered_layout");
+            }
+        }
+#endif
     }
 }
 

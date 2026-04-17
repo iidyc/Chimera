@@ -8,7 +8,7 @@ Usage:
   script/bench_all_gpu_mvr_versions.sh [options]
 
 Description:
-  Benchmark GPU-MVR gpu_search versions v0 through v4 across the default
+  Benchmark GPU-MVR gpu_search versions v0 through v5 across the default
   dataset set:
     lotte
     hotpot
@@ -21,13 +21,15 @@ Description:
     profiling/<dataset>/gpu_search_v2/
     profiling/<dataset>/gpu_search_v3/
     profiling/<dataset>/gpu_search_v4/
+    profiling/<dataset>/gpu_search_v5/
 
 Options:
   --dataset <name>         Dataset to benchmark. Repeatable.
                            Accepts hotspot as an alias for hotpot.
-  --version <v0|v1|v2|v3|v4>  Version to benchmark. Repeatable.
-                           Default: v0 v1 v2 v3 v4
+  --version <v0|v1|v2|v3|v4|v5>  Version to benchmark. Repeatable.
+                           Default: v0 v1 v2 v3 v4 v5
   --config-file <path>     Passed through to bench_gpu_mvr.sh.
+                           Default: profiling/gpu_mvr_config.csv
   --build-dir <path>       Passed through to bench_gpu_mvr.sh.
   --output-dir <path>      Passed through to bench_gpu_mvr.sh.
   --log-dir <path>         Passed through to bench_gpu_mvr.sh.
@@ -79,11 +81,12 @@ single_bench_script="${script_dir}/bench_gpu_mvr.sh"
 [[ -x "$single_bench_script" ]] || die "missing executable helper script: ${single_bench_script}"
 
 datasets=(lotte hotpot msmarco)
-versions=(v0 v1 v2 v3 v4)
+versions=(v0 v1 v2 v3 v4 v5)
 dataset_set=0
 version_set=0
 dry_run=0
 pass_through_args=()
+config_file_set=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -102,10 +105,10 @@ while [[ $# -gt 0 ]]; do
         --version)
             [[ $# -ge 2 ]] || die "missing value for --version"
             case "$2" in
-                v0|v1|v2|v3|v4)
+                v0|v1|v2|v3|v4|v5)
                     ;;
                 *)
-                    die "--version must be one of: v0, v1, v2, v3, v4"
+                    die "--version must be one of: v0, v1, v2, v3, v4, v5"
                     ;;
             esac
             if [[ $version_set -eq 0 ]]; then
@@ -120,6 +123,9 @@ while [[ $# -gt 0 ]]; do
         --config-file|--build-dir|--output-dir|--log-dir|--k|--nq|--warmup|--tmp-root)
             [[ $# -ge 2 ]] || die "missing value for $1"
             pass_through_args+=("$1" "$2")
+            if [[ "$1" == "--config-file" ]]; then
+                config_file_set=1
+            fi
             shift 2
             ;;
         --copy-index-to-tmp|--refresh-tmp-index)
@@ -142,6 +148,10 @@ done
 
 [[ ${#datasets[@]} -gt 0 ]] || die "no datasets selected"
 [[ ${#versions[@]} -gt 0 ]] || die "no versions selected"
+
+if [[ $config_file_set -eq 0 ]]; then
+    pass_through_args+=(--config-file "profiling/gpu_mvr_config.csv")
+fi
 
 for version in "${versions[@]}"; do
     cmd=(
