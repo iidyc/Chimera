@@ -11,7 +11,8 @@ Usage:
 Description:
   Build a GPU-MVR index from raw dataset files using gpu-mvr/build/gpu_build_fast.
   By default the builder is executed via micromamba in the gpu-mvr env when
-  micromamba is available.
+  micromamba is available. Set GPU_MVR_USE_MICROMAMBA=0 to run directly in the
+  current shell environment instead.
 
 Expected dataset layout:
   dataset/<name>/raw/data.bin
@@ -169,7 +170,11 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
 gpu_build_bin="${repo_root}/gpu-mvr/build/gpu_build_fast"
-micromamba_bin="$(command -v micromamba || true)"
+use_micromamba="${GPU_MVR_USE_MICROMAMBA:-1}"
+micromamba_bin=""
+if [[ "$use_micromamba" != "0" ]]; then
+    micromamba_bin="$(command -v micromamba || true)"
+fi
 builder_env_name="${GPU_MVR_MICROMAMBA_ENV:-gpu-mvr}"
 dataset_dir="${repo_root}/dataset/${dataset_name}"
 raw_dir="${dataset_dir}/raw"
@@ -307,6 +312,7 @@ print_run_plan() {
     cat <<EOF
 [driver] repo_root=${repo_root}
 [driver] dataset=${dataset_name}
+[driver] use_micromamba=${use_micromamba}
 [driver] micromamba_bin=${micromamba_bin:-<not-found>}
 [driver] builder_env_name=${builder_env_name}
 [driver] raw_dir=${raw_dir}
