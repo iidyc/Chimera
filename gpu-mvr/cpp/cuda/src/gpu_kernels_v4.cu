@@ -13,16 +13,22 @@ int doc_ht_find_or_insert(
     int* __restrict__ touched_list,    // [max_compact_docs]
     int* __restrict__ num_inserted,    // scalar, init 0
     int  doc_id,
+    int  max_compact_docs,
     unsigned int ht_mask               // ht_capacity - 1
 ) {
     unsigned int h = (unsigned int)doc_id * 2654435761u;   // Knuth multiplicative hash
     h &= ht_mask;
 
-    for (;;) {
+    const unsigned int ht_capacity = ht_mask + 1;
+    for (unsigned int probe_count = 0; probe_count < ht_capacity; ++probe_count) {
         int probe = atomicCAS(&ht_keys[h], -1, doc_id);
         if (probe == -1) {
             // We just inserted this key. Allocate a compact id.
             int cid = atomicAdd(num_inserted, 1);
+            if (cid >= max_compact_docs) {
+                atomicExch(&ht_vals[h], -2);  // overflow sentinel
+                return -1;
+            }
             touched_list[cid] = doc_id;
             atomicExch(&ht_vals[h], cid);     // publish
             return cid;
@@ -30,12 +36,13 @@ int doc_ht_find_or_insert(
         if (probe == doc_id) {
             // Key already exists. Spin until compact_id is published.
             int cid;
-            do { cid = *(volatile int*)&ht_vals[h]; } while (cid < 0);
-            return cid;
+            do { cid = *(volatile int*)&ht_vals[h]; } while (cid == -1);
+            return (cid >= 0 && cid < max_compact_docs) ? cid : -1;
         }
         // Collision with a different key — linear probe.
         h = (h + 1) & ht_mask;
     }
+    return -1;
 }
 #endif
 
@@ -50,6 +57,112 @@ __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
     } while (assumed != old);
     return __int_as_float(old);
 }
+
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+__device__ __forceinline__ int doc_id_from_doc_ptrs_binary(
+    const int* __restrict__ d_doc_ptrs,
+    int num_docs,
+    uint32_t token_id
+) {
+    int lo = 0;
+    int hi = num_docs - 1;
+
+    while (lo < hi) {
+        const int mid = lo + ((hi - lo + 1) >> 1);
+        const uint32_t mid_start = (uint32_t)__ldg(&d_doc_ptrs[mid]);
+        if (mid_start <= token_id) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    return lo;
+}
+
+__device__ __forceinline__ int doc_id_from_doc_ptrs_binary_range(
+    const int* __restrict__ d_doc_ptrs,
+    int lo,
+    int hi,
+    uint32_t token_id
+) {
+    while (lo < hi) {
+        const int mid = lo + ((hi - lo + 1) >> 1);
+        const uint32_t mid_start = (uint32_t)__ldg(&d_doc_ptrs[mid]);
+        if (mid_start <= token_id) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    return lo;
+}
+
+__device__ __forceinline__ int doc_id_from_doc_ptrs_blocked(
+    const int* __restrict__ d_doc_ptrs,
+    const int* __restrict__ d_doc_block_lut,
+    uint32_t token_id
+) {
+    const int block = static_cast<int>(token_id >> kDocPtrLookupBlockShift);
+    const int lo = __ldg(&d_doc_block_lut[block]);
+    const int hi = __ldg(&d_doc_block_lut[block + 1]);
+    return (lo >= hi)
+        ? lo
+        : doc_id_from_doc_ptrs_binary_range(d_doc_ptrs, lo, hi, token_id);
+}
+
+__device__ __forceinline__ bool warp_tokens_are_nondecreasing(
+    uint32_t token_id,
+    unsigned active_mask
+) {
+    const int lane = threadIdx.x & 31;
+    const unsigned lower_lanes_mask =
+        active_mask & ((lane == 0) ? 0u : ((1u << lane) - 1u));
+    bool ordered = true;
+    if (lower_lanes_mask != 0u) {
+        const int prev_lane = 31 - __clz(lower_lanes_mask);
+        const uint32_t prev_token = __shfl_sync(active_mask, token_id, prev_lane);
+        ordered = token_id >= prev_token;
+    }
+    return __all_sync(active_mask, ordered);
+}
+
+__device__ __forceinline__ int doc_id_from_doc_ptrs_warp_sorted(
+    uint32_t token_id,
+    const int* __restrict__ d_doc_ptrs,
+    int num_docs,
+    unsigned active_mask,
+    int* __restrict__ warp_doc_ids
+) {
+    const int lane = threadIdx.x & 31;
+    const int leader_lane = __ffs(active_mask) - 1;
+
+    if (lane == leader_lane) {
+        unsigned remaining = active_mask;
+        int lower_doc = 0;
+        bool first = true;
+
+        while (remaining != 0u) {
+            const int src_lane = __ffs(remaining) - 1;
+            const uint32_t lane_token = __shfl_sync(active_mask, token_id, src_lane);
+            lower_doc = first
+                ? doc_id_from_doc_ptrs_binary(d_doc_ptrs, num_docs, lane_token)
+                : doc_id_from_doc_ptrs_binary_range(
+                    d_doc_ptrs,
+                    lower_doc,
+                    num_docs - 1,
+                    lane_token);
+            warp_doc_ids[src_lane] = lower_doc;
+            remaining &= (remaining - 1);
+            first = false;
+        }
+    }
+
+    __syncwarp(active_mask);
+    return warp_doc_ids[lane];
+}
+#endif
 
 __global__ void stage1_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
@@ -227,6 +340,7 @@ __global__ void stage1_binary_ip_lut_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -326,7 +440,10 @@ __global__ void stage1_binary_ip_lut_kernel(
             int cid = doc_ht_find_or_insert(
                 d_ht_keys, d_ht_vals,
                 d_touched_doc_list, d_num_touched_docs,
-                doc_id, ht_mask);
+                doc_id, max_touched_docs, ht_mask);
+            if (cid < 0) {
+                continue;
+            }
 
             float* slot = &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx];
 #else
@@ -364,7 +481,12 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const float*    __restrict__ d_cb1_sumq,
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    const int*      __restrict__ d_doc_ptrs,
+    const int*      __restrict__ d_doc_block_lut,
+#else
     const int*      __restrict__ d_doc_ids,
+#endif
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
@@ -372,6 +494,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -444,7 +567,14 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
         const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
             d_code + (size_t)orig_id * CODE_BYTES));
         const float factor = __ldg(&d_factor[orig_id]);
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+        const int doc_id = doc_id_from_doc_ptrs_blocked(
+            d_doc_ptrs,
+            d_doc_block_lut,
+            orig_id);
+#else
         const int   doc_id = __ldg(&d_doc_ids[orig_id]);
+#endif
 
         float ip = 0.0f;
         #pragma unroll
@@ -467,7 +597,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
             int cid = doc_ht_find_or_insert(
                 d_ht_keys, d_ht_vals,
                 d_touched_doc_list, d_num_touched_docs,
-                doc_id, ht_mask);
+                doc_id, max_touched_docs, ht_mask);
+            if (cid < 0) {
+                continue;
+            }
 
             float* slot = &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx];
 #else
@@ -807,13 +940,19 @@ __global__ void aggregate_stage1_tracked_kernel(
     const size_t* __restrict__ d_emb_ids,
     const float*  __restrict__ d_emb_dists,
     const int*    __restrict__ d_pair_offsets,
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    const int*    __restrict__ d_doc_ptrs,
+    const int*    __restrict__ d_doc_block_lut,
+#else
     const int*    __restrict__ d_doc_ids,
+#endif
     float*        d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     int*          d_ht_keys,
     int*          d_ht_vals,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
+    int           max_touched_docs,
     unsigned int  ht_mask,
 #else
     int*          d_doc_touched,
@@ -824,6 +963,8 @@ __global__ void aggregate_stage1_tracked_kernel(
     size_t        total_pairs,
     size_t        max_embs_per_query
 ) {
+    (void)total_pairs;
+
     // Grid: (blocks_x, Q_DOCLEN). blockIdx.y encodes q_idx, eliminating binary search.
     const int q_idx = blockIdx.y;
     if (q_idx >= Q_DOCLEN) return;
@@ -845,10 +986,19 @@ __global__ void aggregate_stage1_tracked_kernel(
     // it from the touched list is safe.
     const float dist =
         d_emb_dists[(size_t)q_idx * max_embs_per_query + local_idx];
-    if (dist <= 0.0f) return;
 
     const size_t emb_id = d_emb_ids[(size_t)pair_start + local_idx];
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    const uint32_t token_id = static_cast<uint32_t>(emb_id);
+    const int doc_id = doc_id_from_doc_ptrs_blocked(
+        d_doc_ptrs,
+        d_doc_block_lut,
+        token_id);
+#else
     const int doc_id = d_doc_ids[emb_id];
+#endif
+
+    if (dist <= 0.0f) return;
     if (doc_id >= (int)num_docs) return;
 
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
@@ -857,7 +1007,8 @@ __global__ void aggregate_stage1_tracked_kernel(
     int cid = doc_ht_find_or_insert(
         d_ht_keys, d_ht_vals,
         d_touched_doc_list, d_num_touched_docs,
-        doc_id, ht_mask);
+        doc_id, max_touched_docs, ht_mask);
+    if (cid < 0) return;
     atomicMaxFloat(&d_doc_query_max[(size_t)cid * Q_DOCLEN + q_idx], dist);
 #else
     // Doc-major layout: [doc_id * Q_DOCLEN + q_idx]. Adjacent q's for same

@@ -52,6 +52,7 @@ __global__ void stage1_binary_ip_lut_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -81,6 +82,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -179,6 +181,7 @@ __global__ void aggregate_stage1_tracked_kernel(
     int*          d_ht_vals,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
+    int           max_touched_docs,
     unsigned int  ht_mask,
 #else
     int*          d_doc_touched,

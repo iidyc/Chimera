@@ -54,8 +54,6 @@ add_compile_definitions(GPU_MVR_PROFILE)
 # add_compile_definitions(GPU_MVR_TIMELINE)
 add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
 add_compile_definitions(GPU_MVR_USE_LUT)
-# Uncomment to use compact doc buffer (hash table) instead of full num_docs buffer
-add_compile_definitions(GPU_MVR_COMPACT_DOC_BUFFER)
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -121,37 +119,42 @@ set_target_properties(gpu_search_v3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_definitions(gpu_search_v3 PRIVATE GPU_MVR_IMPL_NAME=\"v3\")
 target_link_libraries(gpu_search_v3 PRIVATE gpu_mvr_core)
 
-add_executable(gpu_search_v4
-    cpp/app/gpu_search_v4.cu
-    cpp/cuda/src/gpu_index_v4.cu
-    cpp/cuda/src/gpu_kernels_v4.cu
-)
-target_include_directories(gpu_search_v4 PRIVATE
-    cpp/include
-    cpp/cuda/include
-)
-set_target_properties(gpu_search_v4 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_definitions(gpu_search_v4 PRIVATE
-    GPU_MVR_IMPL_NAME=\"v4\"
+function(add_gpu_search_v4_family_target target_name impl_name)
+    add_executable(${target_name}
+        cpp/app/gpu_search_v4.cu
+        cpp/cuda/src/gpu_index_v4.cu
+        cpp/cuda/src/gpu_kernels_v4.cu
+    )
+    target_include_directories(${target_name} PRIVATE
+        cpp/include
+        cpp/cuda/include
+    )
+    set_target_properties(${target_name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    target_compile_definitions(${target_name} PRIVATE
+        GPU_MVR_IMPL_NAME=\"${impl_name}\"
+        ${ARGN}
+    )
+    target_link_libraries(${target_name} PRIVATE gpu_mvr_core)
+endfunction()
+
+add_gpu_search_v4_family_target(
+    gpu_search_v4
+    v4
     GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
 )
-target_link_libraries(gpu_search_v4 PRIVATE gpu_mvr_core)
 
-add_executable(gpu_search_v5
-    cpp/app/gpu_search_v4.cu
-    cpp/cuda/src/gpu_index_v4.cu
-    cpp/cuda/src/gpu_kernels_v4.cu
-)
-target_include_directories(gpu_search_v5 PRIVATE
-    cpp/include
-    cpp/cuda/include
-)
-set_target_properties(gpu_search_v5 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_definitions(gpu_search_v5 PRIVATE
-    GPU_MVR_IMPL_NAME=\"v5\"
+add_gpu_search_v4_family_target(
+    gpu_search_v5
+    v5
     GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
 )
-target_link_libraries(gpu_search_v5 PRIVATE gpu_mvr_core)
+
+add_gpu_search_v4_family_target(
+    gpu_search_v6
+    v6
+    GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
+    GPU_MVR_DOCID_VIA_DOCPTRS=1
+)
 
 add_executable(gpu_search_v2
     cpp/app/gpu_search_v2.cu

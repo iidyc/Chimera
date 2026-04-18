@@ -6,6 +6,12 @@
 
 #include "gpu_config.cuh"
 
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+inline constexpr int kDocPtrLookupBlockShift = 11;
+inline constexpr uint32_t kDocPtrLookupBlockSize =
+    1u << kDocPtrLookupBlockShift;
+#endif
+
 // Query-tiled stage2 LUT kernel constants (used at launch sites for shared mem sizing)
 #define STAGE2_LUT_TILE_Q 8
 #define STAGE2_LUT_NUM_TILES (Q_DOCLEN / STAGE2_LUT_TILE_Q)
@@ -52,6 +58,7 @@ __global__ void stage1_binary_ip_lut_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -73,7 +80,12 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const float*    __restrict__ d_cb1_sumq,
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    const int*      __restrict__ d_doc_ptrs,
+    const int*      __restrict__ d_doc_block_lut,
+#else
     const int*      __restrict__ d_doc_ids,
+#endif
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
@@ -81,6 +93,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -171,13 +184,19 @@ __global__ void aggregate_stage1_tracked_kernel(
     const size_t* __restrict__ d_emb_ids,
     const float*  __restrict__ d_emb_dists,
     const int*    __restrict__ d_pair_offsets,
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    const int*    __restrict__ d_doc_ptrs,
+    const int*    __restrict__ d_doc_block_lut,
+#else
     const int*    __restrict__ d_doc_ids,
+#endif
     float*        d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     int*          d_ht_keys,
     int*          d_ht_vals,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
+    int           max_touched_docs,
     unsigned int  ht_mask,
 #else
     int*          d_doc_touched,

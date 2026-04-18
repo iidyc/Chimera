@@ -8,26 +8,26 @@ Usage:
   script/bench_all_gpu_mvr_versions.sh [options]
 
 Description:
-  Benchmark GPU-MVR gpu_search versions v0 through v5 across the default
+  Benchmark GPU-MVR gpu_search versions v0 through v6 across the default
   dataset set:
     lotte
     hotpot
     msmarco
 
   This is a thin wrapper around script/bench_gpu_mvr.sh. It preserves the
-  per-version output layout from the single-version benchmark driver, e.g.:
-    profiling/<dataset>/gpu_search_v0/
-    profiling/<dataset>/gpu_search_v1/
-    profiling/<dataset>/gpu_search_v2/
-    profiling/<dataset>/gpu_search_v3/
-    profiling/<dataset>/gpu_search_v4/
-    profiling/<dataset>/gpu_search_v5/
+  per-version log layout from the single-version benchmark driver, e.g.:
+    log/bench/gpu_search_v0/<dataset>/benchmark_<run_id>.log
+    log/bench/gpu_search_v1/<dataset>/benchmark_<run_id>.log
+    ...
+
+  Use script/parse_bench_logs.py later to regenerate structured CSV tables from
+  the raw logs.
 
 Options:
   --dataset <name>         Dataset to benchmark. Repeatable.
                            Accepts hotspot as an alias for hotpot.
-  --version <v0|v1|v2|v3|v4|v5>  Version to benchmark. Repeatable.
-                           Default: v0 v1 v2 v3 v4 v5
+  --version <v0|v1|v2|v3|v4|v5|v6>  Version to benchmark. Repeatable.
+                           Default: v0 v1 v2 v3 v4 v5 v6
   --config-file <path>     Passed through to bench_gpu_mvr.sh.
                            Default: profiling/gpu_mvr_config.csv
   --build-dir <path>       Passed through to bench_gpu_mvr.sh.
@@ -36,9 +36,6 @@ Options:
   --k <top_k>              Passed through to bench_gpu_mvr.sh.
   --nq <count>             Passed through to bench_gpu_mvr.sh.
   --warmup <count>         Passed through to bench_gpu_mvr.sh.
-  --copy-index-to-tmp      Passed through to bench_gpu_mvr.sh.
-  --refresh-tmp-index      Passed through to bench_gpu_mvr.sh.
-  --tmp-root <path>        Passed through to bench_gpu_mvr.sh.
   --dry-run                Print commands without executing them.
   -h, --help               Show this help message.
 EOF
@@ -81,7 +78,7 @@ single_bench_script="${script_dir}/bench_gpu_mvr.sh"
 [[ -x "$single_bench_script" ]] || die "missing executable helper script: ${single_bench_script}"
 
 datasets=(lotte hotpot msmarco)
-versions=(v0 v1 v2 v3 v4 v5)
+versions=(v0 v1 v2 v3 v4 v5 v6)
 dataset_set=0
 version_set=0
 dry_run=0
@@ -105,10 +102,10 @@ while [[ $# -gt 0 ]]; do
         --version)
             [[ $# -ge 2 ]] || die "missing value for --version"
             case "$2" in
-                v0|v1|v2|v3|v4|v5)
+                v0|v1|v2|v3|v4|v5|v6)
                     ;;
                 *)
-                    die "--version must be one of: v0, v1, v2, v3, v4, v5"
+                    die "--version must be one of: v0, v1, v2, v3, v4, v5, v6"
                     ;;
             esac
             if [[ $version_set -eq 0 ]]; then
@@ -120,17 +117,13 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
-        --config-file|--build-dir|--output-dir|--log-dir|--k|--nq|--warmup|--tmp-root)
+        --config-file|--build-dir|--output-dir|--log-dir|--k|--nq|--warmup)
             [[ $# -ge 2 ]] || die "missing value for $1"
             pass_through_args+=("$1" "$2")
             if [[ "$1" == "--config-file" ]]; then
                 config_file_set=1
             fi
             shift 2
-            ;;
-        --copy-index-to-tmp|--refresh-tmp-index)
-            pass_through_args+=("$1")
-            shift
             ;;
         --dry-run)
             dry_run=1

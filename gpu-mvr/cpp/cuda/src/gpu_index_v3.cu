@@ -266,8 +266,7 @@ void gpu_mvr_index::set_doc_mapping(const std::vector<int>& doc_lens) {
 
 void gpu_mvr_index::allocate_workspace() {
     ws_.max_q_doclen = Q_DOCLEN;
-    // ws_.max_stage1_pairs = nprobe * max_cluster_size * Q_DOCLEN;
-    ws_.max_stage1_pairs = nprobe * n / n_clusters * Q_DOCLEN;
+    ws_.max_stage1_pairs = (size_t)nprobe * max_cluster_size * Q_DOCLEN;
     ws_.max_stage2_candidates = k_rank_cluster;
     ws_.max_stage2_tokens = ws_.max_stage2_candidates * max_doc_len;
     ws_.max_stage2_k = k_rank_all_tokens;
@@ -275,14 +274,13 @@ void gpu_mvr_index::allocate_workspace() {
     ws_.estimated_num_docs = (size_t)num_docs;
 
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    // Compact doc buffer: sized for the max docs that can be touched in
-    // one query, NOT all docs. Upper bound = nprobe * max_cluster_size
-    // (single query token). The union across Q_DOCLEN tokens shares many
-    // clusters via CAGRA, so this is a safe over-estimate.
-    // ws_.max_compact_docs = std::min((size_t)num_docs,
-    //                                 (size_t)nprobe * max_cluster_size);
-    ws_.max_compact_docs = std::min((size_t)num_docs,
-                                    (size_t)nprobe * n / n_clusters * 32);
+    // The compact-doc buffer must cover the union across all query tokens.
+    // Using average cluster size here is unsafe: one query can probe a much
+    // heavier-than-average set of clusters and overflow the hash table before
+    // the host-side touched-doc count check runs.
+    ws_.max_compact_docs = std::min(
+        (size_t)num_docs,
+        (size_t)nprobe * max_cluster_size * Q_DOCLEN);
     // Hash table capacity: next power-of-2 >= 2× max_compact_docs (≤50% load).
     {
         size_t cap = 1;
@@ -936,6 +934,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.d_ht_vals,
             ws_.d_unique_doc_ids,
             ws_.d_num_unique_docs,
+            static_cast<int>(ws_.max_compact_docs),
             ws_.ht_mask,
 #else
             ws_.d_doc_touched,

@@ -18,18 +18,22 @@ Expected dataset layout:
   dataset/<name>/raw/doclens.bin
 
 Outputs:
-  dataset/<name>/gpu_mvr/
-  log/build/<dataset>_gpu_build_fast.log
-  log/build/<dataset>_gpu_build_fast.timings.log
+  dataset/<name>/gpu_mvr_2m/     when --n-clusters is 2000000 or 2M (default)
+  dataset/<name>/gpu_mvr_1m/     when --n-clusters is 1000000 or 1M
+  dataset/<name>/gpu_mvr_<count>/ for other cluster counts
+  log/build/<dataset>/<index_dir>/gpu_build_fast_<run_id>.log
 
 Arguments:
   dataset_name           Dataset name under dataset/. Defaults to hotpot.
   --dataset <name>       Same as the positional dataset argument.
-  --n-clusters <count>   Number of IVF/CAGRA centroids. Default: 2097152.
+  --n-clusters <count>   Number of IVF/CAGRA centroids.
+                         Accepts 2M=2000000 and 1M=1000000. Default: 2000000.
   --copy-raw-to-tmp      Copy raw/data.bin and raw/doclens.bin into /tmp first.
   --refresh-tmp-raw      Re-copy the /tmp raw files even if they already exist.
   --tmp-root <path>      Root directory for /tmp raw copies.
                          Default: /tmp/$USER/gpu_mvr_build
+  --log-dir <path>       Root directory for raw build logs.
+                         Default: log/build
   --dry-run              Print the resolved command and paths without running it.
   -h, --help             Show this help message.
 EOF
@@ -40,11 +44,60 @@ die() {
     exit 1
 }
 
+normalize_n_clusters() {
+    local value="$1"
+    local upper_value="${value^^}"
+    case "$upper_value" in
+        2M)
+            printf '%s' "2000000"
+            ;;
+        1M)
+            printf '%s' "1000000"
+            ;;
+        *)
+            printf '%s' "$value"
+            ;;
+    esac
+}
+
+index_dir_name_for_n_clusters() {
+    local cluster_count="$1"
+    case "$cluster_count" in
+        2000000)
+            printf '%s' "gpu_mvr_2m"
+            ;;
+        1000000)
+            printf '%s' "gpu_mvr_1m"
+            ;;
+        *)
+            printf '%s' "gpu_mvr_${cluster_count}"
+            ;;
+    esac
+}
+
+make_run_id() {
+    local timestamp
+    local suffix
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+    if [[ -n "${SLURM_JOB_ID-}" ]]; then
+        suffix="job${SLURM_JOB_ID}"
+        if [[ -n "${SLURM_ARRAY_TASK_ID-}" ]]; then
+            suffix+="_task${SLURM_ARRAY_TASK_ID}"
+        fi
+    else
+        suffix="pid$$"
+    fi
+
+    printf '%s_%s' "$timestamp" "$suffix"
+}
+
 dataset_name="hotpot"
-n_clusters="2097152"
+n_clusters="2000000"
 copy_raw_to_tmp=0
 refresh_tmp_raw=0
 tmp_root="/tmp/${USER:-user}/gpu_mvr_build"
+log_dir=""
 dry_run=0
 dataset_set=0
 
@@ -74,6 +127,11 @@ while [[ $# -gt 0 ]]; do
             tmp_root="$2"
             shift 2
             ;;
+        --log-dir)
+            [[ $# -ge 2 ]] || die "missing value for --log-dir"
+            log_dir="$2"
+            shift 2
+            ;;
         --dry-run)
             dry_run=1
             shift
@@ -97,6 +155,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+n_clusters="$(normalize_n_clusters "$n_clusters")"
 [[ "$n_clusters" =~ ^[0-9]+$ ]] || die "--n-clusters must be a positive integer"
 (( n_clusters > 0 )) || die "--n-clusters must be > 0"
 
@@ -116,19 +175,23 @@ dataset_dir="${repo_root}/dataset/${dataset_name}"
 raw_dir="${dataset_dir}/raw"
 data_file="${raw_dir}/data.bin"
 doclens_file="${raw_dir}/doclens.bin"
-index_dir="${dataset_dir}/gpu_mvr"
-log_dir="${repo_root}/log/build"
+index_dir_name="$(index_dir_name_for_n_clusters "$n_clusters")"
+index_dir="${dataset_dir}/${index_dir_name}"
+if [[ -z "$log_dir" ]]; then
+    log_dir="${repo_root}/log/build"
+fi
 
 [[ -x "$gpu_build_bin" ]] || die "gpu_build binary not found or not executable: ${gpu_build_bin}"
 [[ -d "$dataset_dir" ]] || die "dataset directory not found: ${dataset_dir}"
 [[ -f "$data_file" ]] || die "missing embedding file: ${data_file}"
 [[ -f "$doclens_file" ]] || die "missing doclens file: ${doclens_file}"
 
+run_id="$(make_run_id)"
+log_dir="${log_dir}/${dataset_name}/${index_dir_name}"
 mkdir -p "$index_dir" "$log_dir"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-full_log="${log_dir}/${dataset_name}_gpu_build_fast.log"
-timing_log="${log_dir}/${dataset_name}_gpu_build_fast.timings.log"
+full_log="${log_dir}/gpu_build_fast_${run_id}.log"
 
 if [[ $dry_run -eq 0 ]]; then
     : > "$full_log"
@@ -252,23 +315,16 @@ print_run_plan() {
 [driver] data_file=${data_file}
 [driver] doclens_file=${doclens_file}
 [driver] index_dir=${index_dir}
-[driver] full_log=${full_log}
-[driver] timing_log=${timing_log}
+[driver] run_id=${run_id}
+[driver] log_file=${full_log}
 [driver] n_clusters=${n_clusters}
 [driver] copy_raw_to_tmp=${copy_raw_to_tmp}
 [driver] refresh_tmp_raw=${refresh_tmp_raw}
 [driver] tmp_root=${tmp_root}
+[driver] parser_hint=raw build log only; parse separately if needed
 [driver] command=$(printf '%q ' "${build_cmd[@]}")
 EOF
     print_hardware_info
-}
-
-extract_timing_summary() {
-    local source_log="$1"
-    {
-        echo "[driver] extracted_timing_summary_from=${source_log}"
-        grep -E '^\[(build_index|build_fast)\] Step [0-9]+(b)? done in |^\[build_index\] Quantize pipeline total: |^\[(build_index|build_fast)\]\[profile\] ' "$source_log" || true
-    } > "$timing_log"
 }
 
 file_size_bytes() {
@@ -479,10 +535,15 @@ print_run_plan | tee -a "$full_log"
 echo "[driver] build_start_utc=${timestamp}" | tee -a "$full_log"
 
 run_build() {
+    local command_prefix=()
+    if command -v stdbuf >/dev/null 2>&1; then
+        command_prefix=(stdbuf -oL -eL)
+    fi
+
     if [[ -x /usr/bin/time ]]; then
-        /usr/bin/time -v "${build_cmd[@]}"
+        /usr/bin/time -v "${command_prefix[@]}" "${build_cmd[@]}"
     else
-        "${build_cmd[@]}"
+        "${command_prefix[@]}" "${build_cmd[@]}"
     fi
 }
 
@@ -495,12 +556,9 @@ end_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 echo "[driver] build_end_utc=${end_timestamp}" | tee -a "$full_log"
 echo "[driver] build_exit_code=${build_status}" | tee -a "$full_log"
 
-extract_timing_summary "$full_log"
-
 if [[ $build_status -ne 0 ]]; then
     echo "[driver] build failed; see ${full_log}" >&2
     exit "$build_status"
 fi
 
 echo "[driver] build completed successfully" | tee -a "$full_log"
-echo "[driver] timing summary saved to ${timing_log}" | tee -a "$full_log"

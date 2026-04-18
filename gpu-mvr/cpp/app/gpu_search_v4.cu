@@ -5,6 +5,53 @@
 #include "startup_profile.hpp"
 #include "utils.hpp"
 
+namespace {
+
+void maybe_print_phase_progress(
+    const std::string& label,
+    const char* phase,
+    int completed,
+    int total,
+    std::chrono::steady_clock::time_point phase_start,
+    std::chrono::steady_clock::time_point& last_log_time)
+{
+    if (total <= 0 || completed <= 0) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool phase_done = completed >= total;
+    const bool count_checkpoint = (completed == 1) || (completed % 250 == 0);
+    const bool time_checkpoint =
+        std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 5;
+
+    if (!phase_done && !count_checkpoint && !time_checkpoint) {
+        return;
+    }
+
+    const double elapsed_s =
+        std::chrono::duration<double>(now - phase_start).count();
+    const double qps =
+        (elapsed_s > 0.0) ? static_cast<double>(completed) / elapsed_s : 0.0;
+    const double eta_s =
+        (!phase_done && qps > 0.0) ? static_cast<double>(total - completed) / qps : 0.0;
+
+    std::cout
+        << "[RUN] Progress label=" << label
+        << " phase=" << phase
+        << " completed=" << completed << "/" << total
+        << " elapsed_s=" << elapsed_s
+        << " qps=" << qps;
+    if (!phase_done && qps > 0.0) {
+        std::cout << " eta_s=" << eta_s;
+    }
+    std::cout << std::endl;
+
+    last_log_time = now;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     gpu_search_cli_args args;
     args.runtime.k_rank_cluster = 3000;
@@ -51,12 +98,33 @@ int main(int argc, char** argv) {
         ground_truth.begin() + warmup_queries,
         ground_truth.begin() + warmup_queries + run_queries);
 
+    std::cout
+        << "[RUN] Constructing GPU index from " << args.index_file
+        << " using max runtime config: "
+        << "nprobe=" << allocation_runtime.nprobe
+        << " k_rank_cluster=" << allocation_runtime.k_rank_cluster
+        << " k_rank_all_tokens=" << allocation_runtime.k_rank_all_tokens
+        << " itopk_size=" << allocation_runtime.itopk_size
+        << " overlap_chunks=" << allocation_runtime.overlap_chunks
+        << std::endl;
     gpu_mvr_index index(args.index_file, doclens, allocation_runtime);
     startup.mark("construct_index");
+    std::cout
+        << "[RUN] Index ready. Benchmarking " << runtime_configs.size()
+        << " configuration(s) with warmup_queries=" << warmup_queries
+        << " eval_queries=" << run_queries
+        << " k=" << args.k
+        << std::endl;
     gpu_mvr::GpuMemoryTracker gpu_memory;
     gpu_memory.sample("after_index_construct");
 
     for (const auto& runtime_config : runtime_configs) {
+        std::cout
+            << "[RUN] Starting config label=" << runtime_config.label
+            << " warmup_queries=" << warmup_queries
+            << " eval_queries=" << run_queries
+            << " k=" << args.k
+            << std::endl;
         print_gpu_search_runtime_config_banner(runtime_config);
         index.nprobe = runtime_config.runtime.nprobe;
         index.k_rank_cluster = runtime_config.runtime.k_rank_cluster;
@@ -65,8 +133,17 @@ int main(int argc, char** argv) {
         index.overlap_chunks = runtime_config.runtime.overlap_chunks;
         gpu_memory.sample("config_begin:" + runtime_config.label);
 
+        const auto warmup_start = std::chrono::steady_clock::now();
+        auto warmup_last_log = warmup_start;
         for (int i = 0; i < warmup_queries; ++i) {
             index.search_profiled(&Q[i * Q_DOCLEN * d], args.k);
+            maybe_print_phase_progress(
+                runtime_config.label,
+                "warmup",
+                i + 1,
+                warmup_queries,
+                warmup_start,
+                warmup_last_log);
             gpu_memory.sample_query_if_needed(
                 "warmup:" + runtime_config.label,
                 static_cast<size_t>(i),
@@ -78,6 +155,8 @@ int main(int argc, char** argv) {
         std::vector<std::vector<size_t>> results(run_queries);
         std::vector<double> query_latencies_ms;
         query_latencies_ms.reserve(run_queries);
+        const auto eval_start = std::chrono::steady_clock::now();
+        auto eval_last_log = eval_start;
         for (int i = 0; i < run_queries; ++i) {
             const int query_idx = warmup_queries + i;
             const auto query_start = std::chrono::high_resolution_clock::now();
@@ -85,6 +164,13 @@ int main(int argc, char** argv) {
             const auto query_end = std::chrono::high_resolution_clock::now();
             query_latencies_ms.push_back(
                 std::chrono::duration<double, std::milli>(query_end - query_start).count());
+            maybe_print_phase_progress(
+                runtime_config.label,
+                "eval",
+                i + 1,
+                run_queries,
+                eval_start,
+                eval_last_log);
             gpu_memory.sample_query_if_needed(
                 "eval:" + runtime_config.label,
                 static_cast<size_t>(i),

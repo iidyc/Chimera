@@ -29,6 +29,13 @@ GPU_END_TO_END_RE = re.compile(r"^\[SEARCH\] End-to-end measured time: ([0-9.]+)
 GPU_THROUGHPUT_RE = re.compile(r"^\[SEARCH\] Throughput: ([0-9.]+) qps$")
 GPU_AVG_LATENCY_RE = re.compile(r"^\[SEARCH\] Average latency per query: ([0-9.]+) ms$")
 GPU_RECALL_RE = re.compile(r"^Recall@(\d+): ([0-9.]+)$")
+GPU_MEM_RE = re.compile(
+    r"^\[GPU_MEM\] current=(?P<current>[0-9.]+) MiB, "
+    r"peak=(?P<peak>[0-9.]+) MiB, "
+    r"total=(?P<total>[0-9.]+) MiB, "
+    r"samples=(?P<samples>\d+), "
+    r"peak_label=(?P<peak_label>.+)$"
+)
 
 COLBERT_CONFIG_RE = re.compile(
     r"^\[CONFIG\] label=(?P<label>\S+) ncells=(?P<ncells>\d+) ndocs=(?P<ndocs>\d+)$"
@@ -67,6 +74,11 @@ GPU_RESULTS_HEADER = [
     "p99_ms",
     "max_ms",
     "stddev_ms",
+    "gpu_mem_current_mib",
+    "gpu_mem_peak_mib",
+    "gpu_mem_total_mib",
+    "gpu_mem_samples",
+    "gpu_mem_peak_label",
 ]
 
 COLBERT_RESULTS_HEADER = [
@@ -107,8 +119,8 @@ class ParsedOutputs:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Parse benchmark logs written under log/bench and regenerate the "
-            "structured CSV outputs under profiling/."
+            "Parse raw benchmark logs written under log/bench and regenerate "
+            "the structured CSV outputs under profiling/."
         )
     )
     parser.add_argument(
@@ -130,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         "paths",
         nargs="+",
         type=Path,
-        help="One or more benchmark.log files or directories containing them.",
+        help="One or more benchmark*.log files or directories containing them.",
     )
     return parser.parse_args()
 
@@ -229,8 +241,12 @@ def parse_gpu_mvr_log(log_file: Path, repo_root_override: Path | None) -> Parsed
 
     implementation = require_metadata(metadata, "implementation")
     dataset = require_metadata(metadata, "dataset")
-    index_source = require_metadata(metadata, "index_source")
-    index_path = require_metadata(metadata, "active_index_dir")
+    index_source = metadata.get("index_source", "nfs")
+    index_path = metadata.get("active_index_dir") or metadata.get("source_index_dir")
+    if not index_path:
+        raise ParseError(
+            f"missing [driver] active_index_dir=... or [driver] source_index_dir=... in log"
+        )
     k = require_metadata(metadata, "k")
     warmup = require_metadata(metadata, "warmup")
     results_csv = remap_repo_path(require_metadata(metadata, "results_csv"), metadata, repo_root_override)
@@ -239,10 +255,28 @@ def parse_gpu_mvr_log(log_file: Path, repo_root_override: Path | None) -> Parsed
     rows: list[dict[str, str]] = []
     current_config: dict[str, str] | None = None
     current_metrics: dict[str, str] = {}
+    gpu_mem: dict[str, str] = {
+        "gpu_mem_current_mib": "",
+        "gpu_mem_peak_mib": "",
+        "gpu_mem_total_mib": "",
+        "gpu_mem_samples": "",
+        "gpu_mem_peak_label": "",
+    }
 
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
+            continue
+
+        match = GPU_MEM_RE.match(line)
+        if match:
+            gpu_mem = {
+                "gpu_mem_current_mib": match.group("current"),
+                "gpu_mem_peak_mib": match.group("peak"),
+                "gpu_mem_total_mib": match.group("total"),
+                "gpu_mem_samples": match.group("samples"),
+                "gpu_mem_peak_label": match.group("peak_label"),
+            }
             continue
 
         match = GPU_CONFIG_RE.match(line)
@@ -353,6 +387,7 @@ def parse_gpu_mvr_log(log_file: Path, repo_root_override: Path | None) -> Parsed
                     "p99_ms": current_metrics["p99_ms"],
                     "max_ms": current_metrics["max_ms"],
                     "stddev_ms": current_metrics["stddev_ms"],
+                    **gpu_mem,
                 }
             )
             current_config = None
@@ -363,6 +398,10 @@ def parse_gpu_mvr_log(log_file: Path, repo_root_override: Path | None) -> Parsed
 
     if not rows:
         raise ParseError(f"no GPU-MVR benchmark rows found in {log_file}")
+
+    if any(value for value in gpu_mem.values()):
+        for row in rows:
+            row.update(gpu_mem)
 
     expected_count = metadata.get("config_count")
     if expected_count and len(rows) != int(expected_count):
@@ -552,13 +591,13 @@ def discover_log_files(paths: list[Path]) -> list[Path]:
             discovered.append(path)
             continue
         if path.is_dir():
-            discovered.extend(sorted(path.rglob("benchmark.log")))
+            discovered.extend(sorted(path.rglob("benchmark*.log")))
             continue
         raise ParseError(f"path not found: {path}")
 
     unique_logs = sorted(dict.fromkeys(discovered))
     if not unique_logs:
-        raise ParseError("no benchmark.log files found")
+        raise ParseError("no benchmark*.log files found")
     return unique_logs
 
 

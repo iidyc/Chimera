@@ -13,16 +13,22 @@ int doc_ht_find_or_insert(
     int* __restrict__ touched_list,    // [max_compact_docs]
     int* __restrict__ num_inserted,    // scalar, init 0
     int  doc_id,
+    int  max_compact_docs,
     unsigned int ht_mask               // ht_capacity - 1
 ) {
     unsigned int h = (unsigned int)doc_id * 2654435761u;   // Knuth multiplicative hash
     h &= ht_mask;
 
-    for (;;) {
+    const unsigned int ht_capacity = ht_mask + 1;
+    for (unsigned int probe_count = 0; probe_count < ht_capacity; ++probe_count) {
         int probe = atomicCAS(&ht_keys[h], -1, doc_id);
         if (probe == -1) {
             // We just inserted this key. Allocate a compact id.
             int cid = atomicAdd(num_inserted, 1);
+            if (cid >= max_compact_docs) {
+                atomicExch(&ht_vals[h], -2);  // overflow sentinel
+                return -1;
+            }
             touched_list[cid] = doc_id;
             atomicExch(&ht_vals[h], cid);     // publish
             return cid;
@@ -30,12 +36,13 @@ int doc_ht_find_or_insert(
         if (probe == doc_id) {
             // Key already exists. Spin until compact_id is published.
             int cid;
-            do { cid = *(volatile int*)&ht_vals[h]; } while (cid < 0);
-            return cid;
+            do { cid = *(volatile int*)&ht_vals[h]; } while (cid == -1);
+            return (cid >= 0 && cid < max_compact_docs) ? cid : -1;
         }
         // Collision with a different key — linear probe.
         h = (h + 1) & ht_mask;
     }
+    return -1;
 }
 #endif
 
@@ -227,6 +234,7 @@ __global__ void stage1_binary_ip_lut_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -326,7 +334,10 @@ __global__ void stage1_binary_ip_lut_kernel(
             int cid = doc_ht_find_or_insert(
                 d_ht_keys, d_ht_vals,
                 d_touched_doc_list, d_num_touched_docs,
-                doc_id, ht_mask);
+                doc_id, max_touched_docs, ht_mask);
+            if (cid < 0) {
+                continue;
+            }
 
             float* slot = &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx];
 #else
@@ -372,6 +383,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     int*         d_ht_vals,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
+    int          max_touched_docs,
     unsigned int ht_mask,
 #else
     int*         d_doc_touched,
@@ -467,7 +479,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
             int cid = doc_ht_find_or_insert(
                 d_ht_keys, d_ht_vals,
                 d_touched_doc_list, d_num_touched_docs,
-                doc_id, ht_mask);
+                doc_id, max_touched_docs, ht_mask);
+            if (cid < 0) {
+                continue;
+            }
 
             float* slot = &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx];
 #else
@@ -816,6 +831,7 @@ __global__ void aggregate_stage1_tracked_kernel(
     int*          d_ht_vals,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
+    int           max_touched_docs,
     unsigned int  ht_mask,
 #else
     int*          d_doc_touched,
@@ -859,7 +875,8 @@ __global__ void aggregate_stage1_tracked_kernel(
     int cid = doc_ht_find_or_insert(
         d_ht_keys, d_ht_vals,
         d_touched_doc_list, d_num_touched_docs,
-        doc_id, ht_mask);
+        doc_id, max_touched_docs, ht_mask);
+    if (cid < 0) return;
     atomicMaxFloat(&d_doc_query_max[(size_t)cid * Q_DOCLEN + q_idx], dist);
 #else
     // Doc-major layout: [doc_id * Q_DOCLEN + q_idx]. Adjacent q's for same

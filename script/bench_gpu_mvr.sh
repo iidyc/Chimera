@@ -9,39 +9,36 @@ Usage:
   script/bench_gpu_mvr.sh [dataset_name ...] [options]
 
 Description:
-  Benchmark a GPU-MVR gpu_search version on one or more datasets and write per-dataset
-  recall-vs-qps measurements plus a Pareto frontier CSV.
+  Benchmark a GPU-MVR gpu_search version on one or more datasets and write
+  raw per-run logs only.
 
   By default, the script benchmarks:
     hotpot
     lotte
 
-  It reads search configurations from profiling/gpu_mvr_config.csv and writes:
-    profiling/<dataset>/<implementation>/benchmark_results.csv
-    profiling/<dataset>/<implementation>/pareto_frontier.csv
-    log/bench/<implementation>/<dataset>/benchmark.log
+  It reads search configurations from profiling/gpu_mvr_config.csv and writes
+  a unique log file for each dataset run:
+    log/bench/<implementation>/<dataset>/benchmark_<run_id>.log
 
-  Optional /tmp staging can copy dataset/<name>/gpu_mvr into local
-  storage first and reuse the copy across subsequent runs.
+  The log records the intended structured-output paths, but this script does
+  not generate CSV tables itself. Use script/parse_bench_logs.py later to
+  regenerate benchmark_results_*.csv and pareto_frontier_*.csv from the logs.
 
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
-  --version <v0|v1|v2|v3|v4|v5>  GPU-MVR search version. Default: v3
+  --version <v0|v1|v2|v3|v4|v5|v6>  GPU-MVR search version. Default: v3
   --implementation-label <label>
                            Output folder label. Default: gpu_search_<version>
   --config-file <path>     Config CSV. Default: profiling/gpu_mvr_config.csv
   --build-dir <path>       Dedicated build directory. Default: gpu-mvr/build
   --binary <path>          Search binary. Overrides --build-dir and --version.
                            Default: <build-dir>/gpu_search_<version>
-  --output-dir <path>      CSV output directory. Default: profiling
+  --output-dir <path>      Structured-output root recorded in log metadata for
+                           script/parse_bench_logs.py. Default: profiling
   --log-dir <path>         Log output directory. Default: log/bench
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
   --nq <count>             Evaluation queries after warmup. Default: -1
   --warmup <count>         Warmup query count. Default: 5
-  --copy-index-to-tmp      Copy gpu_mvr into /tmp before benchmarking.
-  --refresh-tmp-index      Re-copy the /tmp index even if it already exists.
-  --tmp-root <path>        Root directory for /tmp index copies.
-                           Default: /tmp/$USER/gpu_mvr_benchmark
   --dry-run                Print planned commands without executing them.
   -h, --help               Show this help message.
 EOF
@@ -50,21 +47,6 @@ EOF
 die() {
     echo "error: $*" >&2
     exit 1
-}
-
-trim_field() {
-    local value="$1"
-    value="${value//$'\r'/}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s' "$value"
-}
-
-run_cmd() {
-    echo "+ $(printf '%q ' "$@")"
-    if [[ $dry_run -eq 0 ]]; then
-        "$@"
-    fi
 }
 
 log_line() {
@@ -76,13 +58,21 @@ log_line() {
     fi
 }
 
-log_capture_safe_line() {
-    local line="$1"
-    if [[ $dry_run -eq 1 ]]; then
-        echo "$line" >&2
+make_run_id() {
+    local timestamp
+    local suffix
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+    if [[ -n "${SLURM_JOB_ID-}" ]]; then
+        suffix="job${SLURM_JOB_ID}"
+        if [[ -n "${SLURM_ARRAY_TASK_ID-}" ]]; then
+            suffix+="_task${SLURM_ARRAY_TASK_ID}"
+        fi
     else
-        echo "$line" | tee -a "$current_log_file" >&2
+        suffix="pid$$"
     fi
+
+    printf '%s_%s' "$timestamp" "$suffix"
 }
 
 require_positive_int() {
@@ -179,16 +169,6 @@ print_hardware_info() {
     done
 }
 
-extract_last_match_or_die() {
-    local source_file="$1"
-    local sed_expr="$2"
-    local description="$3"
-    local value=""
-    value="$(sed -nE "$sed_expr" "$source_file" | tail -n 1)"
-    [[ -n "$value" ]] || die "failed to parse ${description} from ${source_file}"
-    printf '%s' "$value"
-}
-
 count_gpu_search_configs() {
     local config_path="$1"
     awk -F, '
@@ -210,271 +190,24 @@ count_gpu_search_configs() {
     ' "$config_path"
 }
 
-parse_batched_gpu_search_output() {
-    local run_output="$1"
-    local dataset_name="$2"
-    local active_index_dir="$3"
-    local index_source="$4"
+resolve_source_index_dir() {
+    local dataset_dir="$1"
+    local candidate=""
+    local candidates=(
+        "${dataset_dir}/gpu_mvr_2m"
+        "${dataset_dir}/gpu_mvr_1m"
+        "${dataset_dir}/gpu_mvr"
+        "${dataset_dir}/gpu_mvr_index"
+    )
 
-    awk \
-        -v implementation_label="$implementation_label" \
-        -v dataset_name="$dataset_name" \
-        -v index_source="$index_source" \
-        -v index_path="$active_index_dir" \
-        -v k="$k" \
-        -v warmup="$warmup" '
-        function fail(message) {
-            print "error: " message > "/dev/stderr"
-            exit 1
-        }
-
-        function reset_metrics() {
-            search_seconds = ""
-            queries = ""
-            end_to_end_ms = ""
-            qps = ""
-            recall = ""
-            avg_latency_ms = ""
-            p50_ms = ""
-            p90_ms = ""
-            p95_ms = ""
-            p99_ms = ""
-            max_ms = ""
-            stddev_ms = ""
-        }
-
-        function flush_row() {
-            if (current_label == "") {
-                fail("missing config label before metric emission")
-            }
-            if (search_seconds == "" || queries == "" || end_to_end_ms == "" ||
-                qps == "" || recall == "" || avg_latency_ms == "" ||
-                p50_ms == "" || p90_ms == "" || p95_ms == "" ||
-                p99_ms == "" || max_ms == "" || stddev_ms == "") {
-                fail("incomplete metric block for label=" current_label)
-            }
-
-            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-                   implementation_label, dataset_name, current_label,
-                   nprobe, k_rank_cluster, k_rank_all_tokens, itopk_size, overlap_chunks,
-                   index_source, index_path, queries, k, warmup, search_seconds,
-                   end_to_end_ms, qps, recall, avg_latency_ms, p50_ms, p90_ms,
-                   p95_ms, p99_ms, max_ms, stddev_ms
-            parsed_rows++
-            reset_metrics()
-        }
-
-        BEGIN {
-            current_label = ""
-            parsed_rows = 0
-            reset_metrics()
-        }
-
-        /^\[CONFIG\] / {
-            if (match($0, /^\[CONFIG\] label=([^ ]+) nprobe=([0-9]+) k_rank_cluster=([0-9]+) k_rank_all_tokens=([0-9]+) itopk_size=([0-9]+) overlap_chunks=([0-9]+)/, m)) {
-                current_label = m[1]
-                nprobe = m[2]
-                k_rank_cluster = m[3]
-                k_rank_all_tokens = m[4]
-                itopk_size = m[5]
-                overlap_chunks = m[6]
-                reset_metrics()
-                next
-            }
-            fail("unable to parse config banner: " $0)
-        }
-
-        /^\[[0-9.]+ s\] / && /GPU search time for [0-9]+ queries\.$/ {
-            if (current_label == "") {
-                fail("saw timing line before config banner")
-            }
-            if (match($0, /^\[([0-9.]+) s\] label=([^ ]+) (v0 )?GPU search time for ([0-9]+) queries\.$/, m)) {
-                if (m[2] != current_label) {
-                    fail("timing label mismatch: expected " current_label ", got " m[2])
-                }
-                search_seconds = m[1]
-                queries = m[4]
-                next
-            }
-            fail("unable to parse timing line: " $0)
-        }
-
-        /^\[SEARCH\] End-to-end measured time: / {
-            if (match($0, /^\[SEARCH\] End-to-end measured time: ([0-9.]+) ms$/, m)) {
-                end_to_end_ms = m[1]
-                next
-            }
-            fail("unable to parse end-to-end line: " $0)
-        }
-
-        /^\[SEARCH\] Throughput: / {
-            if (match($0, /^\[SEARCH\] Throughput: ([0-9.]+) qps$/, m)) {
-                qps = m[1]
-                next
-            }
-            fail("unable to parse throughput line: " $0)
-        }
-
-        /^\[SEARCH\] Average latency per query: / {
-            if (match($0, /^\[SEARCH\] Average latency per query: ([0-9.]+) ms$/, m)) {
-                avg_latency_ms = m[1]
-                next
-            }
-            fail("unable to parse average latency line: " $0)
-        }
-
-        /^\[SEARCH\] Query latency distribution \(ms\): / {
-            if (match($0, /^\[SEARCH\] Query latency distribution \(ms\): p50=([0-9.]+), p90=([0-9.]+), p95=([0-9.]+), p99=([0-9.]+), max=([0-9.]+), stddev=([0-9.]+)$/, m)) {
-                p50_ms = m[1]
-                p90_ms = m[2]
-                p95_ms = m[3]
-                p99_ms = m[4]
-                max_ms = m[5]
-                stddev_ms = m[6]
-                next
-            }
-            fail("unable to parse latency distribution line: " $0)
-        }
-
-        /^Recall@[0-9]+: / {
-            if (match($0, /^Recall@[0-9]+: ([0-9.]+)$/, m)) {
-                recall = m[1]
-                flush_row()
-                next
-            }
-            fail("unable to parse recall line: " $0)
-        }
-
-        END {
-            if (current_label != "" &&
-                (search_seconds != "" || queries != "" || end_to_end_ms != "" ||
-                 qps != "" || recall != "" || avg_latency_ms != "" ||
-                 p50_ms != "" || p90_ms != "" || p95_ms != "" ||
-                 p99_ms != "" || max_ms != "" || stddev_ms != "")) {
-                fail("incomplete trailing metric block for label=" current_label)
-            }
-            if (parsed_rows == 0) {
-                fail("no benchmark rows parsed from " FILENAME)
-            }
-        }
-    ' "$run_output"
-}
-
-copy_index_to_tmp_if_needed() {
-    local dataset_name="$1"
-    local source_index_dir="$2"
-    local source_index_name
-    source_index_name="$(basename "$source_index_dir")"
-    local dest_index_dir="${tmp_root}/${dataset_name}/${source_index_name}"
-
-    if [[ $copy_index_to_tmp -eq 0 ]]; then
-        printf '%s' "$source_index_dir"
-        return
-    fi
-
-    if [[ -d "$dest_index_dir" && $refresh_tmp_index -eq 0 \
-        && -f "$dest_index_dir/doc_1bit.bin" \
-        && -f "$dest_index_dir/doc_4bit.bin" \
-        && -f "$dest_index_dir/cluster_1bit.bin" \
-        && -f "$dest_index_dir/doclens.bin" \
-        && -f "$dest_index_dir/ivf.bin" \
-        && -f "$dest_index_dir/centroids.carga" ]]; then
-        log_capture_safe_line "[driver] reusing_tmp_index=${dest_index_dir}"
-        printf '%s' "$dest_index_dir"
-        return
-    fi
-
-    log_capture_safe_line "[driver] tmp_index_source=${source_index_dir}"
-    log_capture_safe_line "[driver] tmp_index_target=${dest_index_dir}"
-
-    if [[ $dry_run -eq 1 ]]; then
-        if command -v rsync >/dev/null 2>&1; then
-            echo "+ rsync -a --delete ${source_index_dir}/ ${dest_index_dir}/" >&2
-        else
-            echo "+ rm -rf ${dest_index_dir}" >&2
-            echo "+ mkdir -p $(dirname "$dest_index_dir") ${dest_index_dir}" >&2
-            echo "+ cp -a ${source_index_dir}/. ${dest_index_dir}/" >&2
+    for candidate in "${candidates[@]}"; do
+        if [[ -d "$candidate" && -f "${candidate}/doclens.bin" ]]; then
+            printf '%s' "$candidate"
+            return 0
         fi
-        printf '%s' "$dest_index_dir"
-        return
-    fi
+    done
 
-    local parent_dir
-    parent_dir="$(dirname "$dest_index_dir")"
-    mkdir -p "$parent_dir"
-
-    local source_size_bytes
-    local available_bytes
-    source_size_bytes="$(du -sb "$source_index_dir" | awk '{print $1}')"
-    available_bytes="$(df -B1 "$parent_dir" | awk 'NR==2 {print $4}')"
-    if (( available_bytes < source_size_bytes )); then
-        die "not enough free space under ${parent_dir} to copy ${source_index_dir}"
-    fi
-
-    local copy_start_utc
-    local copy_end_utc
-    local copy_start_s
-    local copy_end_s
-    copy_start_utc="$(date -u +%Y%m%dT%H%M%SZ)"
-    copy_start_s="$(date +%s)"
-    log_capture_safe_line "[driver] tmp_copy_start_utc=${copy_start_utc}"
-
-    if command -v rsync >/dev/null 2>&1; then
-        echo "+ $(printf '%q ' rsync -a --delete "${source_index_dir}/" "${dest_index_dir}/")" | tee -a "$current_log_file" >&2
-        rsync -a --delete "${source_index_dir}/" "${dest_index_dir}/"
-    else
-        echo "+ $(printf '%q ' rm -rf "$dest_index_dir")" | tee -a "$current_log_file" >&2
-        rm -rf "$dest_index_dir"
-        echo "+ $(printf '%q ' mkdir -p "$dest_index_dir")" | tee -a "$current_log_file" >&2
-        mkdir -p "$dest_index_dir"
-        echo "+ $(printf '%q ' cp -a "${source_index_dir}/." "${dest_index_dir}/")" | tee -a "$current_log_file" >&2
-        cp -a "${source_index_dir}/." "${dest_index_dir}/"
-    fi
-
-    copy_end_utc="$(date -u +%Y%m%dT%H%M%SZ)"
-    copy_end_s="$(date +%s)"
-    log_capture_safe_line "[driver] tmp_copy_end_utc=${copy_end_utc}"
-    log_capture_safe_line "[driver] tmp_copy_elapsed_seconds=$((copy_end_s - copy_start_s))"
-    log_capture_safe_line "[driver] tmp_index_size=$(du -sh "$dest_index_dir" | awk '{print $1}')"
-
-    printf '%s' "$dest_index_dir"
-}
-
-write_pareto_frontier() {
-    local results_csv="$1"
-    local pareto_csv="$2"
-    local header=""
-
-    header="$(head -n 1 "$results_csv")"
-    {
-        printf '%s\n' "$header"
-        tail -n +2 "$results_csv" | awk -F, '
-            {
-                n++
-                row[n] = $0
-                qps[n] = $16 + 0.0
-                recall[n] = $17 + 0.0
-            }
-            END {
-                for (i = 1; i <= n; ++i) {
-                    dominated = 0
-                    for (j = 1; j <= n; ++j) {
-                        if (i == j) {
-                            continue
-                        }
-                        if ((qps[j] >= qps[i] && recall[j] >= recall[i]) &&
-                            (qps[j] > qps[i] || recall[j] > recall[i])) {
-                            dominated = 1
-                            break
-                        }
-                    }
-                    if (!dominated) {
-                        print row[i]
-                    }
-                }
-            }
-        ' | sort -t, -k16,16g -k17,17g
-    } > "$pareto_csv"
+    return 1
 }
 
 benchmark_dataset() {
@@ -484,52 +217,47 @@ benchmark_dataset() {
 
     local dataset_dir="${repo_root}/dataset/${dataset_name}"
     local raw_dir="${dataset_dir}/raw"
-    local source_index_dir="${dataset_dir}/gpu_mvr"
+    local source_index_dir=""
     local query_file="${raw_dir}/query.bin"
     local index_doclens_file="${source_index_dir}/doclens.bin"
     local gt_file="${raw_dir}/gt.tsv"
     local impl_output_dir="${output_dir}/${dataset_name}/${implementation_label}"
     local impl_log_dir="${log_dir}/${implementation_label}/${dataset_name}"
-    local results_csv="${impl_output_dir}/benchmark_results.csv"
-    local pareto_csv="${impl_output_dir}/pareto_frontier.csv"
-    local log_file="${impl_log_dir}/benchmark.log"
-    local index_source="nfs"
-    local active_index_dir=""
+    local run_id=""
+    local results_csv=""
+    local pareto_csv=""
+    local log_file=""
     local config_count=""
-    local run_output=""
     local status=0
     local run_start_utc=""
     local run_end_utc=""
-    local parsed_rows=""
-    local parsed_count=""
     local command=()
 
     [[ -d "$dataset_dir" ]] || die "dataset directory not found: ${dataset_dir}"
     [[ -f "$query_file" ]] || die "missing query file: ${query_file}"
     [[ -f "$gt_file" ]] || die "missing ground truth file: ${gt_file}"
-    if [[ ! -d "$source_index_dir" ]]; then
-        source_index_dir="${dataset_dir}/gpu_mvr_index"
-        index_doclens_file="${source_index_dir}/doclens.bin"
-    fi
+    source_index_dir="$(resolve_source_index_dir "$dataset_dir")" || \
+        die "missing index directory: expected one of ${dataset_dir}/gpu_mvr_2m, ${dataset_dir}/gpu_mvr_1m, ${dataset_dir}/gpu_mvr, or ${dataset_dir}/gpu_mvr_index"
+    index_doclens_file="${source_index_dir}/doclens.bin"
 
-    [[ -d "$source_index_dir" ]] || die "missing index directory: ${dataset_dir}/gpu_mvr (or legacy gpu_mvr_index)"
     [[ -f "$index_doclens_file" ]] || die "missing index doclens file: ${index_doclens_file}"
+
+    run_id="$(make_run_id)"
+    results_csv="${impl_output_dir}/benchmark_results_${run_id}.csv"
+    pareto_csv="${impl_output_dir}/pareto_frontier_${run_id}.csv"
+    log_file="${impl_log_dir}/benchmark_${run_id}.log"
 
     current_log_file="$log_file"
 
     if [[ $dry_run -eq 0 ]]; then
-        mkdir -p "$impl_output_dir" "$impl_log_dir"
+        mkdir -p "$impl_log_dir"
         : > "$log_file"
-    fi
-
-    active_index_dir="$(copy_index_to_tmp_if_needed "$dataset_name" "$source_index_dir")"
-    if [[ "$active_index_dir" != "$source_index_dir" ]]; then
-        index_source="tmp"
     fi
 
     log_line "[driver] repo_root=${repo_root}"
     log_line "[driver] implementation=${implementation_label}"
     log_line "[driver] dataset=${dataset_name}"
+    log_line "[driver] run_id=${run_id}"
     log_line "[driver] config_file=${config_file}"
     log_line "[driver] build_dir=${build_dir}"
     log_line "[driver] binary=${binary}"
@@ -537,31 +265,23 @@ benchmark_dataset() {
     log_line "[driver] index_doclens_file=${index_doclens_file}"
     log_line "[driver] gt_file=${gt_file}"
     log_line "[driver] source_index_dir=${source_index_dir}"
-    log_line "[driver] active_index_dir=${active_index_dir}"
-    log_line "[driver] index_source=${index_source}"
+    log_line "[driver] output_dir=${output_dir}"
     log_line "[driver] results_csv=${results_csv}"
     log_line "[driver] pareto_csv=${pareto_csv}"
+    log_line "[driver] log_file=${log_file}"
+    log_line "[driver] parser_script=${repo_root}/script/parse_bench_logs.py"
     log_line "[driver] k=${k}"
     log_line "[driver] nq=${nq}"
     log_line "[driver] warmup=${warmup}"
-    log_line "[driver] copy_index_to_tmp=${copy_index_to_tmp}"
-    log_line "[driver] refresh_tmp_index=${refresh_tmp_index}"
-    log_line "[driver] tmp_root=${tmp_root}"
     print_hardware_info
     config_count="$(count_gpu_search_configs "$config_file")"
     log_line "[driver] config_count=${config_count}"
-
-    if [[ $dry_run -eq 0 ]]; then
-        printf '%s\n' \
-            "implementation,dataset,label,nprobe,k_rank_cluster,k_rank_all_tokens,itopk_size,overlap_chunks,index_source,index_path,queries,k,warmup,search_seconds,end_to_end_ms,qps,recall,avg_latency_ms,p50_ms,p90_ms,p95_ms,p99_ms,max_ms,stddev_ms" \
-            > "$results_csv"
-    fi
 
     command=(
         "$binary"
         --query "$query_file"
         --gt "$gt_file"
-        --index "$active_index_dir"
+        --index "$source_index_dir"
         --k "$k"
         --nq "$nq"
         --warmup "$warmup"
@@ -575,49 +295,30 @@ benchmark_dataset() {
         return
     fi
 
-    run_output="$(mktemp "${TMPDIR:-/tmp}/gpu_search_${version}.${dataset_name}.XXXXXX.log")"
     run_start_utc="$(date -u +%Y%m%dT%H%M%SZ)"
     log_line "[run] start_utc=${run_start_utc}"
+    log_line "[run] live_output=enabled"
 
     set +e
-    "${command[@]}" > "$run_output" 2>&1
-    status=$?
+    if command -v stdbuf >/dev/null 2>&1; then
+        stdbuf -oL -eL "${command[@]}" 2>&1 | tee -a "$current_log_file"
+        status=${PIPESTATUS[0]}
+    else
+        "${command[@]}" 2>&1 | tee -a "$current_log_file"
+        status=${PIPESTATUS[0]}
+    fi
     set -e
 
-    tee -a "$current_log_file" < "$run_output"
     run_end_utc="$(date -u +%Y%m%dT%H%M%SZ)"
     log_line "[run] end_utc=${run_end_utc}"
     log_line "[run] exit_code=${status}"
 
     if [[ $status -ne 0 ]]; then
-        rm -f "$run_output"
         die "gpu_search_${version} failed for dataset=${dataset_name}; see ${current_log_file}"
     fi
 
-    parsed_rows="$(parse_batched_gpu_search_output "$run_output" "$dataset_name" "$active_index_dir" "$index_source")" || {
-        rm -f "$run_output"
-        die "failed to parse batched gpu_search_${version} output for dataset=${dataset_name}; see ${current_log_file}"
-    }
-    parsed_count="$(printf '%s\n' "$parsed_rows" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
-    [[ "$parsed_count" == "$config_count" ]] || die "parsed ${parsed_count} result rows but expected ${config_count} configs for dataset=${dataset_name}"
-    printf '%s\n' "$parsed_rows" >> "$results_csv"
-
-    while IFS=, read -r _ _ parsed_label _ _ _ _ _ _ _ _ _ _ _ _ parsed_qps parsed_recall parsed_avg_latency_ms _; do
-        [[ -n "$parsed_label" ]] || continue
-        log_line "[run] parsed_metrics label=${parsed_label} qps=${parsed_qps} recall=${parsed_recall} avg_latency_ms=${parsed_avg_latency_ms}"
-    done <<< "$parsed_rows"
-
-    rm -f "$run_output"
-
-    if [[ $dry_run -eq 0 ]]; then
-        write_pareto_frontier "$results_csv" "$pareto_csv"
-        log_line "[summary] results_csv=${results_csv}"
-        log_line "[summary] pareto_csv=${pareto_csv}"
-        log_line "[summary] pareto_points=$(tail -n +2 "$pareto_csv" | wc -l | tr -d '[:space:]')"
-        log_line "[summary] pareto_frontier_begin"
-        tail -n +2 "$pareto_csv" | tee -a "$current_log_file"
-        log_line "[summary] pareto_frontier_end"
-    fi
+    log_line "[summary] raw_log=${log_file}"
+    log_line "[summary] parse_with=$(printf '%q ' "${repo_root}/script/parse_bench_logs.py" "$log_file")"
 }
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -628,14 +329,11 @@ build_dir="${repo_root}/gpu-mvr/build"
 binary=""
 output_dir="${repo_root}/profiling"
 log_dir="${repo_root}/log/bench"
-tmp_root="/tmp/${USER:-user}/gpu_mvr_benchmark"
 version="v3"
 implementation_label=""
 k=100
 nq=-1
 warmup=5
-copy_index_to_tmp=0
-refresh_tmp_index=0
 dry_run=0
 dataset_set=0
 binary_set=0
@@ -703,19 +401,6 @@ while [[ $# -gt 0 ]]; do
             warmup="$2"
             shift 2
             ;;
-        --copy-index-to-tmp)
-            copy_index_to_tmp=1
-            shift
-            ;;
-        --refresh-tmp-index)
-            refresh_tmp_index=1
-            shift
-            ;;
-        --tmp-root)
-            [[ $# -ge 2 ]] || die "missing value for --tmp-root"
-            tmp_root="$2"
-            shift 2
-            ;;
         --dry-run)
             dry_run=1
             shift
@@ -740,10 +425,10 @@ if [[ $dataset_set -eq 0 ]]; then
 fi
 
 case "$version" in
-    v0|v1|v2|v3|v4|v5)
+    v0|v1|v2|v3|v4|v5|v6)
         ;;
     *)
-        die "--version must be one of: v0, v1, v2, v3, v4, v5"
+        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6"
         ;;
 esac
 

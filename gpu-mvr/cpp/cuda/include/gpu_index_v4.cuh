@@ -95,25 +95,32 @@ struct gpu_mvr_index {
     std::vector<char> full_code_;
     std::vector<float> one_bit_factor_;
     std::vector<float> ex_factor_;
+#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
     std::vector<int> doc_ids_;
+#endif
     std::vector<int> doc_ptrs_;
     float (*ip_func_)(const float*, const uint8_t*, size_t);
     void (*unpack_func_)(const uint8_t*, float*, size_t);
 
     // GPU persistent data
-    char*  d_one_bit_code_;
-    float* d_one_bit_factor_;
-    int*   d_doc_ids_;
-    int*   d_doc_ptrs_;
-    int*   d_inv_list_;
-    size_t* d_cluster_pos_;
+    char*  d_one_bit_code_ = nullptr;
+    float* d_one_bit_factor_ = nullptr;
+#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
+    int*   d_doc_ids_ = nullptr;
+#endif
+    int*   d_doc_ptrs_ = nullptr;
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    int*   d_doc_block_lut_ = nullptr;
+#endif
+    int*   d_inv_list_ = nullptr;
+    size_t* d_cluster_pos_ = nullptr;
 
     // Cluster-ordered copies: data reordered by inv_list so that vectors
     // in the same cluster are contiguous in memory. Stage-1 reads these
     // instead of the original arrays for coalesced global memory access.
-    char*  d_clustered_code_;
-    float* d_clustered_factor_;
-    int*   d_clustered_doc_ids_;
+    char*  d_clustered_code_ = nullptr;
+    float* d_clustered_factor_ = nullptr;
+    int*   d_clustered_doc_ids_ = nullptr;
     bool   use_clustered_ = true;  // false = fallback to non-clustered + inv_list indirection
 
     // Search parameters

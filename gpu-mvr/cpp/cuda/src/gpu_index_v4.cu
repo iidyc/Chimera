@@ -20,12 +20,21 @@
 #error "GPU_MVR_CLUSTERED_LAYOUT_DISABLED and GPU_MVR_CLUSTERED_LAYOUT_REQUIRED are mutually exclusive"
 #endif
 
+#if defined(GPU_MVR_DOCID_VIA_DOCPTRS) && \
+    !defined(GPU_MVR_CLUSTERED_LAYOUT_DISABLED)
+#error "GPU_MVR_DOCID_VIA_DOCPTRS currently requires GPU_MVR_CLUSTERED_LAYOUT_DISABLED"
+#endif
+
 // ======================== CONSTRUCTOR ========================
 
 gpu_mvr_index::gpu_mvr_index(
     const std::string& filename,
     const std::vector<int>& doc_lens,
     const gpu_search_runtime_options& runtime_options) {
+    auto log_ctor_step = [](const std::string& message) {
+        std::cout << "[INIT][index_ctor] " << message << std::endl;
+    };
+
     nprobe = runtime_options.nprobe;
     k_rank_cluster = runtime_options.k_rank_cluster;
     k_rank_all_tokens = runtime_options.k_rank_all_tokens;
@@ -36,6 +45,10 @@ gpu_mvr_index::gpu_mvr_index(
     const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
     startup.mark("resolve_index_paths");
 
+    log_ctor_step(
+        "Loading quantized payloads from " +
+        resolved_paths.quantized_data_path + " and " +
+        resolved_paths.doc_4bit_path + " ...");
     std::ifstream inf(resolved_paths.quantized_data_path, std::ios::binary);
     const auto header =
         mvr_index_file_format::read_header(inf, resolved_paths.quantized_data_path);
@@ -92,20 +105,64 @@ gpu_mvr_index::gpu_mvr_index(
     ip_func_ = select_excode_ipfunc(1 + ex_bits);
     unpack_func_ = select_excode_unpackfunc(1 + ex_bits);
 
+    log_ctor_step(
+        "Loading IVF postings and centroid graph from " +
+        resolved_paths.ivf_path + " and " +
+        resolved_paths.centroids_path + " ...");
     ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
     ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
     max_cluster_size = ivf->max_cluster_size();
-    std::cout << "max cluster size: " << max_cluster_size << "\n";
+    std::cout << "max cluster size: " << max_cluster_size << std::endl;
     startup.mark("load_ivf");
 
+    log_ctor_step(
+        "Building document-to-token map for " +
+        std::to_string(doc_lens.size()) + " docs and " +
+        std::to_string(n) + " embeddings ...");
     set_doc_mapping(doc_lens);
     startup.mark("set_doc_mapping");
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    log_ctor_step(
+        "GPU doc-id mapping will use d_doc_ptrs-only lookup; "
+        "skipping dense d_doc_ids allocation.");
+#endif
 
+    log_ctor_step("Uploading persistent stage-1 data to GPU ...");
     const size_t code_bytes = n * PADDED_DIM / 8;
     CUDA_CHECK(cudaMalloc(&d_one_bit_code_, code_bytes));
     CUDA_CHECK(cudaMalloc(&d_one_bit_factor_, n * sizeof(float)));
+#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
     CUDA_CHECK(cudaMalloc(&d_doc_ids_, n * sizeof(int)));
+#endif
     CUDA_CHECK(cudaMalloc(&d_doc_ptrs_, (num_docs + 1) * sizeof(int)));
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    {
+        const size_t num_doc_blocks =
+            (n + kDocPtrLookupBlockSize - 1) >> kDocPtrLookupBlockShift;
+        std::vector<int> doc_block_lut(num_doc_blocks + 1, 0);
+        size_t doc_id = 0;
+        for (size_t block = 0; block < num_doc_blocks; ++block) {
+            const size_t token_boundary = block * kDocPtrLookupBlockSize;
+            while (doc_id + 1 < doc_ptrs_.size() &&
+                   static_cast<size_t>(doc_ptrs_[doc_id + 1]) <= token_boundary) {
+                ++doc_id;
+            }
+            doc_block_lut[block] = static_cast<int>(doc_id);
+        }
+        doc_block_lut[num_doc_blocks] = static_cast<int>(num_docs - 1);
+        CUDA_CHECK(cudaMalloc(
+            &d_doc_block_lut_,
+            doc_block_lut.size() * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(
+            d_doc_block_lut_,
+            doc_block_lut.data(),
+            doc_block_lut.size() * sizeof(int),
+            cudaMemcpyHostToDevice));
+        log_ctor_step(
+            "Uploaded doc_ptr lookup table with " +
+            std::to_string(doc_block_lut.size()) + " entries.");
+    }
+#endif
 
     CUDA_CHECK(cudaMalloc(&d_cluster_pos_, (ivf->n_clusters + 1) * sizeof(size_t)));
     CUDA_CHECK(cudaMemcpy(
@@ -130,16 +187,46 @@ gpu_mvr_index::gpu_mvr_index(
 
     CUDA_CHECK(cudaMemcpy(d_one_bit_code_, one_bit_code_.data(), code_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_one_bit_factor_, one_bit_factor_.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
     CUDA_CHECK(cudaMemcpy(d_doc_ids_, doc_ids_.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+#endif
     CUDA_CHECK(cudaMemcpy(d_doc_ptrs_, doc_ptrs_.data(), (num_docs + 1) * sizeof(int), cudaMemcpyHostToDevice));
     startup.mark("upload_persistent_data");
 
+    log_ctor_step(
+        "Allocating GPU workspace for max runtime config "
+        "(nprobe=" + std::to_string(nprobe) +
+        ", k_rank_cluster=" + std::to_string(k_rank_cluster) +
+        ", k_rank_all_tokens=" + std::to_string(k_rank_all_tokens) +
+        ", itopk_size=" + std::to_string(itopk_size) +
+        ", overlap_chunks=" + std::to_string(overlap_chunks) + ") ...");
     allocate_workspace();
     startup.mark("allocate_workspace");
 
     {
         const size_t inv_n = ivf->inv_list.size();
         const size_t code_per_vec = PADDED_DIM / 8;
+#ifdef GPU_MVR_CLUSTERED_LAYOUT_DISABLED
+#ifdef GPU_MVR_USE_LUT
+        if (d_inv_list_ == nullptr) {
+            const size_t inv_list_size = ivf->inv_list.size();
+            CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
+            CUDA_CHECK(cudaMemcpy(
+                d_inv_list_,
+                ivf->inv_list.data(),
+                inv_list_size * sizeof(int),
+                cudaMemcpyHostToDevice));
+        }
+#endif
+        use_clustered_ = false;
+        d_clustered_code_ = nullptr;
+        d_clustered_factor_ = nullptr;
+        d_clustered_doc_ids_ = nullptr;
+        std::cout << "[gpu_mvr] Clustered layout disabled for this build. "
+                     "Using original-order layout with inv_list indirection."
+                  << std::endl;
+        startup.mark("disable_clustered_layout");
+#else
         const size_t clustered_bytes =
             inv_n * (code_per_vec + sizeof(float) + sizeof(int));
 
@@ -175,6 +262,9 @@ gpu_mvr_index::gpu_mvr_index(
                     resolved_paths.gpu_index_path);
             }
 
+            log_ctor_step(
+                "Loading cluster-ordered stage-1 layout from " +
+                resolved_paths.gpu_index_path + " ...");
             std::ifstream clustered_header_file(
                 resolved_paths.gpu_index_path, std::ios::binary);
             const auto clustered_header =
@@ -281,12 +371,7 @@ gpu_mvr_index::gpu_mvr_index(
             startup.mark("load_clustered_layout");
         };
 
-#ifdef GPU_MVR_CLUSTERED_LAYOUT_DISABLED
-        disable_clustered_layout(
-            "[gpu_mvr] Clustered layout disabled for this build. "
-            "Using original-order layout with inv_list indirection.",
-            "disable_clustered_layout");
-#elif defined(GPU_MVR_CLUSTERED_LAYOUT_REQUIRED)
+#ifdef GPU_MVR_CLUSTERED_LAYOUT_REQUIRED
         size_t free_mem = 0;
         size_t total_mem = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
@@ -325,9 +410,10 @@ gpu_mvr_index::gpu_mvr_index(
                     " MB needed, " +
                     std::to_string(free_mem / (1024 * 1024)) +
                     " MB free). Falling back to inv_list indirection.",
-                    "skip_clustered_layout");
+                "skip_clustered_layout");
             }
         }
+#endif
 #endif
     }
 }
@@ -341,11 +427,18 @@ void gpu_mvr_index::set_doc_mapping(const std::vector<int>& doc_lens) {
         max_doc_len = std::max(max_doc_len, doc_lens[i]);
         doc_ptrs_[i + 1] = doc_ptrs_[i] + doc_lens[i];
     }
+#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
     doc_ids_.resize(n);
     for (size_t i = 0; i < num_docs; ++i) {
         for (size_t j = 0; j < doc_lens[i]; ++j) {
             doc_ids_[doc_ptrs_[i] + j] = i;
         }
+    }
+#endif
+    if (static_cast<size_t>(doc_ptrs_.back()) != n) {
+        throw std::runtime_error(
+            "doclens token count " + std::to_string(doc_ptrs_.back()) +
+            " does not match index embedding count " + std::to_string(n));
     }
 }
 
@@ -353,8 +446,7 @@ void gpu_mvr_index::set_doc_mapping(const std::vector<int>& doc_lens) {
 
 void gpu_mvr_index::allocate_workspace() {
     ws_.max_q_doclen = Q_DOCLEN;
-    // ws_.max_stage1_pairs = nprobe * max_cluster_size * Q_DOCLEN;
-    ws_.max_stage1_pairs = nprobe * n / n_clusters * Q_DOCLEN;
+    ws_.max_stage1_pairs = (size_t)nprobe * max_cluster_size * Q_DOCLEN;
     ws_.max_stage2_candidates = k_rank_cluster;
     ws_.max_stage2_tokens = ws_.max_stage2_candidates * max_doc_len;
     ws_.max_stage2_k = k_rank_all_tokens;
@@ -362,14 +454,13 @@ void gpu_mvr_index::allocate_workspace() {
     ws_.estimated_num_docs = (size_t)num_docs;
 
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    // Compact doc buffer: sized for the max docs that can be touched in
-    // one query, NOT all docs. Upper bound = nprobe * max_cluster_size
-    // (single query token). The union across Q_DOCLEN tokens shares many
-    // clusters via CAGRA, so this is a safe over-estimate.
-    // ws_.max_compact_docs = std::min((size_t)num_docs,
-    //                                 (size_t)nprobe * max_cluster_size);
-    ws_.max_compact_docs = std::min((size_t)num_docs,
-                                    (size_t)nprobe * n / n_clusters * 32);
+    // The compact-doc buffer must cover the union across all query tokens.
+    // Using average cluster size here is unsafe: one query can probe a much
+    // heavier-than-average set of clusters and overflow the hash table before
+    // the host-side touched-doc count check runs.
+    ws_.max_compact_docs = std::min(
+        (size_t)num_docs,
+        (size_t)nprobe * max_cluster_size * Q_DOCLEN);
     // Hash table capacity: next power-of-2 >= 2× max_compact_docs (≤50% load).
     {
         size_t cap = 1;
@@ -380,12 +471,13 @@ void gpu_mvr_index::allocate_workspace() {
     size_t doc_buf_rows = ws_.max_compact_docs;
 
     std::cout << "max cluster size: " << max_cluster_size << "\n";
+    std::cout << "max cluster size: " << max_cluster_size << std::endl;
     std::cout << "max_compact_docs: " << ws_.max_compact_docs
-              << "  (num_docs=" << num_docs << ")\n";
-    std::cout << "hash table capacity: " << ws_.ht_capacity << "\n";
+              << "  (num_docs=" << num_docs << ")" << std::endl;
+    std::cout << "hash table capacity: " << ws_.ht_capacity << std::endl;
 #else
     size_t doc_buf_rows = ws_.estimated_num_docs;
-    std::cout << "max cluster size: " << max_cluster_size << "\n";
+    std::cout << "max cluster size: " << max_cluster_size << std::endl;
 #endif
 
     size_t estimated_size = Q_DOCLEN * PADDED_DIM * sizeof(float) +  // d_queries
@@ -405,7 +497,7 @@ void gpu_mvr_index::allocate_workspace() {
                             ws_.estimated_num_docs * sizeof(int);  // d_doc_touched
 #endif
     std::cout << "Estimated GPU memory required for workspace: "
-              << (estimated_size / (1024.0 * 1024.0)) << " MB\n";
+              << (estimated_size / (1024.0 * 1024.0)) << " MB" << std::endl;
 
     CUDA_CHECK(cudaMalloc(&ws_.d_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws_.d_cb1_sumq, Q_DOCLEN * sizeof(float)));
@@ -1000,6 +1092,42 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     }
 #endif
 #ifdef GPU_MVR_USE_LUT
+#if defined(GPU_MVR_CLUSTERED_LAYOUT_DISABLED)
+    {
+        int blocks_x = std::max(
+            (max_cluster_size + threads_per_block - 1) / threads_per_block,
+            16);
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+            ws_.d_cagra_labels, d_cluster_pos_,
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+            d_doc_ptrs_,
+            d_doc_block_lut_,
+#else
+            d_doc_ids_,
+#endif
+            d_inv_list_,
+            ws_.d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+            ws_.d_ht_keys,
+            ws_.d_ht_vals,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+            static_cast<int>(ws_.max_compact_docs),
+            ws_.ht_mask,
+#else
+            ws_.d_doc_touched,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+#endif
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+    }
+#else
     if (use_clustered_) {
         // Clustered layout: flat iteration across all probed clusters with
         // coalesced memory access. Ensure enough blocks for good SM occupancy.
@@ -1018,6 +1146,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.d_ht_vals,
             ws_.d_unique_doc_ids,
             ws_.d_num_unique_docs,
+            static_cast<int>(ws_.max_compact_docs),
             ws_.ht_mask,
 #else
             ws_.d_doc_touched,
@@ -1039,7 +1168,12 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_cagra_labels, d_cluster_pos_,
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+            d_doc_ptrs_,
+            d_doc_block_lut_,
+#else
             d_doc_ids_,
+#endif
             d_inv_list_,
             ws_.d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
@@ -1047,6 +1181,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.d_ht_vals,
             ws_.d_unique_doc_ids,
             ws_.d_num_unique_docs,
+            static_cast<int>(ws_.max_compact_docs),
             ws_.ht_mask,
 #else
             ws_.d_doc_touched,
@@ -1058,6 +1193,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ivf->n_clusters
         );
     }
+#endif
 #else
     {
         int max_embs_per_query = ws_.max_embs_per_query_bound;
@@ -1085,11 +1221,18 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         const int agg_threads = 256;
         dim3 agg_grid((max_embs_per_query + agg_threads - 1) / agg_threads, Q_DOCLEN);
         aggregate_stage1_tracked_kernel<<<agg_grid, agg_threads, 0, stream>>>(
-            ws_.d_emb_ids, ws_.d_emb_dists, ws_.d_pair_offsets, d_doc_ids_,
+            ws_.d_emb_ids, ws_.d_emb_dists, ws_.d_pair_offsets,
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+            d_doc_ptrs_,
+            d_doc_block_lut_,
+#else
+            d_doc_ids_,
+#endif
             ws_.d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
             ws_.d_ht_keys, ws_.d_ht_vals,
             ws_.d_unique_doc_ids, ws_.d_num_unique_docs,
+            static_cast<int>(ws_.max_compact_docs),
             ws_.ht_mask,
 #else
             ws_.d_doc_touched,
@@ -1864,8 +2007,13 @@ gpu_mvr_index::~gpu_mvr_index() {
 
     CUDA_CHECK(cudaFree(d_one_bit_code_));
     CUDA_CHECK(cudaFree(d_one_bit_factor_));
+#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
     CUDA_CHECK(cudaFree(d_doc_ids_));
+#endif
     CUDA_CHECK(cudaFree(d_doc_ptrs_));
+#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
+    CUDA_CHECK(cudaFree(d_doc_block_lut_));
+#endif
     // d_inv_list_ may be allocated in non-LUT path or as fallback in LUT path;
     // cudaFree(nullptr) is a safe no-op
     CUDA_CHECK(cudaFree(d_inv_list_));
