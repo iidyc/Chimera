@@ -47,18 +47,9 @@ __global__ void stage1_binary_ip_lut_kernel(
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
     float*       d_doc_query_max,
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    int*         d_ht_keys,
-    int*         d_ht_vals,
-    int*         d_touched_doc_list,
-    int*         d_num_touched_docs,
-    int          max_touched_docs,
-    unsigned int ht_mask,
-#else
     int*         d_doc_touched,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
-#endif
     size_t       num_docs,
     int          nprobe,
     size_t       n_clusters
@@ -77,18 +68,9 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const int*      __restrict__ d_doc_ids,
     const uint32_t* __restrict__ d_inv_list,
     float*       d_doc_query_max,
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    int*         d_ht_keys,
-    int*         d_ht_vals,
-    int*         d_touched_doc_list,
-    int*         d_num_touched_docs,
-    int          max_touched_docs,
-    unsigned int ht_mask,
-#else
     int*         d_doc_touched,
     int*         d_touched_doc_list,
     int*         d_num_touched_docs,
-#endif
     size_t       num_docs,
     int          nprobe,
     size_t       n_clusters
@@ -176,18 +158,9 @@ __global__ void aggregate_stage1_tracked_kernel(
     const int*    __restrict__ d_pair_offsets,
     const int*    __restrict__ d_doc_ids,
     float*        d_doc_query_max,
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    int*          d_ht_keys,
-    int*          d_ht_vals,
-    int*          d_touched_doc_list,
-    int*          d_num_touched_docs,
-    int           max_touched_docs,
-    unsigned int  ht_mask,
-#else
     int*          d_doc_touched,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
-#endif
     size_t        num_docs,
     size_t        total_pairs,
     size_t        max_embs_per_query
@@ -198,8 +171,6 @@ __global__ void sum_doc_scores_sparse_kernel(
     const int*   __restrict__ d_touched_doc_list,
     float*       d_scores_out,
     int*         d_doc_ids_out,
-    int          num_touched
-#ifndef GPU_MVR_COMPACT_DOC_BUFFER
-    , size_t     num_docs
-#endif
+    int          num_touched,
+    size_t       num_docs
 );

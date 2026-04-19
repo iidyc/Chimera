@@ -87,6 +87,8 @@ struct gpu_mvr_index {
 
     int max_doc_len = 0;
     int max_cluster_size = 0;
+    size_t workspace_probe_cluster_bound_ = 0;
+    size_t workspace_probe_token_bound_ = 0;
 
     // CPU-side data
     Rotator<float>* rotator_;
@@ -165,16 +167,7 @@ struct gpu_mvr_index {
         float*  d_stage1_doc_scores;
         float*  d_doc_query_max;
         int*    d_num_unique_docs;
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-        // Hash table for doc_id → compact_slot mapping (replaces d_doc_touched)
-        int*    d_ht_keys;           // [ht_capacity], init -1
-        int*    d_ht_vals;           // [ht_capacity], init -1
-        size_t  ht_capacity;         // power of 2
-        unsigned int ht_mask;        // ht_capacity - 1
-        size_t  max_compact_docs;    // max unique docs (d_doc_query_max rows)
-#else
         int*    d_doc_touched;
-#endif
         void*   d_cub_temp_storage;
         size_t  cub_temp_storage_bytes;
 
@@ -289,6 +282,7 @@ struct gpu_mvr_index {
     ~gpu_mvr_index();
 
     void set_doc_mapping(const std::vector<int>& doc_lens);
+    void compute_workspace_probe_bounds();
     void allocate_workspace();
     size_t doc_len(size_t doc_id) const;
 

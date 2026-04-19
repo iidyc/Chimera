@@ -155,16 +155,7 @@ struct gpu_mvr_index {
         float*  d_stage1_doc_scores;
         float*  d_doc_query_max;
         int*    d_num_unique_docs;
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-        // Hash table for doc_id → compact_slot mapping (replaces d_doc_touched)
-        int*    d_ht_keys;           // [ht_capacity], init -1
-        int*    d_ht_vals;           // [ht_capacity], init -1
-        size_t  ht_capacity;         // power of 2
-        unsigned int ht_mask;        // ht_capacity - 1
-        size_t  max_compact_docs;    // max unique docs (d_doc_query_max rows)
-#else
         int*    d_doc_touched;
-#endif
         void*   d_cub_temp_storage;
         size_t  cub_temp_storage_bytes;
 
