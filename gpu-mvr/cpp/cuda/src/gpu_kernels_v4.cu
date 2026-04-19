@@ -324,7 +324,7 @@ __global__ void precompute_lut_kernel(
 //
 // Grid: (blocks_x, Q_DOCLEN).
 // Requires d_doc_query_max to be zero-initialised.
-#define STAGE1_MAX_NPROBE 256
+#define STAGE1_MAX_NPROBE 512
 
 __global__ void stage1_binary_ip_lut_kernel(
     const float*    __restrict__ d_lut,
