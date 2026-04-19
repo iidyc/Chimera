@@ -303,7 +303,7 @@ __global__ void stage1_binary_ip_lut_kernel(
 
         // 128-bit vectorized code load (one LDG.128 instead of two LDG.64).
         const uint4 code128 = *reinterpret_cast<const uint4*>(
-            d_clustered_code + emb_pos * CODE_BYTES);
+            d_clustered_code + static_cast<size_t>(emb_pos) * CODE_BYTES);
 
         // Issue factor + doc_id loads early — their ~400-cycle latency
         // overlaps with the 32-step LUT computation below.
