@@ -25,6 +25,7 @@
 #include <cfloat>
 #include <cstdlib>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <immintrin.h>
 #include <iostream>
@@ -48,6 +49,31 @@
 #include "startup_profile.hpp"
 
 using namespace rabitqlib;
+
+namespace {
+
+void validate_doc4ex_header_compatibility(
+    const mvr_index_file_format::Header& base_header,
+    const mvr_index_file_format::Header& ex_header,
+    const std::string& base_filename,
+    const std::string& ex_filename)
+{
+    if (base_header.n != ex_header.n ||
+        base_header.d != ex_header.d ||
+        base_header.n_clusters != ex_header.n_clusters ||
+        base_header.padded_dim != ex_header.padded_dim ||
+        base_header.rotator_type != ex_header.rotator_type) {
+        throw std::runtime_error(
+            "Quantized index metadata mismatch between " + base_filename +
+            " and " + ex_filename);
+    }
+    if (ex_header.ex_bits == 0) {
+        throw std::runtime_error(
+            "doc_4bit_ex sidecar must have ex_bits > 0: " + ex_filename);
+    }
+}
+
+}  // namespace
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = (call); \
@@ -411,9 +437,7 @@ gpu_mvr_index::gpu_mvr_index(
         startup.mark("read_header_and_rotator");
 
         one_bit_code_.resize(n * PADDED_DIM / 8);
-        ex_code_.resize(n * PADDED_DIM * ex_bits / 8);
         one_bit_factor_.resize(n);
-        ex_factor_.resize(n);
 
         inf.read(one_bit_code_.data(), one_bit_code_.size());
         if (!inf) {
@@ -423,63 +447,98 @@ gpu_mvr_index::gpu_mvr_index(
             );
         }
 
-        const size_t ex_code_stride = PADDED_DIM * ex_bits / 8;
-        const size_t full_code_stride = PADDED_DIM * (1 + ex_bits) / 8;
-        startup.note("quantized_payload_mode", "doc_4bit_to_ex_decode");
         inf.read((char*)one_bit_factor_.data(), n * sizeof(float));
-        inf.read((char*)ex_factor_.data(), n * sizeof(float));
         if (!inf) {
             throw std::runtime_error(
-                "Failed to read scaling factors from index file: " +
+                "Failed to read one-bit scaling factors from index file: " +
                 resolved_paths.quantized_data_path
             );
         }
-        inf.close();
+        const bool has_doc4_ex =
+            std::filesystem::exists(resolved_paths.doc_4bit_ex_path);
+        if (has_doc4_ex) {
+            std::ifstream doc4ex(resolved_paths.doc_4bit_ex_path, std::ios::binary);
+            const auto doc4ex_header =
+                mvr_index_file_format::read_header(doc4ex, resolved_paths.doc_4bit_ex_path);
+            validate_doc4ex_header_compatibility(
+                header,
+                doc4ex_header,
+                resolved_paths.quantized_data_path,
+                resolved_paths.doc_4bit_ex_path);
+            auto* doc4ex_rotator = mvr_index_file_format::load_rotator(
+                doc4ex, doc4ex_header, resolved_paths.doc_4bit_ex_path);
+            delete doc4ex_rotator;
 
-        std::ifstream doc4(resolved_paths.doc_4bit_path, std::ios::binary);
-        const auto doc4_header =
-            mvr_index_file_format::read_header(doc4, resolved_paths.doc_4bit_path);
-        mvr_index_file_format::validate_matching_header(
-            header,
-            doc4_header,
-            resolved_paths.quantized_data_path,
-            resolved_paths.doc_4bit_path);
-        auto* doc4_rotator =
-            mvr_index_file_format::load_rotator(doc4, doc4_header, resolved_paths.doc_4bit_path);
-        delete doc4_rotator;
-
-        auto full_unpack = select_excode_unpackfunc(1 + ex_bits);
-        const uint8_t ex_mask = static_cast<uint8_t>((1u << ex_bits) - 1u);
-        const size_t batch_vectors = 8192;
-        std::vector<char> full_batch(batch_vectors * full_code_stride);
-        std::vector<float> unpacked(PADDED_DIM);
-        std::vector<uint8_t> raw_ex(PADDED_DIM);
-
-        for (size_t start = 0; start < n; start += batch_vectors) {
-            const size_t batch_count = std::min(batch_vectors, n - start);
-            const size_t batch_bytes = batch_count * full_code_stride;
-            doc4.read(full_batch.data(), batch_bytes);
-            if (!doc4) {
+            ex_bits = doc4ex_header.ex_bits;
+            ex_code_.resize(n * PADDED_DIM * ex_bits / 8);
+            ex_factor_.resize(n);
+            startup.note("quantized_payload_mode", "doc_4bit_ex_sidecar");
+            doc4ex.read(ex_code_.data(), ex_code_.size());
+            doc4ex.read((char*)ex_factor_.data(), n * sizeof(float));
+            if (!doc4ex) {
                 throw std::runtime_error(
-                    "Failed to read doc_4bit payload from index file: " +
-                    resolved_paths.doc_4bit_path
+                    "Failed to read doc_4bit_ex payload from index file: " +
+                    resolved_paths.doc_4bit_ex_path);
+            }
+        } else {
+            ex_code_.resize(n * PADDED_DIM * ex_bits / 8);
+            ex_factor_.resize(n);
+            const size_t ex_code_stride = PADDED_DIM * ex_bits / 8;
+            const size_t full_code_stride = PADDED_DIM * (1 + ex_bits) / 8;
+            startup.note("quantized_payload_mode", "doc_4bit_to_ex_decode");
+            inf.read((char*)ex_factor_.data(), n * sizeof(float));
+            if (!inf) {
+                throw std::runtime_error(
+                    "Failed to read scaling factors from index file: " +
+                    resolved_paths.quantized_data_path
                 );
             }
 
-            for (size_t i = 0; i < batch_count; ++i) {
-                full_unpack(
-                    reinterpret_cast<const uint8_t*>(full_batch.data() + i * full_code_stride),
-                    unpacked.data(),
-                    PADDED_DIM);
-                for (size_t dim_idx = 0; dim_idx < PADDED_DIM; ++dim_idx) {
-                    raw_ex[dim_idx] =
-                        static_cast<uint8_t>(unpacked[dim_idx]) & ex_mask;
+            std::ifstream doc4(resolved_paths.doc_4bit_path, std::ios::binary);
+            const auto doc4_header =
+                mvr_index_file_format::read_header(doc4, resolved_paths.doc_4bit_path);
+            mvr_index_file_format::validate_matching_header(
+                header,
+                doc4_header,
+                resolved_paths.quantized_data_path,
+                resolved_paths.doc_4bit_path);
+            auto* doc4_rotator =
+                mvr_index_file_format::load_rotator(doc4, doc4_header, resolved_paths.doc_4bit_path);
+            delete doc4_rotator;
+
+            auto full_unpack = select_excode_unpackfunc(1 + ex_bits);
+            const uint8_t ex_mask = static_cast<uint8_t>((1u << ex_bits) - 1u);
+            const size_t batch_vectors = 8192;
+            std::vector<char> full_batch(batch_vectors * full_code_stride);
+            std::vector<float> unpacked(PADDED_DIM);
+            std::vector<uint8_t> raw_ex(PADDED_DIM);
+
+            for (size_t start = 0; start < n; start += batch_vectors) {
+                const size_t batch_count = std::min(batch_vectors, n - start);
+                const size_t batch_bytes = batch_count * full_code_stride;
+                doc4.read(full_batch.data(), batch_bytes);
+                if (!doc4) {
+                    throw std::runtime_error(
+                        "Failed to read doc_4bit payload from index file: " +
+                        resolved_paths.doc_4bit_path
+                    );
                 }
-                quant::rabitq_impl::ex_bits::packing_rabitqplus_code(
-                    raw_ex.data(),
-                    reinterpret_cast<uint8_t*>(ex_code_.data() + (start + i) * ex_code_stride),
-                    PADDED_DIM,
-                    ex_bits);
+
+                for (size_t i = 0; i < batch_count; ++i) {
+                    full_unpack(
+                        reinterpret_cast<const uint8_t*>(full_batch.data() + i * full_code_stride),
+                        unpacked.data(),
+                        PADDED_DIM);
+                    for (size_t dim_idx = 0; dim_idx < PADDED_DIM; ++dim_idx) {
+                        raw_ex[dim_idx] =
+                            static_cast<uint8_t>(unpacked[dim_idx]) & ex_mask;
+                    }
+                    quant::rabitq_impl::ex_bits::packing_rabitqplus_code(
+                        raw_ex.data(),
+                        reinterpret_cast<uint8_t*>(ex_code_.data() + (start + i) * ex_code_stride),
+                        PADDED_DIM,
+                        ex_bits);
+                }
             }
         }
         startup.mark("read_quantized_payload");

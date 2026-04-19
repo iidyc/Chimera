@@ -9,6 +9,7 @@ namespace gpu_index_layout {
 inline constexpr char kIvfFilename[] = "ivf.bin";
 inline constexpr char kDoc1BitFilename[] = "doc_1bit.bin";
 inline constexpr char kDoc4BitFilename[] = "doc_4bit.bin";
+inline constexpr char kDoc4BitExFilename[] = "doc_4bit_ex.bin";
 inline constexpr char kCluster1BitFilename[] = "cluster_1bit.bin";
 inline constexpr char kDoclensFilename[] = "doclens.bin";
 inline constexpr char kMetadataFilename[] = "index_metadata.json";
@@ -19,6 +20,7 @@ inline constexpr char kGpuIndexFilename[] = "gpu_index.bin";
 struct ResolvedPaths {
     std::string quantized_data_path;
     std::string doc_4bit_path;
+    std::string doc_4bit_ex_path;
     std::string ivf_path;
     std::string centroids_path;
     std::string gpu_index_path;
@@ -31,6 +33,10 @@ inline std::string doc_1bit_path(const std::string& index_dir) {
 
 inline std::string doc_4bit_path(const std::string& index_dir) {
     return (std::filesystem::path(index_dir) / kDoc4BitFilename).string();
+}
+
+inline std::string doc_4bit_ex_path(const std::string& index_dir) {
+    return (std::filesystem::path(index_dir) / kDoc4BitExFilename).string();
 }
 
 inline std::string cluster_1bit_path(const std::string& index_dir) {
@@ -81,6 +87,7 @@ inline ResolvedPaths resolve_index_paths(const std::string& path) {
         return {
             doc_1bit_path(index_dir),
             doc_4bit_path(index_dir),
+            doc_4bit_ex_path(index_dir),
             ivf_path(index_dir),
             centroids_path(index_dir),
             cluster_1bit_path(index_dir),
@@ -93,6 +100,7 @@ inline ResolvedPaths resolve_index_paths(const std::string& path) {
         return {
             fs_path.string(),
             doc_4bit_path(index_dir),
+            doc_4bit_ex_path(index_dir),
             ivf_path(index_dir),
             centroids_path(index_dir),
             cluster_1bit_path(index_dir),

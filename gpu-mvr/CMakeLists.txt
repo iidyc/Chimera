@@ -219,6 +219,15 @@ set_source_files_properties(
 )
 target_link_libraries(gpu_build_fast PRIVATE gpu_mvr_core)
 
+add_executable(gpu_build_doc_4bit_ex
+    cpp/app/gpu_build_doc_4bit_ex.cpp
+)
+target_include_directories(gpu_build_doc_4bit_ex PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+target_link_libraries(gpu_build_doc_4bit_ex PRIVATE gpu_mvr_core)
+
 add_executable(gpu_search_v0
     cpp/app/gpu_search_baseline.cu
     cpp/cuda/src/gpu_index_baseline.cu
