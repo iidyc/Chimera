@@ -1,4 +1,4 @@
-#include "gpu_index_v4.cuh"
+#include "gpu_index_v5.cuh"
 
 #include <cerrno>
 #include <cstdlib>
@@ -7,6 +7,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <filesystem>
+#include <system_error>
+
+#include "clustered_stage1_file_format.hpp"
 #include "gpu_index_layout.hpp"
 #include "mvr_index_file_format.hpp"
 #include "startup_profile.hpp"
@@ -176,15 +180,7 @@ gpu_mvr_index::gpu_mvr_index(
         (ivf->n_clusters + 1) * sizeof(size_t),
         cudaMemcpyHostToDevice));
 
-    {
-        const size_t inv_list_size = ivf->inv_list.size();
-        CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(
-            d_inv_list_,
-            ivf->inv_list.data(),
-            inv_list_size * sizeof(int),
-            cudaMemcpyHostToDevice));
-    }
+    d_inv_list_ = nullptr;
 
     CUDA_CHECK(cudaMemcpy(d_one_bit_code_, one_bit_code_.data(), code_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_one_bit_factor_, one_bit_factor_.data(), n * sizeof(float), cudaMemcpyHostToDevice));
@@ -204,9 +200,139 @@ gpu_mvr_index::gpu_mvr_index(
     allocate_workspace();
     startup.mark("allocate_workspace");
 
-    std::cout << "[gpu_mvr] Using original-order layout with inv_list indirection."
-              << std::endl;
-    startup.mark("use_nonclustered_layout");
+    {
+        const size_t inv_n = ivf->inv_list.size();
+        const size_t code_per_vec = PADDED_DIM / 8;
+        const size_t clustered_bytes =
+            inv_n * (code_per_vec + sizeof(float) + sizeof(int));
+
+        if (resolved_paths.gpu_index_path.empty() ||
+            !std::filesystem::exists(resolved_paths.gpu_index_path)) {
+            throw std::runtime_error(
+                "Required clustered sidecar is missing: " +
+                resolved_paths.gpu_index_path);
+        }
+
+        log_ctor_step(
+            "Loading cluster-ordered stage-1 layout from " +
+            resolved_paths.gpu_index_path + " ...");
+        std::ifstream clustered_header_file(
+            resolved_paths.gpu_index_path, std::ios::binary);
+        const auto clustered_header =
+            clustered_stage1_file_format::read_header(
+                clustered_header_file, resolved_paths.gpu_index_path);
+        if (clustered_header.n_entries != inv_n ||
+            clustered_header.code_bytes_per_vector != code_per_vec) {
+            throw std::runtime_error(
+                "GPU index metadata mismatch for " +
+                resolved_paths.gpu_index_path);
+        }
+        if (clustered_stage1_file_format::has_embedded_rotator(clustered_header)) {
+            if (clustered_header.source_dim != header.d ||
+                clustered_header.padded_dim != header.padded_dim ||
+                clustered_header.rotator_type != header.rotator_type) {
+                throw std::runtime_error(
+                    "cluster_1bit rotator metadata mismatch for " +
+                    resolved_paths.gpu_index_path);
+            }
+            auto* clustered_rotator = clustered_stage1_file_format::load_rotator(
+                clustered_header_file,
+                clustered_header,
+                resolved_paths.gpu_index_path);
+            delete clustered_rotator;
+        }
+        clustered_header_file.close();
+
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+        if (free_mem <= clustered_bytes) {
+            throw std::runtime_error(
+                "Insufficient GPU memory for required cluster_1bit.bin layout: need " +
+                std::to_string(clustered_bytes / (1024 * 1024)) +
+                " MB, have " +
+                std::to_string(free_mem / (1024 * 1024)) +
+                " MB free");
+        }
+
+        struct stat clustered_stat {};
+        const int clustered_fd = open(resolved_paths.gpu_index_path.c_str(), O_RDONLY);
+        if (clustered_fd < 0) {
+            throw std::runtime_error(
+                "Failed to open GPU index: " + resolved_paths.gpu_index_path);
+        }
+        if (fstat(clustered_fd, &clustered_stat) != 0) {
+            const auto err = errno;
+            close(clustered_fd);
+            throw std::runtime_error(
+                "Failed to stat GPU index " + resolved_paths.gpu_index_path +
+                ": " + std::system_category().message(err));
+        }
+
+        const size_t mapping_size = static_cast<size_t>(clustered_stat.st_size);
+        const size_t expected_size =
+            clustered_stage1_file_format::prefix_bytes(clustered_header) +
+            inv_n * code_per_vec +
+            inv_n * sizeof(float) +
+            inv_n * sizeof(int) +
+            inv_n * sizeof(uint32_t);
+        if (mapping_size != expected_size) {
+            close(clustered_fd);
+            throw std::runtime_error(
+                "Unexpected GPU index size for " +
+                resolved_paths.gpu_index_path);
+        }
+
+        void* clustered_mapping =
+            mmap(nullptr, mapping_size, PROT_READ, MAP_PRIVATE, clustered_fd, 0);
+        if (clustered_mapping == MAP_FAILED) {
+            const auto err = errno;
+            close(clustered_fd);
+            throw std::runtime_error(
+                "Failed to mmap GPU index " + resolved_paths.gpu_index_path +
+                ": " + std::system_category().message(err));
+        }
+
+        const auto* clustered_base = static_cast<const char*>(clustered_mapping);
+        const size_t clustered_prefix_bytes =
+            clustered_stage1_file_format::prefix_bytes(clustered_header);
+        const auto* clustered_code =
+            clustered_base + clustered_prefix_bytes;
+        const auto* clustered_factor = reinterpret_cast<const float*>(
+            clustered_code + inv_n * code_per_vec);
+        const auto* clustered_doc_ids = reinterpret_cast<const int*>(
+            reinterpret_cast<const char*>(clustered_factor) +
+            inv_n * sizeof(float));
+
+        CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
+        CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
+
+        CUDA_CHECK(cudaMemcpy(
+            d_clustered_code_,
+            clustered_code,
+            inv_n * code_per_vec,
+            cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_clustered_factor_,
+            clustered_factor,
+            inv_n * sizeof(float),
+            cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_clustered_doc_ids_,
+            clustered_doc_ids,
+            inv_n * sizeof(int),
+            cudaMemcpyHostToDevice));
+
+        munmap(clustered_mapping, mapping_size);
+        close(clustered_fd);
+        use_clustered_ = true;
+        startup.note("clustered_layout_source", "persisted");
+        std::cout << "[gpu_mvr] Using cluster-ordered layout ("
+                  << (clustered_bytes / (1024.0 * 1024.0)) << " MB)"
+                  << std::endl;
+        startup.mark("load_clustered_layout");
+    }
 }
 
 // ======================== set_doc_mapping ========================
@@ -838,7 +964,8 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         ws_.d_emb_ids,
         nprobe,
         ivf->n_clusters,
-        Q_DOCLEN
+        Q_DOCLEN,
+        false
     );
 
 #ifdef GPU_MVR_PROFILE
@@ -868,16 +995,10 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             16);
         dim3 grid(blocks_x, Q_DOCLEN);
 
-        stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
-            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+        stage1_binary_ip_lut_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_lut, d_clustered_code_, d_clustered_factor_, ws_.d_cb1_sumq,
             ws_.d_cagra_labels, d_cluster_pos_,
-#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
-            d_doc_ptrs_,
-            d_doc_block_lut_,
-#else
-            d_doc_ids_,
-#endif
-            d_inv_list_,
+            d_clustered_doc_ids_,
             ws_.d_doc_query_max,
             ws_.d_doc_touched,
             ws_.d_unique_doc_ids,
@@ -1689,8 +1810,15 @@ gpu_mvr_index::~gpu_mvr_index() {
 #ifdef GPU_MVR_DOCID_VIA_DOCPTRS
     CUDA_CHECK(cudaFree(d_doc_block_lut_));
 #endif
+    // d_inv_list_ may be allocated in non-LUT path or as fallback in LUT path;
+    // cudaFree(nullptr) is a safe no-op
     CUDA_CHECK(cudaFree(d_inv_list_));
     CUDA_CHECK(cudaFree(d_cluster_pos_));
+
+    // Clustered arrays are nullptr when fallback is active; cudaFree(nullptr) is safe
+    CUDA_CHECK(cudaFree(d_clustered_code_));
+    CUDA_CHECK(cudaFree(d_clustered_factor_));
+    CUDA_CHECK(cudaFree(d_clustered_doc_ids_));
 
     CUDA_CHECK(cudaFree(ws_.d_queries));
     CUDA_CHECK(cudaFree(ws_.d_cb1_sumq));

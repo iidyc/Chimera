@@ -44,7 +44,26 @@ __global__ void precompute_lut_kernel(
     float* __restrict__ d_lut
 );
 
+__global__ void stage1_binary_ip_lut_kernel(
+    const float*    __restrict__ d_lut,
+    const char*     __restrict__ d_clustered_code,
+    const float*    __restrict__ d_clustered_factor,
+    const float*    __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_clustered_doc_ids,
+    float*       d_doc_query_max,
+    int*         d_doc_touched,
+    int*         d_touched_doc_list,
+    int*         d_num_touched_docs,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+);
+
 // Non-clustered variant: uses inv_list indirection to access original arrays.
+// Optimized for scattered access with explicit cluster iteration, shared-memory
+// inv_list tiling, and __ldg() for read-only cache utilization.
 __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const float*    __restrict__ d_lut,
     const char*     __restrict__ d_code,
@@ -132,7 +151,8 @@ __global__ void expand_cluster_ids_kernel(
     size_t*             d_emb_ids,
     int                 nprobe,
     size_t              n_clusters,
-    size_t              num_queries
+    size_t              num_queries,
+    bool                use_clustered_layout
 );
 
 __global__ void gather_doc_lengths_kernel(

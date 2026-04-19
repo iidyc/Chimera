@@ -41,7 +41,7 @@
 #include "query.hpp"
 #include "ivf_pg.hpp"
 #include "gpu_config.cuh"
-#include "gpu_kernels_v4.cuh"
+#include "gpu_kernels_v5.cuh"
 
 using namespace rabitqlib;
 
@@ -116,6 +116,14 @@ struct gpu_mvr_index {
 #endif
     int*   d_inv_list_ = nullptr;
     size_t* d_cluster_pos_ = nullptr;
+
+    // Cluster-ordered copies: data reordered by inv_list so that vectors
+    // in the same cluster are contiguous in memory. Stage-1 reads these
+    // instead of the original arrays for coalesced global memory access.
+    char*  d_clustered_code_ = nullptr;
+    float* d_clustered_factor_ = nullptr;
+    int*   d_clustered_doc_ids_ = nullptr;
+    bool   use_clustered_ = true;  // false = fallback to non-clustered + inv_list indirection
 
     // Search parameters
     int nprobe = 128;

@@ -119,7 +119,7 @@ set_target_properties(gpu_search_v3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_definitions(gpu_search_v3 PRIVATE GPU_MVR_IMPL_NAME=\"v3\")
 target_link_libraries(gpu_search_v3 PRIVATE gpu_mvr_core)
 
-function(add_gpu_search_v4_family_target target_name impl_name)
+function(add_gpu_search_v4_nonclustered_target target_name impl_name)
     add_executable(${target_name}
         cpp/app/gpu_search_v4.cu
         cpp/cuda/src/gpu_index_v4.cu
@@ -137,22 +137,29 @@ function(add_gpu_search_v4_family_target target_name impl_name)
     target_link_libraries(${target_name} PRIVATE gpu_mvr_core)
 endfunction()
 
-add_gpu_search_v4_family_target(
+add_gpu_search_v4_nonclustered_target(
     gpu_search_v4
     v4
-    GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
 )
 
-add_gpu_search_v4_family_target(
-    gpu_search_v5
-    v5
-    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+add_executable(gpu_search_v5
+    cpp/app/gpu_search_v5.cu
+    cpp/cuda/src/gpu_index_v5.cu
+    cpp/cuda/src/gpu_kernels_v5.cu
 )
+target_include_directories(gpu_search_v5 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v5 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v5 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v5\"
+)
+target_link_libraries(gpu_search_v5 PRIVATE gpu_mvr_core)
 
-add_gpu_search_v4_family_target(
+add_gpu_search_v4_nonclustered_target(
     gpu_search_v6
     v6
-    GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
     GPU_MVR_DOCID_VIA_DOCPTRS=1
 )
 

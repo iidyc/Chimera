@@ -1,4 +1,4 @@
-#include "gpu_kernels_v4.cuh"
+#include "gpu_kernels_v5.cuh"
 
 #include <cfloat>
 
@@ -797,7 +797,8 @@ __global__ void expand_cluster_ids_kernel(
     size_t*             d_emb_ids,
     int                 nprobe,
     size_t              n_clusters,
-    size_t              num_queries
+    size_t              num_queries,
+    bool                use_clustered_layout
 ) {
     size_t query_idx = blockIdx.x;
     if (query_idx >= num_queries) return;
@@ -813,8 +814,17 @@ __global__ void expand_cluster_ids_kernel(
         size_t cluster_end = d_cluster_pos[cluster_id + 1];
         size_t cluster_size = cluster_end - cluster_start;
 
-        for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
-            d_emb_ids[out_start + write_pos + i] = d_inv_list[cluster_start + i];
+        if (use_clustered_layout) {
+            // Emit the cluster-local position directly. The caller will
+            // index into d_clustered_code/factor/doc_ids which are already
+            // reordered by inv_list, so the position IS the access index.
+            for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
+                d_emb_ids[out_start + write_pos + i] = cluster_start + i;
+            }
+        } else {
+            for (size_t i = threadIdx.x; i < cluster_size; i += blockDim.x) {
+                d_emb_ids[out_start + write_pos + i] = d_inv_list[cluster_start + i];
+            }
         }
 
         write_pos += cluster_size;
