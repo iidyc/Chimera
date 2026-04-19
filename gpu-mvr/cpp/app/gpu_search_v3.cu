@@ -40,17 +40,16 @@ int main(int argc, char** argv) {
     const auto runtime_configs = load_gpu_search_runtime_configs(args);
     const auto allocation_runtime = max_gpu_search_runtime_options(runtime_configs);
     const int warmup_queries = std::min<int>(args.warmup, static_cast<int>(num_q));
-    const int remaining_queries = std::max<int>(0, static_cast<int>(num_q) - warmup_queries);
     const int run_queries =
-        (args.nq < 0) ? remaining_queries : std::min<int>(args.nq, remaining_queries);
+        (args.nq < 0) ? static_cast<int>(num_q) : std::min<int>(args.nq, static_cast<int>(num_q));
     if (run_queries == 0) {
-        std::cerr << "No evaluation queries remain after warmup." << std::endl;
+        std::cerr << "No evaluation queries selected." << std::endl;
         return 1;
     }
 
     std::vector<std::vector<size_t>> eval_ground_truth(
-        ground_truth.begin() + warmup_queries,
-        ground_truth.begin() + warmup_queries + run_queries);
+        ground_truth.begin(),
+        ground_truth.begin() + run_queries);
 
     gpu_mvr_index index(args.index_file, doclens, allocation_runtime);
     startup.mark("construct_index");
@@ -80,9 +79,8 @@ int main(int argc, char** argv) {
         std::vector<double> query_latencies_ms;
         query_latencies_ms.reserve(run_queries);
         for (int i = 0; i < run_queries; ++i) {
-            const int query_idx = warmup_queries + i;
             const auto query_start = std::chrono::high_resolution_clock::now();
-            results[i] = index.search(&Q[query_idx * Q_DOCLEN * d], args.k);
+            results[i] = index.search(&Q[i * Q_DOCLEN * d], args.k);
             const auto query_end = std::chrono::high_resolution_clock::now();
             query_latencies_ms.push_back(
                 std::chrono::duration<double, std::milli>(query_end - query_start).count());
