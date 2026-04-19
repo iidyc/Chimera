@@ -26,7 +26,7 @@ Description:
 
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
-  --version <v0|v1|v2|v3|v4|v5|v6>  GPU-MVR search version. Default: v3
+  --version <v0|v1|v2|v3|v4|v5|v6|v7>  GPU-MVR search version. Default: v3
   --implementation-label <label>
                            Output folder label. Default: gpu_search_<version>
   --config-file <path>     Config CSV. Default: profiling/gpu_mvr_config.csv
@@ -37,8 +37,8 @@ Options:
                            script/parse_bench_logs.py. Default: profiling
   --log-dir <path>         Log output directory. Default: log/bench
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
-  --nq <count>             Evaluation queries after warmup. Default: -1
-  --warmup <count>         Warmup query count. Default: 5
+  --nq <count>             Evaluation queries timed after warmup; evaluation restarts from query 0. Default: -1
+  --warmup <count>         Warmup query count before timed evaluation restarts from query 0. Default: 5
   --dry-run                Print planned commands without executing them.
   -h, --help               Show this help message.
 EOF
@@ -425,10 +425,10 @@ if [[ $dataset_set -eq 0 ]]; then
 fi
 
 case "$version" in
-    v0|v1|v2|v3|v4|v5|v6)
+    v0|v1|v2|v3|v4|v5|v6|v7)
         ;;
     *)
-        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6"
+        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6, v7"
         ;;
 esac
 

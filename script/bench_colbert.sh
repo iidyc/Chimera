@@ -37,6 +37,7 @@ Options:
   --output-dir <path>      CSV output directory. Default: profiling
   --log-dir <path>         Log output directory. Default: log/bench
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
+  --warmup <count>         Warmup query count before timed runs restart from query 0. Default: 5
   --copy-index-to-tmp      Copy the ColBERT experiment directory into /tmp first.
   --refresh-tmp-index      Re-copy the /tmp index even if it already exists.
   --tmp-root <path>        Root directory for /tmp ColBERT copies.
@@ -484,6 +485,7 @@ benchmark_dataset() {
     log_line "[driver] pareto_csv=${pareto_csv}"
     log_line "[driver] search_py_output_csv=${search_py_output_csv}"
     log_line "[driver] k=${k}"
+    log_line "[driver] warmup=${warmup}"
     log_line "[driver] copy_index_to_tmp=${copy_index_to_tmp}"
     log_line "[driver] refresh_tmp_index=${refresh_tmp_index}"
     log_line "[driver] tmp_root=${tmp_root}"
@@ -507,6 +509,7 @@ benchmark_dataset() {
         --output-csv "$search_py_output_csv"
         --pairs "${pair_args[@]}"
         --k "$k"
+        --warmup "$warmup"
     )
 
     log_line "[run] command=$(printf '%q ' "${cmd[@]}")"
@@ -600,6 +603,7 @@ log_dir="${repo_root}/log/bench"
 tmp_root="/tmp/${USER:-user}/colbert_benchmark"
 env_name="colbert"
 k=100
+warmup=5
 copy_index_to_tmp=0
 refresh_tmp_index=0
 dry_run=0
@@ -661,6 +665,11 @@ while [[ $# -gt 0 ]]; do
             k="$2"
             shift 2
             ;;
+        --warmup)
+            [[ $# -ge 2 ]] || die "missing value for --warmup"
+            warmup="$2"
+            shift 2
+            ;;
         --copy-index-to-tmp)
             copy_index_to_tmp=1
             shift
@@ -698,6 +707,7 @@ validate_path_component "$implementation_label" "implementation label"
 [[ -z "$index_name_override" ]] || validate_path_component "$index_name_override" "index name"
 require_positive_int "--k" "$k"
 (( k > 0 )) || die "--k must be > 0"
+require_positive_int "--warmup" "$warmup"
 [[ -f "$config_file" ]] || die "config CSV not found: ${config_file}"
 [[ -f "$search_script" ]] || die "search script not found: ${search_script}"
 

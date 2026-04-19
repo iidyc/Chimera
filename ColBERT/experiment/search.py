@@ -42,6 +42,7 @@ def parse_args():
     p.add_argument("--pairs", type=pair, nargs="+", required=True,
                    help="List of ncells,ndocs pairs, e.g. --pairs 1,1000 2,4000 4,8000")
     p.add_argument("--k", type=int, default=100)
+    p.add_argument("--warmup", type=int, default=5)
     return p.parse_args()
 
 
@@ -56,6 +57,11 @@ def main():
             np.fromfile(base_file, dtype=np.float32, count=n * q_doclen * d)
         ).reshape(n, q_doclen, d)
     print(f"Loaded document embeddings: {query_emb.shape}")
+    if args.warmup < 0:
+        raise ValueError("--warmup must be >= 0")
+
+    warmup_queries = min(int(args.warmup), int(n))
+    run_queries = int(n)
 
     ground_truth = read_gt_tsv(num_queries=n, top_k=1000, filename=args.ground_truth_path)
 
@@ -71,18 +77,24 @@ def main():
                 num_runs = 3
                 run_times = []
                 results = []
+                print(
+                    f"[RUN] ncells={ncells} ndocs={ndocs} "
+                    f"warmup_queries={warmup_queries} eval_queries={run_queries}"
+                )
                 for run_idx in range(num_runs):
+                    for qid in range(warmup_queries):
+                        searcher.search_from_embeddings(query_emb[qid], k=args.k)
                     results = []
                     begin_time = time.time()
-                    for qid in range(n):
+                    for qid in range(run_queries):
                         pids, ranks, scores = searcher.search_from_embeddings(query_emb[qid], k=args.k)
                         results.append(pids)
                     run_times.append(time.time() - begin_time)
-                avg_time = (sum(run_times) / num_runs) / n
+                avg_time = (sum(run_times) / num_runs) / run_queries
                 recall = sum(
                     sum(1 for pid in ground_truth[qid][:args.k] if pid in results[qid])
-                    for qid in range(n)
-                ) / n / args.k
+                    for qid in range(run_queries)
+                ) / run_queries / args.k
                 print(f"ncells={ncells} ndocs={ndocs} avg_time={avg_time:.4f}s recall@{args.k}={recall:.4f}")
                 writer.writerow([f"{avg_time:.4f}", f"{recall:.4f}"])
                 csv_file.flush()

@@ -30,6 +30,7 @@ Options:
   --output-dir <path>        Passed through to bench_colbert.sh.
   --log-dir <path>           Passed through to bench_colbert.sh.
   --k <top_k>                Passed through to bench_colbert.sh.
+  --warmup <count>           Passed through to bench_colbert.sh.
   --copy-index-to-tmp        Passed through to bench_colbert.sh.
   --refresh-tmp-index        Passed through to bench_colbert.sh.
   --tmp-root <path>          Passed through to bench_colbert.sh.
@@ -93,7 +94,7 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
-        --config-file|--env-name|--search-script|--experiment-name|--index-name|--implementation-label|--output-dir|--log-dir|--k|--tmp-root)
+        --config-file|--env-name|--search-script|--experiment-name|--index-name|--implementation-label|--output-dir|--log-dir|--k|--warmup|--tmp-root)
             [[ $# -ge 2 ]] || die "missing value for $1"
             pass_through_args+=("$1" "$2")
             shift 2
