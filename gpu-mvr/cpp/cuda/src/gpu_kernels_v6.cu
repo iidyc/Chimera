@@ -1,6 +1,133 @@
-#include "gpu_kernels_v5.cuh"
+#include "gpu_kernels_v6.cuh"
 
 #include <cfloat>
+#include <cub/cub.cuh>
+
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+// ---- Open-addressing hash table: doc_id → compact_slot ----
+// Keys array is initialised to -1 (empty). Vals array to -1 (not yet assigned).
+// Returns the compact_id assigned to doc_id (newly allocated or existing).
+__device__ __forceinline__
+int doc_ht_find_or_insert(
+    int* __restrict__ ht_keys,         // [ht_capacity], init -1
+    int* __restrict__ ht_vals,         // [ht_capacity], init -1
+    int* __restrict__ touched_list,    // [max_compact_docs]
+    int* __restrict__ num_inserted,    // scalar, init 0
+    int  doc_id,
+    int  max_compact_docs,
+    unsigned int ht_mask               // ht_capacity - 1
+) {
+    unsigned int h = (unsigned int)doc_id * 2654435761u;   // Knuth multiplicative hash
+    h &= ht_mask;
+
+    const unsigned int ht_capacity = ht_mask + 1;
+    for (unsigned int probe_count = 0; probe_count < ht_capacity; ++probe_count) {
+        const int probe = ht_keys[h];
+        if (probe == doc_id) {
+            // Key already exists. Spin until compact_id is published.
+            int cid;
+            do { cid = *(volatile int*)&ht_vals[h]; } while (cid == -1);
+            return (cid >= 0 && cid < max_compact_docs) ? cid : -1;
+        }
+        if (probe == -1) {
+            const int claimed = atomicCAS(&ht_keys[h], -1, doc_id);
+            if (claimed == doc_id) {
+                int cid;
+                do { cid = *(volatile int*)&ht_vals[h]; } while (cid == -1);
+                return (cid >= 0 && cid < max_compact_docs) ? cid : -1;
+            }
+            if (claimed != -1) {
+                h = (h + 1) & ht_mask;
+                continue;
+            }
+
+            // We just inserted this key. Allocate a compact id.
+            int cid = atomicAdd(num_inserted, 1);
+            if (cid >= max_compact_docs) {
+                atomicExch(&ht_vals[h], -2);  // overflow sentinel
+                return -1;
+            }
+            touched_list[cid] = doc_id;
+            atomicExch(&ht_vals[h], cid);     // publish
+            return cid;
+        }
+        // Collision with a different key — linear probe.
+        h = (h + 1) & ht_mask;
+    }
+    return -1;
+}
+
+__device__ __forceinline__ float warp_group_max(
+    float value,
+    unsigned int group_mask,
+    unsigned int active_mask
+) {
+    const int lane = threadIdx.x & 31;
+    unsigned int remaining = group_mask & ~(1u << lane);
+    while (remaining != 0u) {
+        const int peer_lane = __ffs(remaining) - 1;
+        value = fmaxf(value, __shfl_sync(active_mask, value, peer_lane));
+        remaining &= (remaining - 1);
+    }
+    return value;
+}
+
+__device__ __forceinline__ unsigned int warp_matching_doc_mask(
+    int doc_id,
+    unsigned int active_mask
+) {
+    unsigned int match_mask = 0u;
+    #pragma unroll
+    for (int lane = 0; lane < 32; ++lane) {
+        const unsigned int lane_bit = 1u << lane;
+        if ((active_mask & lane_bit) == 0u) {
+            continue;
+        }
+        if (__shfl_sync(active_mask, doc_id, lane) == doc_id) {
+            match_mask |= lane_bit;
+        }
+    }
+    return match_mask;
+}
+
+__device__ __forceinline__ void bitmap_flag_doc(
+    doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    int doc_id
+) {
+    const int bucket = doc_id / kDocBitmapBucketWidth;
+    const int bit = doc_id % kDocBitmapBucketWidth;
+    atomicOr(&d_doc_bitmap[bucket], doc_bitmap_bucket_t(1u) << bit);
+}
+
+__device__ __forceinline__ int bitmap_compact_id(
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int doc_id
+) {
+    const int bucket = doc_id / kDocBitmapBucketWidth;
+    const int group = bucket / kDocBitmapCompRatio;
+    const int group_bucket_start = group * kDocBitmapCompRatio;
+
+    int compact_id = static_cast<int>(d_doc_bitmap_offsets[group]);
+    #pragma unroll
+    for (int b = 0; b < kDocBitmapCompRatio; ++b) {
+        const int bucket_idx = group_bucket_start + b;
+        if (bucket_idx >= bucket) {
+            break;
+        }
+        compact_id += __popc(__ldg(&d_doc_bitmap[bucket_idx]));
+    }
+
+    const int bit = doc_id % kDocBitmapBucketWidth;
+    const doc_bitmap_bucket_t bucket_bits = __ldg(&d_doc_bitmap[bucket]);
+    const doc_bitmap_bucket_t prior_bits =
+        (bit == 0)
+            ? doc_bitmap_bucket_t(0)
+            : (bucket_bits & ((doc_bitmap_bucket_t(1u) << bit) - 1u));
+    compact_id += __popc(prior_bits);
+    return compact_id;
+}
+#endif
 
 // Atomic max for floats using compare-and-swap
 __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
@@ -155,26 +282,67 @@ __global__ void precompute_lut_kernel(
     }
 }
 
-// Fused stage1 kernel: computes per-(query, emb) binary IP distances and
-// directly performs the doc-level atomicMax aggregation + touched-list
-// tracking inline.
-//
-// v3 — flat iteration with preloaded cluster metadata:
-//   1. Cooperatively preload all (cluster_start, cluster_size) pairs
-//      into shared memory, eliminating per-cluster global loads from
-//      the hot loop.
-//   2. Compute a prefix sum of cluster sizes → flat element indices.
-//   3. Single grid-stride loop over ALL elements across all clusters.
-//      A 7-step binary search (on smem) maps flat_idx → (cluster, local).
-//      This removes the 128-iteration cluster loop overhead and ensures
-//      every thread does useful work (no idle threads on small clusters).
-//   4. 128-bit vectorized code load (uint4) + 32-bit nibble extraction
-//      (halves shift instructions vs uint64_t).
-//   5. Read-before-atomic guard on d_doc_query_max.
-//
-// Grid: (blocks_x, Q_DOCLEN).
-// Requires d_doc_query_max to be zero-initialised.
+// v6 keeps the v4 flat, fused LUT stage-1 traversal, but replaces the online
+// hash remap with a two-pass bitmap remap:
+//   1. Pass 1 flags touched doc ids in a bitmap.
+//   2. The bitmap is prefix-scanned into dense compact ids.
+//   3. Pass 2 recomputes stage 1 and atomically accumulates into compact rows
+//      using the bitmap rank as doc_id -> compact_id.
 #define STAGE1_MAX_NPROBE 512
+
+__global__ void bitmap_offset_init_kernel(
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    size_t num_buckets,
+    doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets
+) {
+    using WarpReduce = cub::WarpReduce<uint32_t, kDocBitmapCompRatio>;
+    __shared__ typename WarpReduce::TempStorage
+        temp_storage[256 / kDocBitmapCompRatio];
+
+    const size_t idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+    uint32_t count = 0;
+    if (idx < num_buckets) {
+        count = __popc(d_doc_bitmap[idx]);
+    }
+
+    const int group_id = threadIdx.x / kDocBitmapCompRatio;
+    const uint32_t group_sum = WarpReduce(temp_storage[group_id]).Sum(count);
+    if ((threadIdx.x % kDocBitmapCompRatio) == 0 && idx < num_buckets) {
+        d_doc_bitmap_offsets[idx / kDocBitmapCompRatio] = group_sum;
+    }
+}
+
+__global__ void bitmap_unique_docs_kernel(
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    size_t num_buckets,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int* __restrict__ d_out_doc_ids
+) {
+    const size_t bucket_idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+    if (bucket_idx >= num_buckets) {
+        return;
+    }
+
+    const size_t group_idx = bucket_idx / kDocBitmapCompRatio;
+    uint32_t out_idx = d_doc_bitmap_offsets[group_idx];
+    const size_t group_bucket_start = group_idx * kDocBitmapCompRatio;
+    #pragma unroll
+    for (int offset = 0; offset < kDocBitmapCompRatio; ++offset) {
+        const size_t prev_bucket = group_bucket_start + offset;
+        if (prev_bucket >= bucket_idx) {
+            break;
+        }
+        out_idx += __popc(__ldg(&d_doc_bitmap[prev_bucket]));
+    }
+
+    doc_bitmap_bucket_t bits = __ldg(&d_doc_bitmap[bucket_idx]);
+    while (bits != 0u) {
+        const int bit = __ffs(bits) - 1;
+        d_out_doc_ids[out_idx++] =
+            static_cast<int>(bucket_idx * kDocBitmapBucketWidth + bit);
+        bits &= (bits - 1);
+    }
+}
 
 __global__ void stage1_binary_ip_lut_kernel(
     const float*    __restrict__ d_lut,
@@ -185,9 +353,9 @@ __global__ void stage1_binary_ip_lut_kernel(
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
     float*       d_doc_query_max,
-    int*         d_doc_touched,
-    int*         d_touched_doc_list,
-    int*         d_num_touched_docs,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int          max_touched_docs,
     size_t       num_docs,
     int          nprobe,
     size_t       n_clusters
@@ -277,19 +445,92 @@ __global__ void stage1_binary_ip_lut_kernel(
         float dist = (ip - cb1_sumq) * factor;
 
         if (dist > 0.0f && (size_t)doc_id < num_docs) {
-            float* slot = &d_doc_query_max[(size_t)doc_id * Q_DOCLEN + query_idx];
-            if (dist > *slot) {
-                atomicMax(
-                    reinterpret_cast<int*>(slot),
-                    __float_as_int(dist));
-            }
+            const unsigned int active_mask = __activemask();
+            const unsigned int doc_group =
+                warp_matching_doc_mask(doc_id, active_mask);
+            const int lane = threadIdx.x & 31;
+            const int leader_lane = __ffs(doc_group) - 1;
+            const float group_max = warp_group_max(dist, doc_group, active_mask);
 
-            if (d_doc_touched[doc_id] == 0) {
-                int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
-                if (was_touched == 0) {
-                    int pos = atomicAdd(d_num_touched_docs, 1);
-                    d_touched_doc_list[pos] = doc_id;
+            if (lane == leader_lane) {
+                const int cid = bitmap_compact_id(
+                    d_doc_bitmap,
+                    d_doc_bitmap_offsets,
+                    doc_id);
+                if (cid < 0 || cid >= max_touched_docs) {
+                    continue;
                 }
+
+                atomicMaxFloat(
+                    &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx],
+                    group_max);
+            }
+        }
+    }
+}
+
+__global__ void stage1_binary_ip_lut_flag_docs_kernel(
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_clustered_doc_ids,
+    doc_bitmap_bucket_t* d_doc_bitmap,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+) {
+    __shared__ uint32_t smem_cstart[STAGE1_MAX_NPROBE];
+    __shared__ int      smem_prefix[STAGE1_MAX_NPROBE + 1];
+
+    const int query_idx = blockIdx.y;
+    if (query_idx >= Q_DOCLEN) return;
+
+    const uint32_t* my_labels = d_cagra_labels + query_idx * nprobe;
+    for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
+        uint32_t label = my_labels[p];
+        if (label < (uint32_t)n_clusters) {
+            size_t start = d_cluster_pos[label];
+            smem_cstart[p] = (uint32_t)start;
+            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+        } else {
+            smem_cstart[p] = 0;
+            smem_prefix[p + 1] = 0;
+        }
+    }
+    if (threadIdx.x == 0) smem_prefix[0] = 0;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        for (int i = 1; i <= nprobe; i++) {
+            smem_prefix[i] += smem_prefix[i - 1];
+        }
+    }
+    __syncthreads();
+
+    const int total_elements = smem_prefix[nprobe];
+
+    for (int flat_idx = threadIdx.x + blockIdx.x * blockDim.x;
+         flat_idx < total_elements;
+         flat_idx += blockDim.x * gridDim.x) {
+        int lo = 0, hi = nprobe;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (smem_prefix[mid + 1] <= flat_idx) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        const uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
+        const int doc_id = d_clustered_doc_ids[emb_pos];
+
+        if ((size_t)doc_id < num_docs) {
+            const unsigned int active_mask = __activemask();
+            const unsigned int doc_group =
+                warp_matching_doc_mask(doc_id, active_mask);
+            const int lane = threadIdx.x & 31;
+            if (lane == (__ffs(doc_group) - 1)) {
+                bitmap_flag_doc(d_doc_bitmap, doc_id);
             }
         }
     }
@@ -311,9 +552,9 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const int*      __restrict__ d_doc_ids,
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
-    int*         d_doc_touched,
-    int*         d_touched_doc_list,
-    int*         d_num_touched_docs,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int          max_touched_docs,
     size_t       num_docs,
     int          nprobe,
     size_t       n_clusters
@@ -399,19 +640,94 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
         float dist = (ip - cb1_sumq) * factor;
 
         if (dist > 0.0f && (size_t)doc_id < num_docs) {
-            float* slot = &d_doc_query_max[(size_t)doc_id * Q_DOCLEN + query_idx];
-            if (dist > *slot) {
-                atomicMax(
-                    reinterpret_cast<int*>(slot),
-                    __float_as_int(dist));
-            }
+            const unsigned int active_mask = __activemask();
+            const unsigned int doc_group =
+                warp_matching_doc_mask(doc_id, active_mask);
+            const int lane = threadIdx.x & 31;
+            const int leader_lane = __ffs(doc_group) - 1;
+            const float group_max = warp_group_max(dist, doc_group, active_mask);
 
-            if (d_doc_touched[doc_id] == 0) {
-                int was_touched = atomicExch(&d_doc_touched[doc_id], 1);
-                if (was_touched == 0) {
-                    int pos = atomicAdd(d_num_touched_docs, 1);
-                    d_touched_doc_list[pos] = doc_id;
+            if (lane == leader_lane) {
+                const int cid = bitmap_compact_id(
+                    d_doc_bitmap,
+                    d_doc_bitmap_offsets,
+                    doc_id);
+                if (cid < 0 || cid >= max_touched_docs) {
+                    continue;
                 }
+
+                atomicMaxFloat(
+                    &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx],
+                    group_max);
+            }
+        }
+    }
+}
+
+__global__ void stage1_binary_ip_lut_nonclustered_flag_docs_kernel(
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_inv_list,
+    doc_bitmap_bucket_t* d_doc_bitmap,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+) {
+    __shared__ uint32_t smem_cstart[STAGE1_MAX_NPROBE];
+    __shared__ int      smem_prefix[STAGE1_MAX_NPROBE + 1];
+
+    const int query_idx = blockIdx.y;
+    if (query_idx >= Q_DOCLEN) return;
+
+    const uint32_t* my_labels = d_cagra_labels + query_idx * nprobe;
+    for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
+        uint32_t label = my_labels[p];
+        if (label < (uint32_t)n_clusters) {
+            size_t start = d_cluster_pos[label];
+            smem_cstart[p] = (uint32_t)start;
+            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+        } else {
+            smem_cstart[p] = 0;
+            smem_prefix[p + 1] = 0;
+        }
+    }
+    if (threadIdx.x == 0) smem_prefix[0] = 0;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        for (int i = 1; i <= nprobe; i++) {
+            smem_prefix[i] += smem_prefix[i - 1];
+        }
+    }
+    __syncthreads();
+
+    const int total_elements = smem_prefix[nprobe];
+
+    for (int flat_idx = threadIdx.x + blockIdx.x * blockDim.x;
+         flat_idx < total_elements;
+         flat_idx += blockDim.x * gridDim.x) {
+        int lo = 0, hi = nprobe;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (smem_prefix[mid + 1] <= flat_idx) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        const uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
+        const uint32_t orig_id = (uint32_t)__ldg(&d_inv_list[emb_pos]);
+        const int doc_id = __ldg(&d_doc_ids[orig_id]);
+
+        if ((size_t)doc_id < num_docs) {
+            const unsigned int active_mask = __activemask();
+            const unsigned int doc_group =
+                warp_matching_doc_mask(doc_id, active_mask);
+            const int lane = threadIdx.x & 31;
+            if (lane == (__ffs(doc_group) - 1)) {
+                bitmap_flag_doc(d_doc_bitmap, doc_id);
             }
         }
     }
@@ -734,9 +1050,18 @@ __global__ void aggregate_stage1_tracked_kernel(
     const int*    __restrict__ d_pair_offsets,
     const int*    __restrict__ d_doc_ids,
     float*        d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    int*          d_ht_keys,
+    int*          d_ht_vals,
+    int*          d_touched_doc_list,
+    int*          d_num_touched_docs,
+    int           max_touched_docs,
+    unsigned int  ht_mask,
+#else
     int*          d_doc_touched,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
+#endif
     size_t        num_docs,
     size_t        total_pairs,
     size_t        max_embs_per_query
@@ -771,6 +1096,23 @@ __global__ void aggregate_stage1_tracked_kernel(
     if (dist <= 0.0f) return;
     if (doc_id >= (int)num_docs) return;
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    // Doc-major layout: [compact_id * Q_DOCLEN + q_idx]. Adjacent q's for
+    // same doc are contiguous, which makes the subsequent sum kernel coalesced.
+    const unsigned int active_mask = __activemask();
+    const unsigned int doc_group = warp_matching_doc_mask(doc_id, active_mask);
+    const int lane = threadIdx.x & 31;
+    const int leader_lane = __ffs(doc_group) - 1;
+    const float group_max = warp_group_max(dist, doc_group, active_mask);
+    if (lane == leader_lane) {
+        int cid = doc_ht_find_or_insert(
+            d_ht_keys, d_ht_vals,
+            d_touched_doc_list, d_num_touched_docs,
+            doc_id, max_touched_docs, ht_mask);
+        if (cid < 0) return;
+        atomicMaxFloat(&d_doc_query_max[(size_t)cid * Q_DOCLEN + q_idx], group_max);
+    }
+#else
     // Doc-major layout: [doc_id * Q_DOCLEN + q_idx]. Adjacent q's for same
     // doc are contiguous, which makes the subsequent sum kernel coalesced.
     atomicMaxFloat(&d_doc_query_max[(size_t)doc_id * Q_DOCLEN + q_idx], dist);
@@ -782,6 +1124,7 @@ __global__ void aggregate_stage1_tracked_kernel(
             d_touched_doc_list[pos] = doc_id;
         }
     }
+#endif
 }
 
 // Warp-per-doc cooperative summation.
@@ -796,8 +1139,10 @@ __global__ void sum_doc_scores_sparse_kernel(
     const int*   __restrict__ d_touched_doc_list,
     float*       d_scores_out,
     int*         d_doc_ids_out,
-    int          num_touched,
-    size_t       num_docs
+    int          num_touched
+#ifndef GPU_MVR_COMPACT_DOC_BUFFER
+    , size_t     num_docs
+#endif
 ) {
     const int warp_id_in_block = threadIdx.x >> 5;          // 0..7
     const int lane             = threadIdx.x & 31;          // 0..31
@@ -806,8 +1151,15 @@ __global__ void sum_doc_scores_sparse_kernel(
     if (global_warp_id >= num_touched) return;
 
     const int doc_id = d_touched_doc_list[global_warp_id];
+
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    // d_doc_query_max is compact-indexed: row = global_warp_id
+    // (== compact_id because touched_list is in compact_id order).
+    float val = d_doc_query_max[(size_t)global_warp_id * Q_DOCLEN + lane];
+#else
     // d_doc_query_max is indexed by doc_id directly.
     float val = d_doc_query_max[(size_t)doc_id * Q_DOCLEN + lane];
+#endif
 
     // Warp-shuffle tree reduction (5 steps for 32 lanes).
     #pragma unroll

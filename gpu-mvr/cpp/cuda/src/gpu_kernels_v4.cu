@@ -14,112 +14,6 @@ __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
     return __int_as_float(old);
 }
 
-#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
-__device__ __forceinline__ int doc_id_from_doc_ptrs_binary(
-    const int* __restrict__ d_doc_ptrs,
-    int num_docs,
-    uint32_t token_id
-) {
-    int lo = 0;
-    int hi = num_docs - 1;
-
-    while (lo < hi) {
-        const int mid = lo + ((hi - lo + 1) >> 1);
-        const uint32_t mid_start = (uint32_t)__ldg(&d_doc_ptrs[mid]);
-        if (mid_start <= token_id) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    return lo;
-}
-
-__device__ __forceinline__ int doc_id_from_doc_ptrs_binary_range(
-    const int* __restrict__ d_doc_ptrs,
-    int lo,
-    int hi,
-    uint32_t token_id
-) {
-    while (lo < hi) {
-        const int mid = lo + ((hi - lo + 1) >> 1);
-        const uint32_t mid_start = (uint32_t)__ldg(&d_doc_ptrs[mid]);
-        if (mid_start <= token_id) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    return lo;
-}
-
-__device__ __forceinline__ int doc_id_from_doc_ptrs_blocked(
-    const int* __restrict__ d_doc_ptrs,
-    const int* __restrict__ d_doc_block_lut,
-    uint32_t token_id
-) {
-    const int block = static_cast<int>(token_id >> kDocPtrLookupBlockShift);
-    const int lo = __ldg(&d_doc_block_lut[block]);
-    const int hi = __ldg(&d_doc_block_lut[block + 1]);
-    return (lo >= hi)
-        ? lo
-        : doc_id_from_doc_ptrs_binary_range(d_doc_ptrs, lo, hi, token_id);
-}
-
-__device__ __forceinline__ bool warp_tokens_are_nondecreasing(
-    uint32_t token_id,
-    unsigned active_mask
-) {
-    const int lane = threadIdx.x & 31;
-    const unsigned lower_lanes_mask =
-        active_mask & ((lane == 0) ? 0u : ((1u << lane) - 1u));
-    bool ordered = true;
-    if (lower_lanes_mask != 0u) {
-        const int prev_lane = 31 - __clz(lower_lanes_mask);
-        const uint32_t prev_token = __shfl_sync(active_mask, token_id, prev_lane);
-        ordered = token_id >= prev_token;
-    }
-    return __all_sync(active_mask, ordered);
-}
-
-__device__ __forceinline__ int doc_id_from_doc_ptrs_warp_sorted(
-    uint32_t token_id,
-    const int* __restrict__ d_doc_ptrs,
-    int num_docs,
-    unsigned active_mask,
-    int* __restrict__ warp_doc_ids
-) {
-    const int lane = threadIdx.x & 31;
-    const int leader_lane = __ffs(active_mask) - 1;
-
-    if (lane == leader_lane) {
-        unsigned remaining = active_mask;
-        int lower_doc = 0;
-        bool first = true;
-
-        while (remaining != 0u) {
-            const int src_lane = __ffs(remaining) - 1;
-            const uint32_t lane_token = __shfl_sync(active_mask, token_id, src_lane);
-            lower_doc = first
-                ? doc_id_from_doc_ptrs_binary(d_doc_ptrs, num_docs, lane_token)
-                : doc_id_from_doc_ptrs_binary_range(
-                    d_doc_ptrs,
-                    lower_doc,
-                    num_docs - 1,
-                    lane_token);
-            warp_doc_ids[src_lane] = lower_doc;
-            remaining &= (remaining - 1);
-            first = false;
-        }
-    }
-
-    __syncwarp(active_mask);
-    return warp_doc_ids[lane];
-}
-#endif
-
 __global__ void stage1_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
@@ -414,12 +308,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const float*    __restrict__ d_cb1_sumq,
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
-#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
-    const int*      __restrict__ d_doc_ptrs,
-    const int*      __restrict__ d_doc_block_lut,
-#else
     const int*      __restrict__ d_doc_ids,
-#endif
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
     int*         d_doc_touched,
@@ -491,14 +380,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
         const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
             d_code + (size_t)orig_id * CODE_BYTES));
         const float factor = __ldg(&d_factor[orig_id]);
-#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
-        const int doc_id = doc_id_from_doc_ptrs_blocked(
-            d_doc_ptrs,
-            d_doc_block_lut,
-            orig_id);
-#else
         const int   doc_id = __ldg(&d_doc_ids[orig_id]);
-#endif
 
         float ip = 0.0f;
         #pragma unroll
@@ -840,12 +722,7 @@ __global__ void aggregate_stage1_tracked_kernel(
     const size_t* __restrict__ d_emb_ids,
     const float*  __restrict__ d_emb_dists,
     const int*    __restrict__ d_pair_offsets,
-#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
-    const int*    __restrict__ d_doc_ptrs,
-    const int*    __restrict__ d_doc_block_lut,
-#else
     const int*    __restrict__ d_doc_ids,
-#endif
     float*        d_doc_query_max,
     int*          d_doc_touched,
     int*          d_touched_doc_list,
@@ -879,15 +756,7 @@ __global__ void aggregate_stage1_tracked_kernel(
         d_emb_dists[(size_t)q_idx * max_embs_per_query + local_idx];
 
     const size_t emb_id = d_emb_ids[(size_t)pair_start + local_idx];
-#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
-    const uint32_t token_id = static_cast<uint32_t>(emb_id);
-    const int doc_id = doc_id_from_doc_ptrs_blocked(
-        d_doc_ptrs,
-        d_doc_block_lut,
-        token_id);
-#else
     const int doc_id = d_doc_ids[emb_id];
-#endif
 
     if (dist <= 0.0f) return;
     if (doc_id >= (int)num_docs) return;

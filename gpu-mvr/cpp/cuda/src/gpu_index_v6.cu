@@ -1,17 +1,26 @@
-#include "gpu_index_v3.cuh"
+#include "gpu_index_v6.cuh"
 
+#include <cerrno>
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
 
 #include <filesystem>
-#include <tuple>
+#include <functional>
+#include <system_error>
 
 #include "clustered_stage1_file_format.hpp"
 #include "gpu_index_layout.hpp"
 #include "mvr_index_file_format.hpp"
 #include "startup_profile.hpp"
+
+#if defined(GPU_MVR_CLUSTERED_LAYOUT_DISABLED) && \
+    defined(GPU_MVR_CLUSTERED_LAYOUT_REQUIRED)
+#error "GPU_MVR_CLUSTERED_LAYOUT_DISABLED and GPU_MVR_CLUSTERED_LAYOUT_REQUIRED are mutually exclusive"
+#endif
 
 namespace {
 
@@ -37,7 +46,8 @@ std::pair<size_t, size_t> compute_stage2_token_bounds(
 
 #pragma omp parallel for schedule(dynamic, 1024)
     for (int doc_idx = 0; doc_idx < static_cast<int>(doc_lengths.size()); ++doc_idx) {
-        doc_lengths[doc_idx] = static_cast<size_t>(doc_ptrs[doc_idx + 1] - doc_ptrs[doc_idx]);
+        doc_lengths[doc_idx] =
+            static_cast<size_t>(doc_ptrs[doc_idx + 1] - doc_ptrs[doc_idx]);
     }
 
     std::sort(doc_lengths.begin(), doc_lengths.end(), std::greater<size_t>());
@@ -77,15 +87,24 @@ gpu_mvr_index::gpu_mvr_index(
     const std::string& filename,
     const std::vector<int>& doc_lens,
     const gpu_search_runtime_options& runtime_options) {
+    auto log_ctor_step = [](const std::string& message) {
+        std::cout << "[INIT][index_ctor] " << message << std::endl;
+    };
+
     nprobe = runtime_options.nprobe;
     k_rank_cluster = runtime_options.k_rank_cluster;
     k_rank_all_tokens = runtime_options.k_rank_all_tokens;
     itopk_size = runtime_options.itopk_size;
     overlap_chunks = runtime_options.overlap_chunks;
+
     gpu_mvr::StartupProfile startup("index_ctor");
     const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
     startup.mark("resolve_index_paths");
 
+    log_ctor_step(
+        "Loading quantized payloads from " +
+        resolved_paths.quantized_data_path + " and " +
+        resolved_paths.doc_4bit_path + " ...");
     std::ifstream inf(resolved_paths.quantized_data_path, std::ios::binary);
     const auto header =
         mvr_index_file_format::read_header(inf, resolved_paths.quantized_data_path);
@@ -107,18 +126,17 @@ gpu_mvr_index::gpu_mvr_index(
     startup.mark("read_header_and_rotator");
 
     const size_t one_bit_bytes = n * (PADDED_DIM / 8);
+    one_bit_code_.resize(one_bit_bytes);
     full_code_.resize(n * PADDED_DIM * (1 + ex_bits) / 8);
+    one_bit_factor_.resize(n);
     ex_factor_.resize(n);
 
-    inf.seekg(static_cast<std::streamoff>(one_bit_bytes + n * sizeof(float)), std::ios::cur);
+    inf.read(one_bit_code_.data(), one_bit_code_.size());
+    inf.read(reinterpret_cast<char*>(one_bit_factor_.data()), n * sizeof(float));
+    inf.read(reinterpret_cast<char*>(ex_factor_.data()), n * sizeof(float));
     if (!inf) {
         throw std::runtime_error(
-            "Failed to position ex_factor section in " + resolved_paths.quantized_data_path);
-    }
-    inf.read((char*)ex_factor_.data(), n * sizeof(float));
-    if (!inf) {
-        throw std::runtime_error(
-            "Failed to read ex_factor section in " + resolved_paths.quantized_data_path);
+            "Failed to read doc_1bit payload from " + resolved_paths.quantized_data_path);
     }
     inf.close();
 
@@ -143,173 +161,283 @@ gpu_mvr_index::gpu_mvr_index(
     ip_func_ = select_excode_ipfunc(1 + ex_bits);
     unpack_func_ = select_excode_unpackfunc(1 + ex_bits);
 
+    log_ctor_step(
+        "Loading IVF postings and centroid graph from " +
+        resolved_paths.ivf_path + " and " +
+        resolved_paths.centroids_path + " ...");
     ivf = new IVF_PG(n_clusters, d, PGType::CAGRA);
     ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
     max_cluster_size = ivf->max_cluster_size();
-    std::cout << "max cluster size: " << max_cluster_size << "\n";
+    std::cout << "max cluster size: " << max_cluster_size << std::endl;
     startup.mark("load_ivf");
 
+    log_ctor_step(
+        "Building document-to-token map for " +
+        std::to_string(doc_lens.size()) + " docs and " +
+        std::to_string(n) + " embeddings ...");
     set_doc_mapping(doc_lens);
     startup.mark("set_doc_mapping");
-
+    log_ctor_step(
+        "Computing top-" + std::to_string(nprobe) +
+        " per-query workspace bounds from cluster token/doc counts ...");
     compute_workspace_probe_bounds();
     startup.mark("compute_workspace_probe_bounds");
-
-    size_t free_mem, total_mem;
-    // CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-    // std::cout << "GPU memory usage after index upload: "
-    //           << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
-    //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
-
-    // size_t required_mem = n * PADDED_DIM / 8 + n * sizeof(float) * 2 + (num_docs + 1) * sizeof(int) +  // one-bit code + factor + doc mapping
-    //                       (ivf->n_clusters + 1) * sizeof(size_t);  // cluster_pos
-    // std::cout << "Estimated GPU memory required for index data: "
-    //           << (required_mem / (1024.0 * 1024.0)) << " MB\n";
-    // std::cout << "Free GPU memory: " << (free_mem / (1024.0 * 1024.0)) << " MB\n";
-
-    // Allocate persistent GPU data
+    log_ctor_step("Uploading persistent stage-1 data to GPU ...");
+    const size_t code_bytes = n * PADDED_DIM / 8;
+    CUDA_CHECK(cudaMalloc(&d_one_bit_code_, code_bytes));
+    CUDA_CHECK(cudaMalloc(&d_one_bit_factor_, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_doc_ids_, n * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_doc_ptrs_, (num_docs + 1) * sizeof(int)));
 
-    // Upload inverted list structures to GPU
     CUDA_CHECK(cudaMalloc(&d_cluster_pos_, (ivf->n_clusters + 1) * sizeof(size_t)));
-    CUDA_CHECK(cudaMemcpy(d_cluster_pos_, ivf->cluster_pos.data(),
-                          (ivf->n_clusters + 1) * sizeof(size_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        d_cluster_pos_,
+        ivf->cluster_pos.data(),
+        (ivf->n_clusters + 1) * sizeof(size_t),
+        cudaMemcpyHostToDevice));
 
+#ifndef GPU_MVR_USE_LUT
+    {
+        size_t inv_list_size = ivf->inv_list.size();
+        CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(
+            d_inv_list_,
+            ivf->inv_list.data(),
+            inv_list_size * sizeof(int),
+            cudaMemcpyHostToDevice));
+    }
+#else
     d_inv_list_ = nullptr;
+#endif
 
+    CUDA_CHECK(cudaMemcpy(d_one_bit_code_, one_bit_code_.data(), code_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_one_bit_factor_, one_bit_factor_.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_doc_ids_, doc_ids_.data(), n * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_doc_ptrs_, doc_ptrs_.data(), (num_docs + 1) * sizeof(int), cudaMemcpyHostToDevice));
     startup.mark("upload_persistent_data");
 
-    // CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-    // std::cout << "GPU memory usage after index upload: "
-    //           << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
-    //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
-
+    log_ctor_step(
+        "Allocating GPU workspace for max runtime config "
+        "(nprobe=" + std::to_string(nprobe) +
+        ", k_rank_cluster=" + std::to_string(k_rank_cluster) +
+        ", k_rank_all_tokens=" + std::to_string(k_rank_all_tokens) +
+        ", itopk_size=" + std::to_string(itopk_size) +
+        ", overlap_chunks=" + std::to_string(overlap_chunks) + ") ...");
     allocate_workspace();
     startup.mark("allocate_workspace");
 
-    // Load the persisted cluster-ordered GPU index. Stage-1 and stage-2 both
-    // depend on this layout in v3.
     {
-        size_t inv_n = ivf->inv_list.size();
-        size_t code_per_vec = PADDED_DIM / 8;  // == CODE_BYTES
-        size_t clustered_bytes =
-            inv_n * (code_per_vec + sizeof(float) + sizeof(int) + sizeof(uint32_t));
-        const auto& gpu_index_path = resolved_paths.gpu_index_path;
+        const size_t inv_n = ivf->inv_list.size();
+        const size_t code_per_vec = PADDED_DIM / 8;
+#ifdef GPU_MVR_CLUSTERED_LAYOUT_DISABLED
+#ifdef GPU_MVR_USE_LUT
+        if (d_inv_list_ == nullptr) {
+            const size_t inv_list_size = ivf->inv_list.size();
+            CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
+            CUDA_CHECK(cudaMemcpy(
+                d_inv_list_,
+                ivf->inv_list.data(),
+                inv_list_size * sizeof(int),
+                cudaMemcpyHostToDevice));
+        }
+#endif
+        use_clustered_ = false;
+        d_clustered_code_ = nullptr;
+        d_clustered_factor_ = nullptr;
+        d_clustered_doc_ids_ = nullptr;
+        std::cout << "[gpu_mvr] Clustered layout disabled for this build. "
+                     "Using original-order layout with inv_list indirection."
+                  << std::endl;
+        startup.mark("disable_clustered_layout");
+#else
+        const size_t clustered_bytes =
+            inv_n * (code_per_vec + sizeof(float) + sizeof(int));
 
-        size_t free_mem, total_mem;
+        auto ensure_inv_list_on_gpu = [&]() {
+#ifdef GPU_MVR_USE_LUT
+            if (d_inv_list_ == nullptr) {
+                const size_t inv_list_size = ivf->inv_list.size();
+                CUDA_CHECK(cudaMalloc(&d_inv_list_, inv_list_size * sizeof(int)));
+                CUDA_CHECK(cudaMemcpy(
+                    d_inv_list_,
+                    ivf->inv_list.data(),
+                    inv_list_size * sizeof(int),
+                    cudaMemcpyHostToDevice));
+            }
+#endif
+        };
+
+        auto disable_clustered_layout = [&](const std::string& reason, const char* startup_label) {
+            use_clustered_ = false;
+            d_clustered_code_ = nullptr;
+            d_clustered_factor_ = nullptr;
+            d_clustered_doc_ids_ = nullptr;
+            ensure_inv_list_on_gpu();
+            std::cout << reason << std::endl;
+            startup.mark(startup_label);
+        };
+
+        auto load_persisted_clustered_layout = [&]() {
+            if (resolved_paths.gpu_index_path.empty() ||
+                !std::filesystem::exists(resolved_paths.gpu_index_path)) {
+                throw std::runtime_error(
+                    "Required clustered sidecar is missing: " +
+                    resolved_paths.gpu_index_path);
+            }
+
+            log_ctor_step(
+                "Loading cluster-ordered stage-1 layout from " +
+                resolved_paths.gpu_index_path + " ...");
+            std::ifstream clustered_header_file(
+                resolved_paths.gpu_index_path, std::ios::binary);
+            const auto clustered_header =
+                clustered_stage1_file_format::read_header(
+                    clustered_header_file, resolved_paths.gpu_index_path);
+            if (clustered_header.n_entries != inv_n ||
+                clustered_header.code_bytes_per_vector != code_per_vec) {
+                throw std::runtime_error(
+                    "GPU index metadata mismatch for " +
+                    resolved_paths.gpu_index_path);
+            }
+            if (clustered_stage1_file_format::has_embedded_rotator(clustered_header)) {
+                if (clustered_header.source_dim != header.d ||
+                    clustered_header.padded_dim != header.padded_dim ||
+                    clustered_header.rotator_type != header.rotator_type) {
+                    throw std::runtime_error(
+                        "cluster_1bit rotator metadata mismatch for " +
+                        resolved_paths.gpu_index_path);
+                }
+                auto* clustered_rotator = clustered_stage1_file_format::load_rotator(
+                    clustered_header_file,
+                    clustered_header,
+                    resolved_paths.gpu_index_path);
+                delete clustered_rotator;
+            }
+            clustered_header_file.close();
+
+            struct stat clustered_stat {};
+            const int clustered_fd = open(resolved_paths.gpu_index_path.c_str(), O_RDONLY);
+            if (clustered_fd < 0) {
+                throw std::runtime_error(
+                    "Failed to open GPU index: " + resolved_paths.gpu_index_path);
+            }
+            if (fstat(clustered_fd, &clustered_stat) != 0) {
+                const auto err = errno;
+                close(clustered_fd);
+                throw std::runtime_error(
+                    "Failed to stat GPU index " + resolved_paths.gpu_index_path +
+                    ": " + std::system_category().message(err));
+            }
+
+            const size_t mapping_size = static_cast<size_t>(clustered_stat.st_size);
+            const size_t expected_size =
+                clustered_stage1_file_format::prefix_bytes(clustered_header) +
+                inv_n * code_per_vec +
+                inv_n * sizeof(float) +
+                inv_n * sizeof(int) +
+                inv_n * sizeof(uint32_t);
+            if (mapping_size != expected_size) {
+                close(clustered_fd);
+                throw std::runtime_error(
+                    "Unexpected GPU index size for " +
+                    resolved_paths.gpu_index_path);
+            }
+
+            void* clustered_mapping =
+                mmap(nullptr, mapping_size, PROT_READ, MAP_PRIVATE, clustered_fd, 0);
+            if (clustered_mapping == MAP_FAILED) {
+                const auto err = errno;
+                close(clustered_fd);
+                throw std::runtime_error(
+                    "Failed to mmap GPU index " + resolved_paths.gpu_index_path +
+                    ": " + std::system_category().message(err));
+            }
+
+            const auto* clustered_base = static_cast<const char*>(clustered_mapping);
+            const size_t clustered_prefix_bytes =
+                clustered_stage1_file_format::prefix_bytes(clustered_header);
+            const auto* clustered_code =
+                clustered_base + clustered_prefix_bytes;
+            const auto* clustered_factor = reinterpret_cast<const float*>(
+                clustered_code + inv_n * code_per_vec);
+            const auto* clustered_doc_ids = reinterpret_cast<const int*>(
+                reinterpret_cast<const char*>(clustered_factor) +
+                inv_n * sizeof(float));
+
+            CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
+            CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
+
+            CUDA_CHECK(cudaMemcpy(
+                d_clustered_code_,
+                clustered_code,
+                inv_n * code_per_vec,
+                cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(
+                d_clustered_factor_,
+                clustered_factor,
+                inv_n * sizeof(float),
+                cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(
+                d_clustered_doc_ids_,
+                clustered_doc_ids,
+                inv_n * sizeof(int),
+                cudaMemcpyHostToDevice));
+
+            munmap(clustered_mapping, mapping_size);
+            close(clustered_fd);
+            use_clustered_ = true;
+            startup.note("clustered_layout_source", "persisted");
+            std::cout << "[gpu_mvr] Using cluster-ordered layout ("
+                      << (clustered_bytes / (1024.0 * 1024.0)) << " MB)"
+                      << std::endl;
+            startup.mark("load_clustered_layout");
+        };
+
+#ifdef GPU_MVR_CLUSTERED_LAYOUT_REQUIRED
+        size_t free_mem = 0;
+        size_t total_mem = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-
         if (free_mem <= clustered_bytes) {
             throw std::runtime_error(
                 "Insufficient GPU memory for required cluster_1bit.bin layout: need " +
-                std::to_string(clustered_bytes) + " bytes, have " +
-                std::to_string(free_mem) + " bytes free");
+                std::to_string(clustered_bytes / (1024 * 1024)) +
+                " MB, have " +
+                std::to_string(free_mem / (1024 * 1024)) +
+                " MB free");
         }
+        load_persisted_clustered_layout();
+#else
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
 
-        use_clustered_ = true;
-        if (gpu_index_path.empty() || !std::filesystem::exists(gpu_index_path)) {
-            throw std::runtime_error(
-                "Missing cluster_1bit.bin for split GPU index layout in " +
-                std::filesystem::path(resolved_paths.quantized_data_path).parent_path().string());
-        }
+        const bool force_nonclustered =
+            [] {
+                const char* env = std::getenv("GPU_MVR_FORCE_NONCLUSTERED");
+                return env != nullptr && env[0] != '\0' && std::string(env) != "0";
+            }();
 
-        std::ifstream clustered_header_file(gpu_index_path, std::ios::binary);
-        const auto clustered_header =
-            clustered_stage1_file_format::read_header(
-                clustered_header_file, gpu_index_path);
-        if (clustered_header.n_entries != inv_n ||
-            clustered_header.code_bytes_per_vector != code_per_vec) {
-            throw std::runtime_error(
-                "GPU index metadata mismatch for " + gpu_index_path);
-        }
-        if (clustered_stage1_file_format::has_embedded_rotator(clustered_header)) {
-            if (clustered_header.source_dim != header.d ||
-                clustered_header.padded_dim != header.padded_dim ||
-                clustered_header.rotator_type != header.rotator_type) {
-                throw std::runtime_error(
-                    "cluster_1bit rotator metadata mismatch for " + gpu_index_path);
+        if (!force_nonclustered && free_mem > clustered_bytes) {
+            load_persisted_clustered_layout();
+        } else {
+            if (force_nonclustered) {
+                disable_clustered_layout(
+                    "[gpu_mvr] GPU_MVR_FORCE_NONCLUSTERED is set. "
+                    "Using original-order layout with inv_list indirection.",
+                    "skip_clustered_layout");
+            } else {
+                disable_clustered_layout(
+                    "[gpu_mvr] Insufficient GPU memory for cluster-ordered layout (" +
+                    std::to_string(clustered_bytes / (1024 * 1024)) +
+                    " MB needed, " +
+                    std::to_string(free_mem / (1024 * 1024)) +
+                    " MB free). Falling back to inv_list indirection.",
+                "skip_clustered_layout");
             }
-            auto* clustered_rotator = clustered_stage1_file_format::load_rotator(
-                clustered_header_file, clustered_header, gpu_index_path);
-            delete clustered_rotator;
         }
-        clustered_header_file.close();
-
-        struct stat clustered_stat {};
-        const int clustered_fd = open(gpu_index_path.c_str(), O_RDONLY);
-        if (clustered_fd < 0) {
-            throw std::runtime_error("Failed to open GPU index: " + gpu_index_path);
-        }
-        if (fstat(clustered_fd, &clustered_stat) != 0) {
-            const auto err = errno;
-            close(clustered_fd);
-            throw std::runtime_error(
-                "Failed to stat GPU index " + gpu_index_path + ": " +
-                std::system_category().message(err));
-        }
-
-        const size_t mapping_size = static_cast<size_t>(clustered_stat.st_size);
-        const size_t expected_size =
-            clustered_stage1_file_format::prefix_bytes(clustered_header) +
-            inv_n * code_per_vec +
-            inv_n * sizeof(float) +
-            inv_n * sizeof(int) +
-            inv_n * sizeof(uint32_t);
-        if (mapping_size != expected_size) {
-            close(clustered_fd);
-            throw std::runtime_error(
-                "Unexpected GPU index size for " + gpu_index_path);
-        }
-
-        void* clustered_mapping =
-            mmap(nullptr, mapping_size, PROT_READ, MAP_PRIVATE, clustered_fd, 0);
-        if (clustered_mapping == MAP_FAILED) {
-            const auto err = errno;
-            close(clustered_fd);
-            throw std::runtime_error(
-                "Failed to mmap GPU index " + gpu_index_path + ": " +
-                std::system_category().message(err));
-        }
-
-        const auto* clustered_base = static_cast<const char*>(clustered_mapping);
-        const size_t clustered_prefix_bytes =
-            clustered_stage1_file_format::prefix_bytes(clustered_header);
-        const auto* clustered_code =
-            clustered_base + clustered_prefix_bytes;
-        const auto* clustered_factor = reinterpret_cast<const float*>(
-            clustered_code + inv_n * code_per_vec);
-        const auto* clustered_doc_ids = reinterpret_cast<const int*>(
-            reinterpret_cast<const char*>(clustered_factor) + inv_n * sizeof(float));
-        const auto* token_to_cluster_pos = reinterpret_cast<const uint32_t*>(
-            reinterpret_cast<const char*>(clustered_doc_ids) + inv_n * sizeof(int));
-
-        CUDA_CHECK(cudaMalloc(&d_clustered_code_, inv_n * code_per_vec));
-        CUDA_CHECK(cudaMalloc(&d_clustered_factor_, inv_n * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_clustered_doc_ids_, inv_n * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_token_to_cluster_pos_, inv_n * sizeof(uint32_t)));
-
-        CUDA_CHECK(cudaMemcpy(
-            d_clustered_code_, clustered_code,
-            inv_n * code_per_vec, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            d_clustered_factor_, clustered_factor,
-            inv_n * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            d_clustered_doc_ids_, clustered_doc_ids,
-            inv_n * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            d_token_to_cluster_pos_, token_to_cluster_pos,
-            inv_n * sizeof(uint32_t), cudaMemcpyHostToDevice));
-
-        munmap(clustered_mapping, mapping_size);
-        close(clustered_fd);
-        startup.note("gpu_index_source", "persisted");
-        startup.mark("load_gpu_index");
-
-        std::cout << "[gpu_mvr] Using cluster-ordered layout ("
-                  << (clustered_bytes / (1024.0 * 1024.0)) << " MB)\n";
-        startup.mark("build_clustered_layout");
+#endif
+#endif
     }
 }
 
@@ -322,9 +450,18 @@ void gpu_mvr_index::set_doc_mapping(const std::vector<int>& doc_lens) {
         max_doc_len = std::max(max_doc_len, doc_lens[i]);
         doc_ptrs_[i + 1] = doc_ptrs_[i] + doc_lens[i];
     }
+    doc_ids_.resize(n);
+    for (size_t i = 0; i < num_docs; ++i) {
+        for (size_t j = 0; j < doc_lens[i]; ++j) {
+            doc_ids_[doc_ptrs_[i] + j] = i;
+        }
+    }
+    if (static_cast<size_t>(doc_ptrs_.back()) != n) {
+        throw std::runtime_error(
+            "doclens token count " + std::to_string(doc_ptrs_.back()) +
+            " does not match index embedding count " + std::to_string(n));
+    }
 }
-
-// ======================== allocate_workspace ========================
 
 void gpu_mvr_index::compute_workspace_probe_bounds() {
     const size_t probe_cluster_bound =
@@ -332,22 +469,57 @@ void gpu_mvr_index::compute_workspace_probe_bounds() {
     workspace_probe_cluster_bound_ = probe_cluster_bound;
     if (probe_cluster_bound == 0) {
         workspace_probe_token_bound_ = 0;
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+        workspace_probe_unique_doc_bound_ = 0;
+#endif
         return;
     }
 
     std::vector<size_t> cluster_token_counts(n_clusters, 0);
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    std::vector<size_t> cluster_unique_doc_counts(n_clusters, 0);
+#endif
 
 #pragma omp parallel for schedule(dynamic, 256)
     for (int cluster_idx = 0; cluster_idx < static_cast<int>(n_clusters); ++cluster_idx) {
         const size_t cluster_id = static_cast<size_t>(cluster_idx);
         const size_t start = ivf->cluster_pos[cluster_id];
         const size_t end = ivf->cluster_pos[cluster_id + 1];
-        cluster_token_counts[cluster_id] = end - start;
+        const size_t token_count = end - start;
+        cluster_token_counts[cluster_id] = token_count;
+
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+        if (token_count == 0) {
+            cluster_unique_doc_counts[cluster_id] = 0;
+            continue;
+        }
+
+        const auto first_token_id = static_cast<uint32_t>(ivf->inv_list[start]);
+        int prev_doc_id = doc_ids_[first_token_id];
+        size_t unique_doc_count = 1;
+
+        for (size_t pos = start + 1; pos < end; ++pos) {
+            const uint32_t token_id = static_cast<uint32_t>(ivf->inv_list[pos]);
+            const int current_doc_id = doc_ids_[token_id];
+            if (current_doc_id != prev_doc_id) {
+                ++unique_doc_count;
+                prev_doc_id = current_doc_id;
+            }
+        }
+
+        cluster_unique_doc_counts[cluster_id] = unique_doc_count;
+#endif
     }
 
     workspace_probe_token_bound_ =
         sum_top_sorted_counts(cluster_token_counts, probe_cluster_bound);
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    workspace_probe_unique_doc_bound_ =
+        sum_top_sorted_counts(cluster_unique_doc_counts, probe_cluster_bound);
+#endif
 }
+
+// ======================== allocate_workspace ========================
 
 void gpu_mvr_index::allocate_workspace() {
     ws_.max_q_doclen = Q_DOCLEN;
@@ -360,18 +532,50 @@ void gpu_mvr_index::allocate_workspace() {
     ws_.estimated_num_docs = (size_t)num_docs;
     ws_.max_stage1_touched_docs =
         std::min(ws_.estimated_num_docs, ws_.max_stage1_pairs);
-    const size_t doc_buf_rows = std::max<size_t>(ws_.max_stage1_touched_docs, 1);
-    std::cout << "max cluster size: " << max_cluster_size << "\n";
+
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    // The compact-doc buffer tracks unique documents, not tokens.
+    // A safe per-query-token upper bound is the sum of the largest nprobe
+    // per-cluster unique-doc counts. Across Q_DOCLEN query tokens, multiply
+    // that bound by Q_DOCLEN and clamp to num_docs.
+    ws_.max_compact_docs = std::min(
+        (size_t)num_docs,
+        workspace_probe_unique_doc_bound_ * Q_DOCLEN);
+    ws_.doc_bitmap_bucket_count = doc_bitmap_num_buckets(num_docs);
+    ws_.doc_bitmap_offset_count =
+        doc_bitmap_num_offsets(ws_.doc_bitmap_bucket_count);
+    const size_t doc_buf_rows = std::max<size_t>(ws_.max_compact_docs, 1);
+
+    std::cout << "max cluster size: " << max_cluster_size << std::endl;
     std::cout << "workspace_probe_cluster_bound: "
-              << workspace_probe_cluster_bound_ << "\n";
+              << workspace_probe_cluster_bound_ << std::endl;
     std::cout << "workspace_probe_token_bound_per_query: "
-              << workspace_probe_token_bound_ << "\n";
-    std::cout << "workspace_stage1_doc_bound: "
-              << ws_.max_stage1_touched_docs << "\n";
+              << workspace_probe_token_bound_ << std::endl;
+    std::cout << "workspace_probe_unique_doc_bound_per_query: "
+              << workspace_probe_unique_doc_bound_ << std::endl;
+    std::cout << "max_compact_docs: " << ws_.max_compact_docs
+              << "  (num_docs=" << num_docs << ")" << std::endl;
     std::cout << "workspace_stage2_candidate_token_bound: "
-              << ws_.max_stage2_tokens << "\n";
+              << ws_.max_stage2_tokens << std::endl;
     std::cout << "workspace_stage2_topk_token_bound: "
-              << ws_.max_stage2_k_tokens << "\n";
+              << ws_.max_stage2_k_tokens << std::endl;
+    std::cout << "bitmap buckets: " << ws_.doc_bitmap_bucket_count
+              << " bitmap offsets: " << ws_.doc_bitmap_offset_count
+              << std::endl;
+#else
+    const size_t doc_buf_rows = std::max<size_t>(ws_.max_stage1_touched_docs, 1);
+    std::cout << "max cluster size: " << max_cluster_size << std::endl;
+    std::cout << "workspace_probe_cluster_bound: "
+              << workspace_probe_cluster_bound_ << std::endl;
+    std::cout << "workspace_probe_token_bound_per_query: "
+              << workspace_probe_token_bound_ << std::endl;
+    std::cout << "workspace_stage1_doc_bound: "
+              << ws_.max_stage1_touched_docs << std::endl;
+    std::cout << "workspace_stage2_candidate_token_bound: "
+              << ws_.max_stage2_tokens << std::endl;
+    std::cout << "workspace_stage2_topk_token_bound: "
+              << ws_.max_stage2_k_tokens << std::endl;
+#endif
 
 #ifdef GPU_MVR_USE_LUT
     const size_t stage1_emb_ids_bytes = 0;
@@ -399,11 +603,16 @@ void gpu_mvr_index::allocate_workspace() {
                             doc_buf_rows * sizeof(int) +  // d_sorted_doc_ids
                             doc_buf_rows * sizeof(int) +  // d_unique_doc_ids
                             doc_buf_rows * sizeof(float) +  // d_stage1_doc_scores
-                            ws_.estimated_num_docs * Q_DOCLEN * sizeof(float) +  // d_doc_query_max
+                            doc_buf_rows * Q_DOCLEN * sizeof(float) +  // d_doc_query_max
                             sizeof(int) +  // d_num_unique_docs
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+                            ws_.doc_bitmap_bucket_count * sizeof(doc_bitmap_bucket_t) +
+                            ws_.doc_bitmap_offset_count * sizeof(doc_bitmap_offset_t);
+#else
                             ws_.estimated_num_docs * sizeof(int);  // d_doc_touched
+#endif
     std::cout << "Estimated GPU memory required for workspace: "
-              << (estimated_size / (1024.0 * 1024.0)) << " MB\n";
+              << (estimated_size / (1024.0 * 1024.0)) << " MB" << std::endl;
 
     CUDA_CHECK(cudaMalloc(&ws_.d_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws_.d_cb1_sumq, Q_DOCLEN * sizeof(float)));
@@ -418,9 +627,16 @@ void gpu_mvr_index::allocate_workspace() {
     CUDA_CHECK(cudaMalloc(&ws_.d_sorted_doc_ids, doc_buf_rows * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws_.d_unique_doc_ids, doc_buf_rows * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws_.d_stage1_doc_scores, doc_buf_rows * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, ws_.estimated_num_docs * Q_DOCLEN * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, doc_buf_rows * Q_DOCLEN * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws_.d_num_unique_docs, sizeof(int)));
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    CUDA_CHECK(cudaMalloc(&ws_.d_doc_bitmap,
+                          ws_.doc_bitmap_bucket_count * sizeof(doc_bitmap_bucket_t)));
+    CUDA_CHECK(cudaMalloc(&ws_.d_doc_bitmap_offsets,
+                          ws_.doc_bitmap_offset_count * sizeof(doc_bitmap_offset_t)));
+#else
     CUDA_CHECK(cudaMalloc(&ws_.d_doc_touched, ws_.estimated_num_docs * sizeof(int)));
+#endif
 
     size_t free_mem, total_mem;
     // CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
@@ -475,6 +691,17 @@ void gpu_mvr_index::allocate_workspace() {
         ws_.cub_temp_storage_bytes = std::max(ws_.cub_temp_storage_bytes, temp_bytes);
     }
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    temp_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(
+        nullptr,
+        temp_bytes,
+        ws_.d_doc_bitmap_offsets,
+        ws_.d_doc_bitmap_offsets,
+        ws_.doc_bitmap_offset_count);
+    ws_.cub_temp_storage_bytes = std::max(ws_.cub_temp_storage_bytes, temp_bytes);
+#endif
+
     CUDA_CHECK(cudaMalloc(&ws_.d_cub_temp_storage, ws_.cub_temp_storage_bytes));
 
     // CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
@@ -516,8 +743,8 @@ void gpu_mvr_index::allocate_workspace() {
 #ifdef GPU_MVR_OVERLAP_STAGE23
     CUDA_CHECK(cudaMalloc(&ws_.d_pst_candidate_offsets,
                           (ws_.max_stage2_candidates + 1) * sizeof(size_t)));
-    CUDA_CHECK(cudaMalloc(&ws_.d_pst_clustered_pos,
-                          ws_.max_stage2_tokens * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&ws_.d_pst_token_ids,
+                          ws_.max_stage2_tokens * sizeof(size_t)));
 
     CUDA_CHECK(cudaMalloc(&ws_.d_token_dists,
                           ws_.max_stage2_tokens * (size_t)Q_DOCLEN * sizeof(float)));
@@ -539,23 +766,29 @@ void gpu_mvr_index::allocate_workspace() {
     CUDA_CHECK(cudaEventCreate(&ws_.phase_a_d2h_done_event));
 
     CUDA_CHECK(cudaEventCreateWithFlags(&ws_.pst_compute_done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ws_.pst_extract_done, cudaEventDisableTiming));
     for (int i = 0; i < Workspace::PST_NUM_D2H_CHUNKS; i++)
         CUDA_CHECK(cudaEventCreateWithFlags(&ws_.pst_d2h_chunk_done[i], cudaEventDisableTiming));
 #endif
 
     ws_.max_embs_per_query_bound = static_cast<int>(workspace_probe_token_bound_);
-    CUDA_CHECK(cudaMemset(
-        ws_.d_doc_query_max, 0,
-        ws_.estimated_num_docs * Q_DOCLEN * sizeof(float)));
+    CUDA_CHECK(cudaMemset(ws_.d_doc_query_max, 0, doc_buf_rows * Q_DOCLEN * sizeof(float)));
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    CUDA_CHECK(cudaMemset(ws_.d_doc_bitmap, 0,
+                          ws_.doc_bitmap_bucket_count * sizeof(doc_bitmap_bucket_t)));
+    CUDA_CHECK(cudaMemset(ws_.d_doc_bitmap_offsets, 0,
+                          ws_.doc_bitmap_offset_count * sizeof(doc_bitmap_offset_t)));
+#else
     CUDA_CHECK(cudaMemset(ws_.d_doc_touched, 0, ws_.estimated_num_docs * sizeof(int)));
+#endif
     CUDA_CHECK(cudaMemset(ws_.d_num_unique_docs, 0, sizeof(int)));
 
     int least_prio, greatest_prio;
     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_prio, &greatest_prio));
-    (void)greatest_prio;
     CUDA_CHECK(cudaStreamCreateWithPriority(&ws_.stream_compute, cudaStreamDefault, least_prio));
     CUDA_CHECK(cudaStreamCreate(&ws_.stream_h2d));
     CUDA_CHECK(cudaStreamCreate(&ws_.stream_d2h));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&ws_.stream_extract, cudaStreamDefault, greatest_prio));
     CUDA_CHECK(cudaEventCreate(&ws_.event_h2d_done));
 
 #ifdef GPU_MVR_PROFILE
@@ -595,6 +828,8 @@ void gpu_mvr_index::allocate_workspace() {
     CUDA_CHECK(cudaEventCreate(&ws_.s2_docscore_end));
     CUDA_CHECK(cudaEventCreate(&ws_.s2_d2h_start));
     CUDA_CHECK(cudaEventCreate(&ws_.s2_d2h_end));
+    CUDA_CHECK(cudaEventCreate(&ws_.s2_extract_start));
+    CUDA_CHECK(cudaEventCreate(&ws_.s2_extract_end));
 
     CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_kernel_start));
     CUDA_CHECK(cudaEventCreate(&ws_.s23_pst_kernel_end));
@@ -607,6 +842,8 @@ void gpu_mvr_index::allocate_workspace() {
 #endif
     ws_.running_indices.resize(ws_.max_stage2_candidates);
     ws_.h_sel_indices.resize(ws_.max_stage2_k);
+    ws_.h_out_offsets.resize(ws_.max_stage2_k + 1);
+    ws_.ip_ex_buf.resize(ws_.max_stage2_k * (size_t)max_doc_len * Q_DOCLEN);
     ws_.refined_scores.resize(ws_.max_stage2_k);
     ws_.seen_doc_map.resize(num_docs, false);
 }
@@ -867,14 +1104,27 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     int& actual_k_out,
     cudaStream_t stream
 ) {
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    size_t doc_matrix_size = ws_.max_compact_docs * Q_DOCLEN;
+#else
     size_t doc_matrix_size = ws_.estimated_num_docs * Q_DOCLEN;
+#endif
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.s1_memset_start, ws_.stream_d2h));
     }
 #endif
     CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_query_max, 0, doc_matrix_size * sizeof(float), ws_.stream_d2h));
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_bitmap, 0,
+                               ws_.doc_bitmap_bucket_count * sizeof(doc_bitmap_bucket_t),
+                               ws_.stream_d2h));
+    CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_bitmap_offsets, 0,
+                               ws_.doc_bitmap_offset_count * sizeof(doc_bitmap_offset_t),
+                               ws_.stream_d2h));
+#else
     CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_touched, 0, ws_.estimated_num_docs * sizeof(int), ws_.stream_d2h));
+#endif
     CUDA_CHECK(cudaMemsetAsync(ws_.d_num_unique_docs, 0, sizeof(int), ws_.stream_d2h));
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -889,14 +1139,9 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     }
 #endif
 
-    ivf->search_batch_gpu(
-        ws_.d_queries,
-        Q_DOCLEN,
-        nprobe,
-        ws_.d_cagra_dists,
-        ws_.d_cagra_labels,
-        stream,
-        static_cast<size_t>(itopk_size));
+    ivf->search_batch_gpu(ws_.d_queries, Q_DOCLEN, nprobe,
+                          ws_.d_cagra_dists, ws_.d_cagra_labels, stream,
+                          static_cast<size_t>(itopk_size));
 
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -973,10 +1218,8 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
 
     int threads_per_block = 256;
 
-    // The fused stage1 kernel writes directly into d_doc_query_max /
-    // d_doc_touched / d_num_unique_docs, so the memset on stream_d2h must
-    // complete before we launch it. The memset runs concurrently
-    // with CAGRA search, so waiting here is free on the critical path.
+    // The bitmap/doc-query buffers are cleared on stream_d2h while CAGRA
+    // runs, so waiting here is free on the critical path.
     CUDA_CHECK(cudaStreamWaitEvent(stream, ws_.event_h2d_done));
 
 #ifdef GPU_MVR_PROFILE
@@ -984,7 +1227,111 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_start, stream));
     }
 #endif
+    int h_num_touched = 0;
 #ifdef GPU_MVR_USE_LUT
+#if defined(GPU_MVR_CLUSTERED_LAYOUT_DISABLED)
+    {
+        int blocks_x = std::max(
+            (max_cluster_size + threads_per_block - 1) / threads_per_block,
+            16);
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_lut_nonclustered_flag_docs_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_cagra_labels, d_cluster_pos_,
+            d_doc_ids_,
+            d_inv_list_,
+            ws_.d_doc_bitmap,
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        bitmap_offset_init_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets);
+        CUDA_CHECK(cudaGetLastError());
+
+        size_t scan_temp = ws_.cub_temp_storage_bytes;
+        cub::DeviceScan::ExclusiveSum(
+            ws_.d_cub_temp_storage,
+            scan_temp,
+            ws_.d_doc_bitmap_offsets,
+            ws_.d_doc_bitmap_offsets,
+            ws_.doc_bitmap_offset_count,
+            stream);
+
+        doc_bitmap_offset_t h_num_touched_u32 = 0;
+        CUDA_CHECK(cudaMemcpyAsync(
+            &h_num_touched_u32,
+            ws_.d_doc_bitmap_offsets + ws_.doc_bitmap_offset_count - 1,
+            sizeof(doc_bitmap_offset_t),
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        h_num_touched = static_cast<int>(h_num_touched_u32);
+        if (h_num_touched == 0) {
+            actual_k_out = 0;
+            return;
+        }
+        if ((size_t)h_num_touched > ws_.max_compact_docs) {
+            std::cerr << "ERROR: h_num_touched (" << h_num_touched
+                      << ") exceeds max_compact_docs (" << ws_.max_compact_docs
+                      << "). Increase bitmap compact workspace headroom.\n";
+            actual_k_out = 0;
+            return;
+        }
+
+        bitmap_unique_docs_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets,
+                ws_.d_unique_doc_ids);
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
+        }
+
+        stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+            ws_.d_cagra_labels, d_cluster_pos_,
+            d_doc_ids_,
+            d_inv_list_,
+            ws_.d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+            ws_.d_doc_bitmap,
+            ws_.d_doc_bitmap_offsets,
+            static_cast<int>(ws_.max_compact_docs),
+#else
+            ws_.d_doc_touched,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+#endif
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
+        }
+
+        actual_k_out = std::min((int)k, h_num_touched);
+    }
+#else
     if (use_clustered_) {
         // Clustered layout: flat iteration across all probed clusters with
         // coalesced memory access. Ensure enough blocks for good SM occupancy.
@@ -993,70 +1340,213 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             16);
         dim3 grid(blocks_x, Q_DOCLEN);
 
+        stage1_binary_ip_lut_flag_docs_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_cagra_labels, d_cluster_pos_,
+            d_clustered_doc_ids_,
+            ws_.d_doc_bitmap,
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        bitmap_offset_init_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets);
+        CUDA_CHECK(cudaGetLastError());
+
+        size_t scan_temp = ws_.cub_temp_storage_bytes;
+        cub::DeviceScan::ExclusiveSum(
+            ws_.d_cub_temp_storage,
+            scan_temp,
+            ws_.d_doc_bitmap_offsets,
+            ws_.d_doc_bitmap_offsets,
+            ws_.doc_bitmap_offset_count,
+            stream);
+
+        doc_bitmap_offset_t h_num_touched_u32 = 0;
+        CUDA_CHECK(cudaMemcpyAsync(
+            &h_num_touched_u32,
+            ws_.d_doc_bitmap_offsets + ws_.doc_bitmap_offset_count - 1,
+            sizeof(doc_bitmap_offset_t),
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        h_num_touched = static_cast<int>(h_num_touched_u32);
+        if (h_num_touched == 0) {
+            actual_k_out = 0;
+            return;
+        }
+        if ((size_t)h_num_touched > ws_.max_compact_docs) {
+            std::cerr << "ERROR: h_num_touched (" << h_num_touched
+                      << ") exceeds max_compact_docs (" << ws_.max_compact_docs
+                      << "). Increase bitmap compact workspace headroom.\n";
+            actual_k_out = 0;
+            return;
+        }
+
+        bitmap_unique_docs_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets,
+                ws_.d_unique_doc_ids);
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
+        }
+
         stage1_binary_ip_lut_kernel<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_lut, d_clustered_code_, d_clustered_factor_, ws_.d_cb1_sumq,
             ws_.d_cagra_labels, d_cluster_pos_,
             d_clustered_doc_ids_,
             ws_.d_doc_query_max,
-            ws_.d_doc_touched,
-            ws_.d_unique_doc_ids,
-            ws_.d_num_unique_docs,
+            ws_.d_doc_bitmap,
+            ws_.d_doc_bitmap_offsets,
+            static_cast<int>(ws_.max_compact_docs),
             num_docs,
             nprobe,
             ivf->n_clusters
         );
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
+        }
+
+        actual_k_out = std::min((int)k, h_num_touched);
     } else {
-        throw std::runtime_error("v3 requires clustered cluster_1bit.bin layout");
+        // Non-clustered fallback: explicit cluster iteration with inv_list
+        // indirection, smem tiling, and __ldg() for scattered reads.
+        int blocks_x = std::max(
+            (max_cluster_size + threads_per_block - 1) / threads_per_block,
+            16);
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_lut_nonclustered_flag_docs_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_cagra_labels, d_cluster_pos_,
+            d_doc_ids_,
+            d_inv_list_,
+            ws_.d_doc_bitmap,
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        bitmap_offset_init_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets);
+        CUDA_CHECK(cudaGetLastError());
+
+        size_t scan_temp = ws_.cub_temp_storage_bytes;
+        cub::DeviceScan::ExclusiveSum(
+            ws_.d_cub_temp_storage,
+            scan_temp,
+            ws_.d_doc_bitmap_offsets,
+            ws_.d_doc_bitmap_offsets,
+            ws_.doc_bitmap_offset_count,
+            stream);
+
+        doc_bitmap_offset_t h_num_touched_u32 = 0;
+        CUDA_CHECK(cudaMemcpyAsync(
+            &h_num_touched_u32,
+            ws_.d_doc_bitmap_offsets + ws_.doc_bitmap_offset_count - 1,
+            sizeof(doc_bitmap_offset_t),
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        h_num_touched = static_cast<int>(h_num_touched_u32);
+        if (h_num_touched == 0) {
+            actual_k_out = 0;
+            return;
+        }
+        if ((size_t)h_num_touched > ws_.max_compact_docs) {
+            std::cerr << "ERROR: h_num_touched (" << h_num_touched
+                      << ") exceeds max_compact_docs (" << ws_.max_compact_docs
+                      << "). Increase bitmap compact workspace headroom.\n";
+            actual_k_out = 0;
+            return;
+        }
+
+        bitmap_unique_docs_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets,
+                ws_.d_unique_doc_ids);
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
+        }
+
+        stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+            ws_.d_cagra_labels, d_cluster_pos_,
+            d_doc_ids_,
+            d_inv_list_,
+            ws_.d_doc_query_max,
+            ws_.d_doc_bitmap,
+            ws_.d_doc_bitmap_offsets,
+            static_cast<int>(ws_.max_compact_docs),
+            num_docs,
+            nprobe,
+            ivf->n_clusters
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
+        }
+
+        actual_k_out = std::min((int)k, h_num_touched);
     }
+#endif
 #else
-    throw std::runtime_error("v3 requires GPU_MVR_USE_LUT");
+#error "gpu_search_v6 requires GPU_MVR_USE_LUT"
+    {
+        int max_embs_per_query = ws_.max_embs_per_query_bound;
+        int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+            ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
+            max_embs_per_query
+        );
+    }
 #endif
     CUDA_CHECK(cudaGetLastError());
-#ifdef GPU_MVR_PROFILE
-    if constexpr (kProfile) {
-        CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
-    }
-#endif
-
-#ifdef GPU_MVR_PROFILE
-    if constexpr (kProfile) {
-        CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
-    }
-#endif
-#ifndef GPU_MVR_USE_LUT
-    throw std::runtime_error("v3 requires GPU_MVR_USE_LUT");
-#endif
-#ifdef GPU_MVR_PROFILE
-    if constexpr (kProfile) {
-        CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
-    }
-#endif
-
-    int h_num_touched = 0;
-    if constexpr (kProfile) {
-        XFER_RECORD_BEGIN(stream);
-    }
-    CUDA_CHECK(cudaMemcpyAsync(&h_num_touched, ws_.d_num_unique_docs,
-                               sizeof(int), cudaMemcpyDeviceToHost, stream));
-    if constexpr (kProfile) {
-        XFER_RECORD_END(stream, sizeof(int), false);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    if (h_num_touched == 0) {
-        actual_k_out = 0;
-        return;
-    }
-    if (static_cast<size_t>(h_num_touched) > ws_.max_stage1_touched_docs) {
-        throw std::runtime_error(
-            "Stage1 touched-doc count " + std::to_string(h_num_touched) +
-            " exceeded workspace bound " +
-            std::to_string(ws_.max_stage1_touched_docs));
-    }
-    actual_k_out = std::min((int)k, h_num_touched);
 
     const int thread_count = SUM_SCORES_WARPS_PER_BLOCK * 32; // 256
-    int sparse_blocks = (h_num_touched + SUM_SCORES_WARPS_PER_BLOCK - 1) / SUM_SCORES_WARPS_PER_BLOCK;
+    if (h_num_touched == 0) {
+        return;
+    }
+    int sparse_blocks =
+        (h_num_touched + SUM_SCORES_WARPS_PER_BLOCK - 1) /
+        SUM_SCORES_WARPS_PER_BLOCK;
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.s1_sum_scores_start, stream));
@@ -1067,18 +1557,17 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         ws_.d_unique_doc_ids,
         ws_.d_stage1_doc_scores,
         ws_.d_topk_doc_ids,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+        h_num_touched
+#else
         h_num_touched,
         num_docs
+#endif
     );
     CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.s1_sum_scores_end, stream));
-    }
-#endif
-
-#ifdef GPU_MVR_PROFILE
-    if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.s1_topk_sort_start, stream));
     }
 #endif
@@ -1092,11 +1581,6 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.s1_topk_sort_end, stream));
-    }
-#endif
-
-#ifdef GPU_MVR_PROFILE
-    if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.s1_d2d_start, stream));
     }
 #endif
@@ -1156,12 +1640,12 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, tl_base, e)); return (int)(ms * 1000.0f);
     };
 
-    std::vector<cudaEvent_t> tl_c_wait_ev(overlap_chunks), tl_c_scores_s(overlap_chunks);
-    std::vector<cudaEvent_t> tl_c_scores_e(overlap_chunks);
-    std::vector<cudaEvent_t> tl_c_extract_s(overlap_chunks), tl_c_extract_m(overlap_chunks), tl_c_extract_e(overlap_chunks);
-    std::vector<bool> tl_c_has_extract(overlap_chunks, false);
-    std::vector<bool> tl_c_has_scores(overlap_chunks, false);
-    for (int c = 0; c < overlap_chunks; c++) {
+    cudaEvent_t tl_c_wait_ev[N_OVERLAP_CHUNKS], tl_c_scores_s[N_OVERLAP_CHUNKS];
+    cudaEvent_t tl_c_scores_e[N_OVERLAP_CHUNKS];
+    cudaEvent_t tl_c_extract_s[N_OVERLAP_CHUNKS], tl_c_extract_m[N_OVERLAP_CHUNKS], tl_c_extract_e[N_OVERLAP_CHUNKS];
+    bool tl_c_has_extract[N_OVERLAP_CHUNKS] = {};
+    bool tl_c_has_scores[N_OVERLAP_CHUNKS] = {};
+    for (int c = 0; c < N_OVERLAP_CHUNKS; c++) {
         CUDA_CHECK(cudaEventCreate(&tl_c_wait_ev[c]));
         CUDA_CHECK(cudaEventCreate(&tl_c_scores_s[c]));
         CUDA_CHECK(cudaEventCreate(&tl_c_scores_e[c]));
@@ -1214,12 +1698,11 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
     auto t_cpu2 = std::chrono::high_resolution_clock::now();
 
-    gather_clustered_positions_kernel<<<num_candidates, 256, 0, stream>>>(
+    gather_token_ids_kernel<<<num_candidates, 256, 0, stream>>>(
         ws_.d_topk_doc_ids,
         d_doc_ptrs_,
-        d_token_to_cluster_pos_,
         ws_.d_pst_candidate_offsets,
-        ws_.d_pst_clustered_pos,
+        ws_.d_pst_token_ids,
         num_candidates
     );
     CUDA_CHECK(cudaGetLastError());
@@ -1273,25 +1756,27 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     while (score_threads < Q_DOCLEN && score_threads < 256) score_threads *= 2;
     score_threads = std::min(score_threads, 256);
 
-    int actual_chunks = std::min(overlap_chunks, num_candidates);
+    int actual_chunks = std::min(std::min(overlap_chunks, N_OVERLAP_CHUNKS), num_candidates);
     int cand_chunk_size = (num_candidates + actual_chunks - 1) / actual_chunks;
 #ifdef GPU_MVR_TIMELINE
     tl_actual_chunks = actual_chunks;
 #endif
 
-    std::vector<cudaEvent_t> chunk_compute_done(actual_chunks);
-    std::vector<cudaEvent_t> chunk_d2h_done(actual_chunks);
+    cudaEvent_t chunk_compute_done[N_OVERLAP_CHUNKS];
+    cudaEvent_t chunk_d2h_done[N_OVERLAP_CHUNKS];
+    cudaEvent_t chunk_extract_done[N_OVERLAP_CHUNKS];
     for (int c = 0; c < actual_chunks; c++) {
         CUDA_CHECK(cudaEventCreateWithFlags(&chunk_compute_done[c], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&chunk_d2h_done[c], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&chunk_extract_done[c], cudaEventDisableTiming));
     }
 
 #ifdef GPU_MVR_PROFILE
-    std::vector<cudaEvent_t> chunk_bip_start(actual_chunks);
-    std::vector<cudaEvent_t> chunk_bip_end(actual_chunks);
-    std::vector<cudaEvent_t> chunk_docscore_start(actual_chunks);
-    std::vector<cudaEvent_t> chunk_docscore_end(actual_chunks);
-    std::vector<bool> chunk_has_bip(actual_chunks, false);
+    cudaEvent_t chunk_bip_start[N_OVERLAP_CHUNKS];
+    cudaEvent_t chunk_bip_end[N_OVERLAP_CHUNKS];
+    cudaEvent_t chunk_docscore_start[N_OVERLAP_CHUNKS];
+    cudaEvent_t chunk_docscore_end[N_OVERLAP_CHUNKS];
+    bool chunk_has_bip[N_OVERLAP_CHUNKS] = {};
     if constexpr (kProfile) {
         ws_.s23_pst_kernel_ms = 0;
         ws_.s23_pst_bip_ms = 0;
@@ -1326,15 +1811,19 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
             {
                 size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
                 stage2_binary_ip_lut_kernel<<<bip_blocks, 256, stage2_lut_smem, stream>>>(
-                    ws_.d_lut, d_clustered_code_, d_clustered_factor_,
-                    ws_.d_cb1_sumq,
-                    ws_.d_pst_clustered_pos + tok_start,
+                    ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                    ws_.d_pst_token_ids + tok_start,
                     ws_.d_token_dists + tok_start,
                     total_tokens, tok_count
                 );
             }
 #else
-            throw std::runtime_error("v3 requires GPU_MVR_USE_LUT");
+            stage2_binary_ip_kernel_v2<<<bip_blocks, 256, 0, stream>>>(
+                ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                ws_.d_pst_token_ids + tok_start,
+                ws_.d_token_dists + tok_start,
+                total_tokens, tok_count
+            );
 #endif
 #ifdef GPU_MVR_PROFILE
             if constexpr (kProfile) {
@@ -1394,11 +1883,13 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         CUDA_CHECK(cudaEventRecord(tl_c_scores_e[c], stream_d2h));
 #endif
         CUDA_CHECK(cudaEventRecord(chunk_d2h_done[c], stream_d2h));
+        CUDA_CHECK(cudaEventRecord(chunk_extract_done[c], stream_d2h));
     };
 
     for (int c = 0; c < actual_chunks; c++) {
         launch_chunk_compute(c);
     }
+    CUDA_CHECK(cudaEventRecord(ws_.pst_extract_done, stream));
     auto t_end_phase_b = std::chrono::high_resolution_clock::now();
     float time_phase_b = std::chrono::duration<float, std::milli>(t_end_phase_b - t_start_phase_b).count();
 
@@ -1407,8 +1898,9 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     double time_wait_d2h = 0;
     double time_running_topk = 0;
     double time_identify_new = 0;
-    double time_prepare_refine = 0;
+    double time_gpu_extract = 0;
     double time_cpu_ip_ex = 0;
+    double time_wait_extract = 0;
     double time_combine = 0;
 
     std::priority_queue<std::pair<float, size_t>> cpu_heap;
@@ -1420,6 +1912,8 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
     auto& running_indices = ws_.running_indices;
     auto& h_sel_indices   = ws_.h_sel_indices;
+    auto& h_out_offsets   = ws_.h_out_offsets;
+    auto& ip_ex_buf       = ws_.ip_ex_buf;
     auto& refined_scores  = ws_.refined_scores;
 
     #pragma omp parallel for schedule(static)
@@ -1488,32 +1982,47 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         tl_cpu.push_back({tl_cpu_us(t2), tl_cpu_us(t3), "identify_c" + std::to_string(c), "async"});
 #endif
 
+        h_out_offsets[0] = 0;
         for (int i = 0; i < to_refine; i++) {
             h_sel_indices[i] = new_docs[i].second;
+            int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
+            h_out_offsets[i + 1] = h_out_offsets[i] +
+                (size_t)(doc_ptrs_[doc_id + 1] - doc_ptrs_[doc_id]);
         }
         auto t4 = std::chrono::high_resolution_clock::now();
-        time_prepare_refine += std::chrono::duration<double, std::milli>(t4 - t3).count();
+        time_gpu_extract += std::chrono::duration<double, std::milli>(t4 - t3).count();
 #ifdef GPU_MVR_TIMELINE
-        tl_cpu.push_back({tl_cpu_us(t3), tl_cpu_us(t4), "prepare_refine_c" + std::to_string(c), "async"});
+        tl_cpu.push_back({tl_cpu_us(t3), tl_cpu_us(t4), "launch_extract_c" + std::to_string(c), "async"});
 #endif
 
-        cpu_refine_scores(
-            h_candidate_doc_ids, h_sel_indices.data(),
-            to_refine, ws_.h_pinned_queries, queries,
-            refined_scores.data());
+        cpu_compute_ip_ex(
+            h_candidate_doc_ids, h_sel_indices.data(), h_out_offsets.data(),
+            to_refine, ws_.h_pinned_queries, ip_ex_buf.data());
         auto t5 = std::chrono::high_resolution_clock::now();
         time_cpu_ip_ex += std::chrono::duration<double, std::milli>(t5 - t4).count();
 #ifdef GPU_MVR_TIMELINE
         tl_cpu.push_back({tl_cpu_us(t4), tl_cpu_us(t5), "cpu_ip_ex_c" + std::to_string(c), "static"});
 #endif
 
+        CUDA_CHECK(cudaEventSynchronize(chunk_extract_done[c]));
+        auto t6 = std::chrono::high_resolution_clock::now();
+        time_wait_extract += std::chrono::duration<double, std::milli>(t6 - t5).count();
+#ifdef GPU_MVR_TIMELINE
+        tl_cpu.push_back({tl_cpu_us(t5), tl_cpu_us(t6), "wait_extract_c" + std::to_string(c), "async"});
+#endif
+
+        cpu_combine_scores(
+            h_candidate_doc_ids, h_sel_indices.data(), h_out_offsets.data(),
+            to_refine, queries, ip_ex_buf.data(),
+            refined_scores.data());
+
         for (int i = 0; i < to_refine; i++) {
             cpu_heap.emplace(refined_scores[i].first, (size_t)refined_scores[i].second);
         }
-        auto t6 = std::chrono::high_resolution_clock::now();
-        time_combine += std::chrono::duration<double, std::milli>(t6 - t5).count();
+        auto t7 = std::chrono::high_resolution_clock::now();
+        time_combine += std::chrono::duration<double, std::milli>(t7 - t6).count();
 #ifdef GPU_MVR_TIMELINE
-        tl_cpu.push_back({tl_cpu_us(t5), tl_cpu_us(t6), "combine_c" + std::to_string(c), "subflow"});
+        tl_cpu.push_back({tl_cpu_us(t6), tl_cpu_us(t7), "combine_c" + std::to_string(c), "subflow"});
 #endif
 
         total_refined += to_refine;
@@ -1553,16 +2062,18 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     for (int c = 0; c < actual_chunks; c++) {
         CUDA_CHECK(cudaEventDestroy(chunk_compute_done[c]));
         CUDA_CHECK(cudaEventDestroy(chunk_d2h_done[c]));
+        CUDA_CHECK(cudaEventDestroy(chunk_extract_done[c]));
     }
 
 #ifdef GPU_MVR_TIMELINE
     {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaStreamSynchronize(stream_d2h));
+        CUDA_CHECK(cudaStreamSynchronize(ws_.stream_extract));
 
         tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_start_event), tl_gpu_us(ws_.phase_a_gather_done_event), "gather_doc_lengths", "async"});
         tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_gather_done_event), tl_gpu_us(ws_.phase_a_prefix_done_event), "prefix_sum", "async"});
-        tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_prefix_done_event), tl_gpu_us(ws_.phase_a_token_ids_done_event), "gather_clustered_pos", "async"});
+        tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_prefix_done_event), tl_gpu_us(ws_.phase_a_token_ids_done_event), "gather_token_ids", "async"});
         tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_token_ids_done_event), tl_gpu_us(ws_.phase_a_d2h_done_event), "d2h_metadata", "async"});
 
 #ifdef GPU_MVR_PROFILE
@@ -1591,7 +2102,7 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
         tl_cpu.push_back({tl_cpu_us(t_cpu0), tl_cpu_us(t_cpu1), "launch_gather", "async"});
         tl_cpu.push_back({tl_cpu_us(t_cpu1), tl_cpu_us(t_cpu2), "launch_prefix", "async"});
-        tl_cpu.push_back({tl_cpu_us(t_cpu2), tl_cpu_us(t_cpu3), "launch_clustered_pos", "async"});
+        tl_cpu.push_back({tl_cpu_us(t_cpu2), tl_cpu_us(t_cpu3), "launch_token_ids", "async"});
         tl_cpu.push_back({tl_cpu_us(t_cpu3), tl_cpu_us(t_cpu4), "launch_d2h", "async"});
         tl_cpu.push_back({tl_cpu_us(t_cpu4), tl_cpu_us(t_cpu5), "sync_stream", "async"});
         tl_cpu.push_back({tl_cpu_us(t_cpu5), tl_cpu_us(t_cpu6), "event_elapsed", "async"});
@@ -1634,7 +2145,7 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         std::cout << "[TIMELINE] Wrote timeline.json\n";
 
         CUDA_CHECK(cudaEventDestroy(tl_base));
-        for (int c = 0; c < overlap_chunks; c++) {
+        for (int c = 0; c < N_OVERLAP_CHUNKS; c++) {
             CUDA_CHECK(cudaEventDestroy(tl_c_wait_ev[c]));
             CUDA_CHECK(cudaEventDestroy(tl_c_scores_s[c]));
             CUDA_CHECK(cudaEventDestroy(tl_c_scores_e[c]));
@@ -1650,7 +2161,7 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         std::cout << "[PROFILE] Phase A (Data Preparation) wall: " << time_phase_a << " ms, GPU total: " << time_phase_a_gpu << " ms\n";
         std::cout << "[PROFILE]   1. Gather doc lengths      : " << time_phase_a_gather << " ms (CPU launch: " << cpu_ms(t_cpu0, t_cpu1) << " ms)\n";
         std::cout << "[PROFILE]   2. Prefix sum offsets      : " << time_phase_a_prefix << " ms (CPU launch: " << cpu_ms(t_cpu1, t_cpu2) << " ms)\n";
-        std::cout << "[PROFILE]   3. Gather clustered pos    : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
+        std::cout << "[PROFILE]   3. Gather token IDs        : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
         std::cout << "[PROFILE]   4. D2H metadata + sync     : " << time_phase_a_d2h << " ms (CPU launch: " << cpu_ms(t_cpu3, t_cpu4) << " ms)\n";
         std::cout << "[PROFILE]   5. cudaStreamSynchronize   : " << cpu_ms(t_cpu4, t_cpu5) << " ms\n";
         std::cout << "[PROFILE]   6. cudaEventElapsedTime x5 : " << cpu_ms(t_cpu5, t_cpu6) << " ms\n";
@@ -1659,10 +2170,10 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
                   << " ms\n";
         std::cout << "[PROFILE] Phase B wall time: " << time_phase_b << " ms\n";
         printf("[PROFILE] Phase C: wait_d2h=%.3f ms, topk=%.3f ms, identify=%.3f ms, "
-            "prepare=%.3f ms, cpu_refine=%.3f ms, "
+            "gpu_extract=%.3f ms, cpu_ip_ex=%.3f ms, wait_extract=%.3f ms, "
             "combine=%.3f ms (total=%.3f ms, %d docs)\n",
             time_wait_d2h, time_running_topk, time_identify_new,
-            time_prepare_refine, time_cpu_ip_ex,
+            time_gpu_extract, time_cpu_ip_ex, time_wait_extract,
             time_combine, time_phase_c, total_refined);
         std::cout << "[PROFILE] Total wall time for Phase A + B + C: " << total_wall_time << " ms\n";
         for (int c = 0; c < actual_chunks; c++) {
@@ -1677,15 +2188,45 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
 // ======================== STAGE 3: CPU ========================
 
-void gpu_mvr_index::cpu_refine_scores(
+void gpu_mvr_index::cpu_compute_ip_ex(
     const int* h_candidate_doc_ids,
     const int* h_sel_indices,
+    const size_t* h_out_offsets,
     int to_refine,
     const float* queries_flat,
-    const query_object* queries,
-    std::pair<float, int>* refined_scores
+    float* ip_ex_buf
 ) {
     const size_t full_code_stride = PADDED_DIM * (1 + ex_bits) / 8;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < to_refine; i++) {
+        int doc_id = h_candidate_doc_ids[h_sel_indices[i]];
+        size_t doc_start = doc_ptrs_[doc_id];
+        size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
+        alignas(64) float decoded[PADDED_DIM];
+        for (size_t t = 0; t < n_tok; t++) {
+            size_t tid = doc_start + t;
+            unpack_func_(
+                reinterpret_cast<const uint8_t*>(&full_code_[tid * full_code_stride]),
+                decoded, PADDED_DIM);
+            if (t + 1 < n_tok)
+                __builtin_prefetch(&full_code_[(tid + 1) * full_code_stride], 0, 3);
+            rabitqlib::gemv_batch8_avx512(
+                queries_flat, decoded,
+                &ip_ex_buf[(h_out_offsets[i] + t) * Q_DOCLEN],
+                Q_DOCLEN, PADDED_DIM);
+        }
+    }
+}
+
+void gpu_mvr_index::cpu_combine_scores(
+    const int* h_candidate_doc_ids,
+    const int* h_sel_indices,
+    const size_t* h_out_offsets,
+    int to_refine,
+    const query_object* queries,
+    const float* ip_full_buf,
+    std::pair<float, int>* refined_scores
+) {
     alignas(64) float cbex_sumq_arr[Q_DOCLEN];
     for (size_t j = 0; j < Q_DOCLEN; j++)
         cbex_sumq_arr[j] = queries[j].cbex_sumq;
@@ -1696,8 +2237,6 @@ void gpu_mvr_index::cpu_refine_scores(
         size_t doc_start = doc_ptrs_[doc_id];
         size_t n_tok = doc_ptrs_[doc_id + 1] - doc_start;
 
-        alignas(64) float decoded[PADDED_DIM];
-        alignas(64) float full_ip[Q_DOCLEN];
         alignas(64) float max_ts[Q_DOCLEN];
         __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
         for (size_t j = 0; j < Q_DOCLEN; j += 16)
@@ -1705,26 +2244,16 @@ void gpu_mvr_index::cpu_refine_scores(
 
         for (size_t t = 0; t < n_tok; t++) {
             size_t tid = doc_start + t;
-            unpack_func_(
-                reinterpret_cast<const uint8_t*>(&full_code_[tid * full_code_stride]),
-                decoded, PADDED_DIM);
-            if (t + 1 < n_tok) {
-                __builtin_prefetch(&full_code_[(tid + 1) * full_code_stride], 0, 3);
-                __builtin_prefetch(&ex_factor_[tid + 1], 0, 1);
-            }
-            rabitqlib::gemv_batch8_avx512(
-                queries_flat, decoded,
-                full_ip,
-                Q_DOCLEN, PADDED_DIM);
-
             float tok_exf = ex_factor_[tid];
             __m512 v_tok_exf = _mm512_set1_ps(tok_exf);
 
+            const float* full_base = &ip_full_buf[(h_out_offsets[i] + t) * Q_DOCLEN];
+
             for (size_t j = 0; j < Q_DOCLEN; j += 16) {
-                __m512 full_ip_v = _mm512_load_ps(&full_ip[j]);
+                __m512 full_ip = _mm512_loadu_ps(&full_base[j]);
                 __m512 cbex    = _mm512_load_ps(&cbex_sumq_arr[j]);
                 __m512 combined = _mm512_mul_ps(
-                    _mm512_sub_ps(full_ip_v, cbex),
+                    _mm512_sub_ps(full_ip, cbex),
                     v_tok_exf);
                 _mm512_store_ps(&max_ts[j],
                     _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
@@ -1743,11 +2272,14 @@ void gpu_mvr_index::cpu_refine_scores(
 gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // PG_CAGRA stores a RAFT resource whose active stream is rebound to
-    // ws_.stream_compute during search. Release it before destroying streams.
+    // PG_CAGRA stores a RAFT resource whose active stream is rebound during search.
+    // Release it before tearing down streams and other CUDA resources.
     delete ivf;
     ivf = nullptr;
 
+    CUDA_CHECK(cudaFree(d_one_bit_code_));
+    CUDA_CHECK(cudaFree(d_one_bit_factor_));
+    CUDA_CHECK(cudaFree(d_doc_ids_));
     CUDA_CHECK(cudaFree(d_doc_ptrs_));
     // d_inv_list_ may be allocated in non-LUT path or as fallback in LUT path;
     // cudaFree(nullptr) is a safe no-op
@@ -1758,7 +2290,6 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaFree(d_clustered_code_));
     CUDA_CHECK(cudaFree(d_clustered_factor_));
     CUDA_CHECK(cudaFree(d_clustered_doc_ids_));
-    CUDA_CHECK(cudaFree(d_token_to_cluster_pos_));
 
     CUDA_CHECK(cudaFree(ws_.d_queries));
     CUDA_CHECK(cudaFree(ws_.d_cb1_sumq));
@@ -1784,7 +2315,12 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaFree(ws_.d_stage1_doc_scores));
     CUDA_CHECK(cudaFree(ws_.d_doc_query_max));
     CUDA_CHECK(cudaFree(ws_.d_num_unique_docs));
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    CUDA_CHECK(cudaFree(ws_.d_doc_bitmap));
+    CUDA_CHECK(cudaFree(ws_.d_doc_bitmap_offsets));
+#else
     CUDA_CHECK(cudaFree(ws_.d_doc_touched));
+#endif
     CUDA_CHECK(cudaFree(ws_.d_cub_temp_storage));
     CUDA_CHECK(cudaFree(ws_.d_topk_scores));
     CUDA_CHECK(cudaFree(ws_.d_topk_doc_ids));
@@ -1799,18 +2335,14 @@ gpu_mvr_index::~gpu_mvr_index() {
 #ifdef GPU_MVR_OVERLAP_STAGE23
     CUDA_CHECK(cudaFree(ws_.d_token_dists));
     CUDA_CHECK(cudaFree(ws_.d_pst_candidate_offsets));
-    CUDA_CHECK(cudaFree(ws_.d_pst_clustered_pos));
+    CUDA_CHECK(cudaFree(ws_.d_pst_token_ids));
     CUDA_CHECK(cudaFree(ws_.d_doc_scores));
     CUDA_CHECK(cudaFreeHost(ws_.h_mapped_doc_scores));
     CUDA_CHECK(cudaFreeHost(ws_.h_pinned_pst_candidate_offsets));
     CUDA_CHECK(cudaFreeHost(ws_.h_pinned_pst_candidate_doc_ids));
     CUDA_CHECK(cudaFreeHost(ws_.h_pinned_pst_total_tokens));
-    CUDA_CHECK(cudaEventDestroy(ws_.phase_a_start_event));
-    CUDA_CHECK(cudaEventDestroy(ws_.phase_a_gather_done_event));
-    CUDA_CHECK(cudaEventDestroy(ws_.phase_a_prefix_done_event));
-    CUDA_CHECK(cudaEventDestroy(ws_.phase_a_token_ids_done_event));
-    CUDA_CHECK(cudaEventDestroy(ws_.phase_a_d2h_done_event));
     CUDA_CHECK(cudaEventDestroy(ws_.pst_compute_done));
+    CUDA_CHECK(cudaEventDestroy(ws_.pst_extract_done));
     for (int i = 0; i < Workspace::PST_NUM_D2H_CHUNKS; i++)
         CUDA_CHECK(cudaEventDestroy(ws_.pst_d2h_chunk_done[i]));
 #endif
@@ -1818,6 +2350,7 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaStreamDestroy(ws_.stream_compute));
     CUDA_CHECK(cudaStreamDestroy(ws_.stream_h2d));
     CUDA_CHECK(cudaStreamDestroy(ws_.stream_d2h));
+    CUDA_CHECK(cudaStreamDestroy(ws_.stream_extract));
     CUDA_CHECK(cudaEventDestroy(ws_.event_h2d_done));
 
 #ifdef GPU_MVR_PROFILE
@@ -1857,6 +2390,8 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaEventDestroy(ws_.s2_docscore_end));
     CUDA_CHECK(cudaEventDestroy(ws_.s2_d2h_start));
     CUDA_CHECK(cudaEventDestroy(ws_.s2_d2h_end));
+    CUDA_CHECK(cudaEventDestroy(ws_.s2_extract_start));
+    CUDA_CHECK(cudaEventDestroy(ws_.s2_extract_end));
 
     CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_kernel_start));
     CUDA_CHECK(cudaEventDestroy(ws_.s23_pst_kernel_end));
@@ -1868,4 +2403,5 @@ gpu_mvr_index::~gpu_mvr_index() {
 #endif
 
     delete rotator_;
+    rotator_ = nullptr;
 }

@@ -87,6 +87,8 @@ struct gpu_mvr_index {
 
     int max_doc_len = 0;
     int max_cluster_size = 0;
+    size_t workspace_probe_cluster_bound_ = 0;
+    size_t workspace_probe_token_bound_ = 0;
 
     // CPU-side data
     Rotator<float>* rotator_ = nullptr;
@@ -175,6 +177,7 @@ struct gpu_mvr_index {
         size_t max_stage2_tokens;
         size_t max_stage2_k;
         size_t max_stage2_k_tokens;
+        size_t max_stage1_touched_docs;
         size_t estimated_num_docs;
         int    max_embs_per_query_bound;
 
@@ -264,6 +267,7 @@ struct gpu_mvr_index {
     ~gpu_mvr_index();
 
     void set_doc_mapping(const std::vector<int>& doc_lens);
+    void compute_workspace_probe_bounds();
     void allocate_workspace();
     size_t doc_len(size_t doc_id) const;
 

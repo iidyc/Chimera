@@ -97,9 +97,6 @@ struct gpu_mvr_index {
     std::vector<char> full_code_;
     std::vector<float> one_bit_factor_;
     std::vector<float> ex_factor_;
-#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
-    std::vector<int> doc_ids_;
-#endif
     std::vector<int> doc_ptrs_;
     float (*ip_func_)(const float*, const uint8_t*, size_t);
     void (*unpack_func_)(const uint8_t*, float*, size_t);
@@ -107,13 +104,7 @@ struct gpu_mvr_index {
     // GPU persistent data
     char*  d_one_bit_code_ = nullptr;
     float* d_one_bit_factor_ = nullptr;
-#ifndef GPU_MVR_DOCID_VIA_DOCPTRS
-    int*   d_doc_ids_ = nullptr;
-#endif
     int*   d_doc_ptrs_ = nullptr;
-#ifdef GPU_MVR_DOCID_VIA_DOCPTRS
-    int*   d_doc_block_lut_ = nullptr;
-#endif
     int*   d_inv_list_ = nullptr;
     size_t* d_cluster_pos_ = nullptr;
 
@@ -187,6 +178,7 @@ struct gpu_mvr_index {
         size_t max_stage2_tokens;
         size_t max_stage2_k;
         size_t max_stage2_k_tokens;
+        size_t max_stage1_touched_docs;
         size_t estimated_num_docs;
         int    max_embs_per_query_bound;
 

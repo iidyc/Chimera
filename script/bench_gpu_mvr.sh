@@ -26,7 +26,7 @@ Description:
 
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
-  --version <v0|v1|v2|v3|v4|v5|v6|v7>  GPU-MVR search version. Default: v3
+  --version <v0|v1|v2|v3|v4|v5|v6>  GPU-MVR search version. Default: v3
   --implementation-label <label>
                            Output folder label. Default: gpu_search_<version>
   --config-file <path>     Config CSV. Default: profiling/gpu_mvr_config.csv
@@ -425,10 +425,10 @@ if [[ $dataset_set -eq 0 ]]; then
 fi
 
 case "$version" in
-    v0|v1|v2|v3|v4|v5|v6|v7)
+    v0|v1|v2|v3|v4|v5|v6)
         ;;
     *)
-        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6, v7"
+        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6"
         ;;
 esac
 

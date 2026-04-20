@@ -11,6 +11,26 @@
 #define STAGE2_LUT_NUM_TILES (Q_DOCLEN / STAGE2_LUT_TILE_Q)
 #define STAGE2_LUT_SMEM_FLOATS (STAGE2_LUT_TILE_Q * LUT_ENTRIES_PER_QUERY)
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+using doc_bitmap_bucket_t = uint32_t;
+using doc_bitmap_offset_t = uint32_t;
+
+inline constexpr int kDocBitmapBucketWidth = 32;
+inline constexpr doc_bitmap_bucket_t kDocBitmapHighestBit = 0x80000000u;
+inline constexpr int kDocBitmapCompRatio = 8;
+
+inline constexpr size_t doc_bitmap_num_buckets(size_t num_docs) {
+    const size_t raw =
+        (num_docs + kDocBitmapBucketWidth - 1) / kDocBitmapBucketWidth;
+    return ((raw + kDocBitmapCompRatio - 1) / kDocBitmapCompRatio) *
+           kDocBitmapCompRatio;
+}
+
+inline constexpr size_t doc_bitmap_num_offsets(size_t num_buckets) {
+    return (num_buckets / kDocBitmapCompRatio) + 1;
+}
+#endif
+
 __global__ void stage1_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
@@ -38,7 +58,36 @@ __global__ void precompute_lut_kernel(
     float* __restrict__ d_lut
 );
 
+__global__ void stage1_binary_ip_lut_kernel(
+    const float*    __restrict__ d_lut,
+    const char*     __restrict__ d_clustered_code,
+    const float*    __restrict__ d_clustered_factor,
+    const float*    __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_clustered_doc_ids,
+    float*       d_doc_query_max,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int          max_touched_docs,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+);
+
+__global__ void stage1_binary_ip_lut_flag_docs_kernel(
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_clustered_doc_ids,
+    doc_bitmap_bucket_t* d_doc_bitmap,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+);
+
 // Non-clustered variant: uses inv_list indirection to access original arrays.
+// Optimized for scattered access with explicit cluster iteration, shared-memory
+// inv_list tiling, and __ldg() for read-only cache utilization.
 __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const float*    __restrict__ d_lut,
     const char*     __restrict__ d_code,
@@ -49,12 +98,36 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const int*      __restrict__ d_doc_ids,
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
-    int*         d_doc_touched,
-    int*         d_touched_doc_list,
-    int*         d_num_touched_docs,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int          max_touched_docs,
     size_t       num_docs,
     int          nprobe,
     size_t       n_clusters
+);
+
+__global__ void stage1_binary_ip_lut_nonclustered_flag_docs_kernel(
+    const uint32_t* __restrict__ d_cagra_labels,
+    const size_t*   __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_inv_list,
+    doc_bitmap_bucket_t* d_doc_bitmap,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+);
+
+__global__ void bitmap_offset_init_kernel(
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    size_t num_buckets,
+    doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets
+);
+
+__global__ void bitmap_unique_docs_kernel(
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    size_t num_buckets,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int* __restrict__ d_out_doc_ids
 );
 
 __global__ void stage2_binary_ip_lut_kernel(
@@ -121,7 +194,8 @@ __global__ void expand_cluster_ids_kernel(
     size_t*             d_emb_ids,
     int                 nprobe,
     size_t              n_clusters,
-    size_t              num_queries
+    size_t              num_queries,
+    bool                use_clustered_layout
 );
 
 __global__ void gather_doc_lengths_kernel(
@@ -137,9 +211,18 @@ __global__ void aggregate_stage1_tracked_kernel(
     const int*    __restrict__ d_pair_offsets,
     const int*    __restrict__ d_doc_ids,
     float*        d_doc_query_max,
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    int*          d_ht_keys,
+    int*          d_ht_vals,
+    int*          d_touched_doc_list,
+    int*          d_num_touched_docs,
+    int           max_touched_docs,
+    unsigned int  ht_mask,
+#else
     int*          d_doc_touched,
     int*          d_touched_doc_list,
     int*          d_num_touched_docs,
+#endif
     size_t        num_docs,
     size_t        total_pairs,
     size_t        max_embs_per_query
@@ -150,6 +233,8 @@ __global__ void sum_doc_scores_sparse_kernel(
     const int*   __restrict__ d_touched_doc_list,
     float*       d_scores_out,
     int*         d_doc_ids_out,
-    int          num_touched,
-    size_t       num_docs
+    int          num_touched
+#ifndef GPU_MVR_COMPACT_DOC_BUFFER
+    , size_t     num_docs
+#endif
 );

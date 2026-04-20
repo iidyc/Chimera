@@ -41,7 +41,7 @@
 #include "query.hpp"
 #include "ivf_pg.hpp"
 #include "gpu_config.cuh"
-#include "gpu_kernels_v4.cuh"
+#include "gpu_kernels_v6.cuh"
 
 using namespace rabitqlib;
 
@@ -89,6 +89,9 @@ struct gpu_mvr_index {
     int max_cluster_size = 0;
     size_t workspace_probe_cluster_bound_ = 0;
     size_t workspace_probe_token_bound_ = 0;
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    size_t workspace_probe_unique_doc_bound_ = 0;
+#endif
 
     // CPU-side data
     Rotator<float>* rotator_;
@@ -109,6 +112,14 @@ struct gpu_mvr_index {
     int*   d_doc_ptrs_ = nullptr;
     int*   d_inv_list_ = nullptr;
     size_t* d_cluster_pos_ = nullptr;
+
+    // Cluster-ordered copies: data reordered by inv_list so that vectors
+    // in the same cluster are contiguous in memory. Stage-1 reads these
+    // instead of the original arrays for coalesced global memory access.
+    char*  d_clustered_code_ = nullptr;
+    float* d_clustered_factor_ = nullptr;
+    int*   d_clustered_doc_ids_ = nullptr;
+    bool   use_clustered_ = true;  // false = fallback to non-clustered + inv_list indirection
 
     // Search parameters
     int nprobe = 128;
@@ -152,7 +163,15 @@ struct gpu_mvr_index {
         float*  d_stage1_doc_scores;
         float*  d_doc_query_max;
         int*    d_num_unique_docs;
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+        doc_bitmap_bucket_t* d_doc_bitmap;
+        doc_bitmap_offset_t* d_doc_bitmap_offsets;
+        size_t  doc_bitmap_bucket_count;
+        size_t  doc_bitmap_offset_count;
+        size_t  max_compact_docs;    // max unique docs (d_doc_query_max rows)
+#else
         int*    d_doc_touched;
+#endif
         void*   d_cub_temp_storage;
         size_t  cub_temp_storage_bytes;
 
@@ -192,12 +211,14 @@ struct gpu_mvr_index {
         cudaEvent_t phase_a_d2h_done_event;
 
         cudaEvent_t pst_compute_done;
+        cudaEvent_t pst_extract_done;
         static constexpr int PST_NUM_D2H_CHUNKS = 8;
         cudaEvent_t pst_d2h_chunk_done[PST_NUM_D2H_CHUNKS];
 
         cudaStream_t stream_compute;
         cudaStream_t stream_h2d;
         cudaStream_t stream_d2h;
+        cudaStream_t stream_extract;
 
         cudaEvent_t event_h2d_done;
 
@@ -221,6 +242,7 @@ struct gpu_mvr_index {
         cudaEvent_t s2_binaryip_start, s2_binaryip_end;
         cudaEvent_t s2_docscore_start, s2_docscore_end;
         cudaEvent_t s2_d2h_start, s2_d2h_end;
+        cudaEvent_t s2_extract_start, s2_extract_end;
 
         float s2_gather_ms   = 0;
         float s2_prefix_ms   = 0;
@@ -229,6 +251,7 @@ struct gpu_mvr_index {
         float s2_docscore_ms = 0;
         float s2_d2h_ms      = 0;
         float s2_topk_cpu_us = 0;
+        float s2_extract_ms  = 0;
         int   s2_num_batches = 0;
 
         cudaEvent_t s23_pst_kernel_start, s23_pst_kernel_end;
@@ -250,6 +273,8 @@ struct gpu_mvr_index {
 #endif
         std::vector<int>                   running_indices;
         std::vector<int>                   h_sel_indices;
+        std::vector<size_t>                h_out_offsets;
+        std::vector<float>                 ip_ex_buf;
         std::vector<std::pair<float, int>> refined_scores;
         std::vector<bool>                  seen_doc_map;
     } ws_{};
@@ -299,11 +324,20 @@ struct gpu_mvr_index {
         query_object* queries,
         std::vector<size_t>& result);
 
-    void cpu_refine_scores(
+    void cpu_compute_ip_ex(
         const int* h_candidate_doc_ids,
         const int* h_sel_indices,
+        const size_t* h_out_offsets,
         int to_refine,
         const float* queries_flat,
+        float* ip_ex_buf);
+
+    void cpu_combine_scores(
+        const int* h_candidate_doc_ids,
+        const int* h_sel_indices,
+        const size_t* h_out_offsets,
+        int to_refine,
         const query_object* queries,
+        const float* ip_full_buf,
         std::pair<float, int>* refined_scores);
 };
