@@ -110,8 +110,9 @@ struct gpu_mvr_index {
     float* d_one_bit_factor_ = nullptr;
     int*   d_doc_ids_ = nullptr;
     int*   d_doc_ptrs_ = nullptr;
+    int*   d_doc_block_lut_ = nullptr;
     int*   d_inv_list_ = nullptr;
-    size_t* d_cluster_pos_ = nullptr;
+    gpu_cluster_pos_t* d_cluster_pos_ = nullptr;
 
     // Cluster-ordered copies: data reordered by inv_list so that vectors
     // in the same cluster are contiguous in memory. Stage-1 reads these
@@ -127,6 +128,7 @@ struct gpu_mvr_index {
     int k_rank_all_tokens = 300;
     int itopk_size = 150;
     int overlap_chunks = 5;
+    bool use_docptr_remap_ = false;
 
     // Pre-allocated GPU workspace
     struct Workspace {
@@ -139,7 +141,7 @@ struct gpu_mvr_index {
         int*    d_pair_doc_ids;
         int*    d_pair_query_indices;
 
-        size_t* d_token_ids;
+        stage2_token_id_t* d_token_ids;
         size_t* d_candidate_offsets;
         float*  d_token_dists;
         float*  d_doc_scores;
@@ -168,7 +170,10 @@ struct gpu_mvr_index {
         doc_bitmap_offset_t* d_doc_bitmap_offsets;
         size_t  doc_bitmap_bucket_count;
         size_t  doc_bitmap_offset_count;
-        size_t  max_compact_docs;    // max unique docs (d_doc_query_max rows)
+        size_t  max_compact_docs;    // conservative estimate for unique docs
+        size_t  compact_doc_capacity;
+        char*   d_compact_doc_buffer;
+        size_t  compact_doc_buffer_bytes;
 #else
         int*    d_doc_touched;
 #endif
@@ -178,6 +183,7 @@ struct gpu_mvr_index {
         float*  d_topk_scores;
         int*    d_topk_doc_ids;
         int*    d_topk_indices;
+        size_t  topk_buf_capacity;
 
         float*  h_pinned_queries;
         float*  h_pinned_cb1_sumq;
@@ -196,7 +202,7 @@ struct gpu_mvr_index {
         int    max_embs_per_query_bound;
 
         size_t* d_pst_candidate_offsets;
-        size_t* d_pst_token_ids;
+        stage2_token_id_t* d_pst_token_ids;
 
         float*        h_mapped_doc_scores;
 
@@ -289,6 +295,10 @@ struct gpu_mvr_index {
     void set_doc_mapping(const std::vector<int>& doc_lens);
     void compute_workspace_probe_bounds();
     void allocate_workspace();
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    void ensure_compact_doc_capacity(size_t required_rows);
+    void ensure_stage1_sort_capacity(size_t required_rows);
+#endif
     size_t doc_len(size_t doc_id) const;
 
     std::vector<size_t> search(const float* queries, size_t k);

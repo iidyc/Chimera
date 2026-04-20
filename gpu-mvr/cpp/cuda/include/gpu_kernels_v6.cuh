@@ -31,6 +31,18 @@ inline constexpr size_t doc_bitmap_num_offsets(size_t num_buckets) {
 }
 #endif
 
+#ifdef GPU_MVR_V6_GPU_INDICES_U32
+using stage2_token_id_t = uint32_t;
+using gpu_cluster_pos_t = uint32_t;
+#else
+using stage2_token_id_t = size_t;
+using gpu_cluster_pos_t = size_t;
+#endif
+
+inline constexpr int kDocPtrLookupBlockShift = 10;
+inline constexpr uint32_t kDocPtrLookupBlockSize =
+    1u << kDocPtrLookupBlockShift;
+
 __global__ void stage1_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
@@ -47,7 +59,7 @@ __global__ void stage2_binary_ip_kernel_v2(
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const size_t* __restrict__ d_token_ids,
+    const stage2_token_id_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -64,7 +76,7 @@ __global__ void stage1_binary_ip_lut_kernel(
     const float*    __restrict__ d_clustered_factor,
     const float*    __restrict__ d_cb1_sumq,
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
     float*       d_doc_query_max,
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
@@ -77,7 +89,7 @@ __global__ void stage1_binary_ip_lut_kernel(
 
 __global__ void stage1_binary_ip_lut_flag_docs_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
     doc_bitmap_bucket_t* d_doc_bitmap,
     size_t       num_docs,
@@ -94,8 +106,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const float*    __restrict__ d_factor,
     const float*    __restrict__ d_cb1_sumq,
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_doc_ptrs,
+    const int*      __restrict__ d_doc_block_lut,
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
@@ -108,8 +122,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
 
 __global__ void stage1_binary_ip_lut_nonclustered_flag_docs_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_doc_ptrs,
+    const int*      __restrict__ d_doc_block_lut,
     const int*      __restrict__ d_inv_list,
     doc_bitmap_bucket_t* d_doc_bitmap,
     size_t       num_docs,
@@ -135,7 +151,7 @@ __global__ void stage2_binary_ip_lut_kernel(
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const size_t* __restrict__ d_token_ids,
+    const stage2_token_id_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -173,13 +189,13 @@ __global__ void gather_token_ids_kernel(
     const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
     const size_t* __restrict__ d_candidate_offsets,
-    size_t*       d_out_token_ids,
+    stage2_token_id_t* d_out_token_ids,
     size_t num_candidates
 );
 
 __global__ void compute_query_expansion_sizes_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*       __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     int*                d_query_sizes,
     int                 nprobe,
     size_t              n_clusters,
@@ -189,7 +205,7 @@ __global__ void compute_query_expansion_sizes_kernel(
 __global__ void expand_cluster_ids_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const int*          __restrict__ d_inv_list,
-    const size_t*       __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
     size_t*             d_emb_ids,
     int                 nprobe,

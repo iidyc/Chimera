@@ -55,6 +55,10 @@ add_compile_definitions(GPU_MVR_PROFILE)
 add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
 add_compile_definitions(GPU_MVR_USE_LUT)
 
+option(GPU_MVR_V6_GPU_INDICES_U32
+    "Use uint32_t GPU token/cluster indices in v6; limits total token count to 4,294,967,295"
+    OFF)
+
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
@@ -173,6 +177,11 @@ target_compile_definitions(gpu_search_v6 PRIVATE
     GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
     GPU_MVR_COMPACT_DOC_BUFFER=1
 )
+if(GPU_MVR_V6_GPU_INDICES_U32)
+    target_compile_definitions(gpu_search_v6 PRIVATE
+        GPU_MVR_V6_GPU_INDICES_U32=1
+    )
+endif()
 target_link_libraries(gpu_search_v6 PRIVATE gpu_mvr_core)
 
 add_executable(gpu_search_v2

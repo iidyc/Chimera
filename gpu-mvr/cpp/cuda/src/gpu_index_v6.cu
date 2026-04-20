@@ -79,6 +79,123 @@ std::pair<size_t, size_t> compute_stage2_token_bounds(
     return {candidate_tokens, topk_tokens};
 }
 
+size_t align_up(size_t value, size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+size_t grow_compact_doc_capacity(size_t current, size_t required, size_t limit) {
+    constexpr size_t kRowAlignment = 1u << 16;   // 65536 rows
+    constexpr size_t kMinSlackRows = 1u << 15;   // 32768 rows
+    const size_t aligned_required = align_up(std::max(required, size_t{1}), kRowAlignment);
+    const size_t required_slack = std::max(required / 16, kMinSlackRows);   // ~6.25%
+    const size_t current_slack = std::max(current / 8, kMinSlackRows);      // ~12.5%
+    size_t target = aligned_required;
+    target = std::max(target, align_up(required + required_slack, kRowAlignment));
+    if (current > 0) {
+        target = std::max(target, align_up(current + current_slack, kRowAlignment));
+    }
+    return std::min(limit, target);
+}
+
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+size_t compact_doc_arena_bytes(size_t row_capacity, size_t topk_capacity) {
+    size_t offset = 0;
+    offset = align_up(offset, alignof(int));
+    offset += row_capacity * sizeof(int);     // d_sorted_doc_ids
+    offset = align_up(offset, alignof(int));
+    offset += row_capacity * sizeof(int);     // d_unique_doc_ids
+    offset = align_up(offset, alignof(float));
+    offset += row_capacity * sizeof(float);   // d_stage1_doc_scores
+    offset = align_up(offset, alignof(float));
+    offset += row_capacity * Q_DOCLEN * sizeof(float);  // d_doc_query_max
+    offset = align_up(offset, alignof(float));
+    offset += topk_capacity * sizeof(float);  // d_topk_scores
+    offset = align_up(offset, alignof(int));
+    offset += topk_capacity * sizeof(int);    // d_topk_doc_ids
+    offset = align_up(offset, alignof(int));
+    offset += topk_capacity * sizeof(int);    // d_topk_indices
+    return offset;
+}
+
+void bind_compact_doc_arena(
+    gpu_mvr_index::Workspace& ws,
+    char* base,
+    size_t row_capacity,
+    size_t topk_capacity) {
+    size_t offset = 0;
+    offset = align_up(offset, alignof(int));
+    ws.d_sorted_doc_ids = reinterpret_cast<int*>(base + offset);
+    offset += row_capacity * sizeof(int);
+    offset = align_up(offset, alignof(int));
+    ws.d_unique_doc_ids = reinterpret_cast<int*>(base + offset);
+    offset += row_capacity * sizeof(int);
+    offset = align_up(offset, alignof(float));
+    ws.d_stage1_doc_scores = reinterpret_cast<float*>(base + offset);
+    offset += row_capacity * sizeof(float);
+    offset = align_up(offset, alignof(float));
+    ws.d_doc_query_max = reinterpret_cast<float*>(base + offset);
+    offset += row_capacity * Q_DOCLEN * sizeof(float);
+    offset = align_up(offset, alignof(float));
+    ws.d_topk_scores = reinterpret_cast<float*>(base + offset);
+    offset += topk_capacity * sizeof(float);
+    offset = align_up(offset, alignof(int));
+    ws.d_topk_doc_ids = reinterpret_cast<int*>(base + offset);
+    offset += topk_capacity * sizeof(int);
+    offset = align_up(offset, alignof(int));
+    ws.d_topk_indices = reinterpret_cast<int*>(base + offset);
+}
+#endif
+
+bool env_flag_enabled(const char* name) {
+    const char* env = std::getenv(name);
+    return env != nullptr && env[0] != '\0' && std::string(env) != "0";
+}
+
+int doc_id_from_doc_ptrs_host_binary_range(
+    const std::vector<int>& doc_ptrs,
+    int lo,
+    int hi,
+    uint32_t token_id) {
+    while (lo < hi) {
+        const int mid = lo + ((hi - lo + 1) >> 1);
+        const uint32_t mid_start = static_cast<uint32_t>(doc_ptrs[mid]);
+        if (mid_start <= token_id) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+int doc_id_from_doc_ptrs_host(
+    const std::vector<int>& doc_ptrs,
+    uint32_t token_id) {
+    return doc_id_from_doc_ptrs_host_binary_range(
+        doc_ptrs, 0, static_cast<int>(doc_ptrs.size()) - 2, token_id);
+}
+
+std::vector<int> build_doc_block_lut_host(
+    const std::vector<int>& doc_ptrs,
+    size_t num_docs,
+    size_t num_tokens) {
+    const size_t num_doc_blocks =
+        (num_tokens + kDocPtrLookupBlockSize - 1) >> kDocPtrLookupBlockShift;
+    std::vector<int> doc_block_lut(num_doc_blocks + 1, 0);
+    size_t doc_id = 0;
+    for (size_t block = 0; block < num_doc_blocks; ++block) {
+        const size_t token_boundary = block * kDocPtrLookupBlockSize;
+        while (doc_id + 1 < doc_ptrs.size() &&
+               static_cast<size_t>(doc_ptrs[doc_id + 1]) <= token_boundary) {
+            ++doc_id;
+        }
+        doc_block_lut[block] = static_cast<int>(doc_id);
+    }
+    doc_block_lut[num_doc_blocks] =
+        static_cast<int>(std::max<size_t>(num_docs, 1) - 1);
+    return doc_block_lut;
+}
+
 }  // namespace
 
 // ======================== CONSTRUCTOR ========================
@@ -112,6 +229,16 @@ gpu_mvr_index::gpu_mvr_index(
     d = header.d;
     n_clusters = header.n_clusters;
     ex_bits = header.ex_bits;
+
+#ifdef GPU_MVR_V6_GPU_INDICES_U32
+    if (n > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        throw std::runtime_error(
+            "gpu_search_v6 built with GPU_MVR_V6_GPU_INDICES_U32=1, which "
+            "limits the total token count to 4,294,967,295, but index "
+            "embedding count exceeds that capacity: n=" +
+            std::to_string(n));
+    }
+#endif
 
     if (header.padded_dim != PADDED_DIM) {
         inf.close();
@@ -171,6 +298,15 @@ gpu_mvr_index::gpu_mvr_index(
     std::cout << "max cluster size: " << max_cluster_size << std::endl;
     startup.mark("load_ivf");
 
+    use_docptr_remap_ = env_flag_enabled("GPU_MVR_V6_USE_DOCPTRS");
+    if (use_docptr_remap_) {
+        std::cout
+            << "[gpu_mvr][v6] GPU_MVR_V6_USE_DOCPTRS is set. "
+               "Skipping d_doc_ids_ and using doc_ptrs block LUT remapping "
+               "in non-clustered stage 1."
+            << std::endl;
+    }
+
     log_ctor_step(
         "Building document-to-token map for " +
         std::to_string(doc_lens.size()) + " docs and " +
@@ -186,15 +322,41 @@ gpu_mvr_index::gpu_mvr_index(
     const size_t code_bytes = n * PADDED_DIM / 8;
     CUDA_CHECK(cudaMalloc(&d_one_bit_code_, code_bytes));
     CUDA_CHECK(cudaMalloc(&d_one_bit_factor_, n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_doc_ids_, n * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_doc_ptrs_, (num_docs + 1) * sizeof(int)));
+    if (!use_docptr_remap_) {
+        CUDA_CHECK(cudaMalloc(&d_doc_ids_, n * sizeof(int)));
+    }
 
+    std::vector<int> doc_block_lut;
+    if (use_docptr_remap_) {
+        doc_block_lut = build_doc_block_lut_host(doc_ptrs_, num_docs, n);
+        CUDA_CHECK(cudaMalloc(
+            &d_doc_block_lut_,
+            doc_block_lut.size() * sizeof(int)));
+    }
+
+#ifdef GPU_MVR_V6_GPU_INDICES_U32
+    std::vector<gpu_cluster_pos_t> cluster_pos_gpu(ivf->n_clusters + 1, 0);
+    for (size_t i = 0; i < ivf->cluster_pos.size(); ++i) {
+        cluster_pos_gpu[i] =
+            static_cast<gpu_cluster_pos_t>(ivf->cluster_pos[i]);
+    }
+    CUDA_CHECK(cudaMalloc(
+        &d_cluster_pos_,
+        (ivf->n_clusters + 1) * sizeof(gpu_cluster_pos_t)));
+    CUDA_CHECK(cudaMemcpy(
+        d_cluster_pos_,
+        cluster_pos_gpu.data(),
+        (ivf->n_clusters + 1) * sizeof(gpu_cluster_pos_t),
+        cudaMemcpyHostToDevice));
+#else
     CUDA_CHECK(cudaMalloc(&d_cluster_pos_, (ivf->n_clusters + 1) * sizeof(size_t)));
     CUDA_CHECK(cudaMemcpy(
         d_cluster_pos_,
         ivf->cluster_pos.data(),
         (ivf->n_clusters + 1) * sizeof(size_t),
         cudaMemcpyHostToDevice));
+#endif
 
 #ifndef GPU_MVR_USE_LUT
     {
@@ -212,8 +374,20 @@ gpu_mvr_index::gpu_mvr_index(
 
     CUDA_CHECK(cudaMemcpy(d_one_bit_code_, one_bit_code_.data(), code_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_one_bit_factor_, one_bit_factor_.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_doc_ids_, doc_ids_.data(), n * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_doc_ptrs_, doc_ptrs_.data(), (num_docs + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    if (!use_docptr_remap_) {
+        CUDA_CHECK(cudaMemcpy(
+            d_doc_ids_,
+            doc_ids_.data(),
+            n * sizeof(int),
+            cudaMemcpyHostToDevice));
+    } else {
+        CUDA_CHECK(cudaMemcpy(
+            d_doc_block_lut_,
+            doc_block_lut.data(),
+            doc_block_lut.size() * sizeof(int),
+            cudaMemcpyHostToDevice));
+    }
     startup.mark("upload_persistent_data");
 
     log_ctor_step(
@@ -450,10 +624,12 @@ void gpu_mvr_index::set_doc_mapping(const std::vector<int>& doc_lens) {
         max_doc_len = std::max(max_doc_len, doc_lens[i]);
         doc_ptrs_[i + 1] = doc_ptrs_[i] + doc_lens[i];
     }
-    doc_ids_.resize(n);
-    for (size_t i = 0; i < num_docs; ++i) {
-        for (size_t j = 0; j < doc_lens[i]; ++j) {
-            doc_ids_[doc_ptrs_[i] + j] = i;
+    if (!use_docptr_remap_) {
+        doc_ids_.resize(n);
+        for (size_t i = 0; i < num_docs; ++i) {
+            for (size_t j = 0; j < doc_lens[i]; ++j) {
+                doc_ids_[doc_ptrs_[i] + j] = i;
+            }
         }
     }
     if (static_cast<size_t>(doc_ptrs_.back()) != n) {
@@ -495,12 +671,17 @@ void gpu_mvr_index::compute_workspace_probe_bounds() {
         }
 
         const auto first_token_id = static_cast<uint32_t>(ivf->inv_list[start]);
-        int prev_doc_id = doc_ids_[first_token_id];
+        int prev_doc_id = use_docptr_remap_
+            ? doc_id_from_doc_ptrs_host(doc_ptrs_, first_token_id)
+            : doc_ids_[first_token_id];
         size_t unique_doc_count = 1;
 
         for (size_t pos = start + 1; pos < end; ++pos) {
             const uint32_t token_id = static_cast<uint32_t>(ivf->inv_list[pos]);
-            const int current_doc_id = doc_ids_[token_id];
+            const int current_doc_id = use_docptr_remap_
+                ? doc_id_from_doc_ptrs_host_binary_range(
+                    doc_ptrs_, prev_doc_id, static_cast<int>(num_docs) - 1, token_id)
+                : doc_ids_[token_id];
             if (current_doc_id != prev_doc_id) {
                 ++unique_doc_count;
                 prev_doc_id = current_doc_id;
@@ -544,7 +725,8 @@ void gpu_mvr_index::allocate_workspace() {
     ws_.doc_bitmap_bucket_count = doc_bitmap_num_buckets(num_docs);
     ws_.doc_bitmap_offset_count =
         doc_bitmap_num_offsets(ws_.doc_bitmap_bucket_count);
-    const size_t doc_buf_rows = std::max<size_t>(ws_.max_compact_docs, 1);
+    ws_.compact_doc_capacity = 1;
+    const size_t doc_buf_rows = ws_.compact_doc_capacity;
 
     std::cout << "max cluster size: " << max_cluster_size << std::endl;
     std::cout << "workspace_probe_cluster_bound: "
@@ -555,6 +737,9 @@ void gpu_mvr_index::allocate_workspace() {
               << workspace_probe_unique_doc_bound_ << std::endl;
     std::cout << "max_compact_docs: " << ws_.max_compact_docs
               << "  (num_docs=" << num_docs << ")" << std::endl;
+    std::cout << "initial_compact_doc_capacity: "
+              << ws_.compact_doc_capacity
+              << "  (grows to observed touched docs)" << std::endl;
     std::cout << "workspace_stage2_candidate_token_bound: "
               << ws_.max_stage2_tokens << std::endl;
     std::cout << "workspace_stage2_topk_token_bound: "
@@ -611,7 +796,7 @@ void gpu_mvr_index::allocate_workspace() {
 #else
                             ws_.estimated_num_docs * sizeof(int);  // d_doc_touched
 #endif
-    std::cout << "Estimated GPU memory required for workspace: "
+    std::cout << "Initial GPU memory required for workspace: "
               << (estimated_size / (1024.0 * 1024.0)) << " MB" << std::endl;
 
     CUDA_CHECK(cudaMalloc(&ws_.d_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
@@ -624,10 +809,6 @@ void gpu_mvr_index::allocate_workspace() {
 #endif
     CUDA_CHECK(cudaMalloc(&ws_.d_pair_doc_ids, ws_.max_stage2_candidates * sizeof(int)));
 
-    CUDA_CHECK(cudaMalloc(&ws_.d_sorted_doc_ids, doc_buf_rows * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&ws_.d_unique_doc_ids, doc_buf_rows * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&ws_.d_stage1_doc_scores, doc_buf_rows * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, doc_buf_rows * Q_DOCLEN * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws_.d_num_unique_docs, sizeof(int)));
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     CUDA_CHECK(cudaMalloc(&ws_.d_doc_bitmap,
@@ -709,10 +890,23 @@ void gpu_mvr_index::allocate_workspace() {
     //           << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
     //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    ws_.d_compact_doc_buffer = nullptr;
+    ws_.compact_doc_buffer_bytes = 0;
+    ws_.compact_doc_capacity = 0;
+    ws_.topk_buf_capacity = 0;
+    ensure_compact_doc_capacity(doc_buf_rows);
+#else
+    CUDA_CHECK(cudaMalloc(&ws_.d_sorted_doc_ids, doc_buf_rows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ws_.d_unique_doc_ids, doc_buf_rows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ws_.d_stage1_doc_scores, doc_buf_rows * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, doc_buf_rows * Q_DOCLEN * sizeof(float)));
     size_t topk_buf_size = std::max(doc_buf_rows, ws_.max_stage2_candidates);
+    ws_.topk_buf_capacity = topk_buf_size;
     CUDA_CHECK(cudaMalloc(&ws_.d_topk_scores, topk_buf_size * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws_.d_topk_doc_ids, topk_buf_size * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws_.d_topk_indices, topk_buf_size * sizeof(int)));
+#endif
 
 #ifndef GPU_MVR_OVERLAP_STAGE23
     CUDA_CHECK(cudaMalloc(&ws_.d_candidate_offsets, (ws_.max_stage2_candidates + 1) * sizeof(size_t)));
@@ -847,6 +1041,59 @@ void gpu_mvr_index::allocate_workspace() {
     ws_.refined_scores.resize(ws_.max_stage2_k);
     ws_.seen_doc_map.resize(num_docs, false);
 }
+
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+void gpu_mvr_index::ensure_stage1_sort_capacity(size_t required_rows) {
+    required_rows = std::max<size_t>(required_rows, 1);
+
+    size_t temp_bytes = 0;
+    cub::DeviceRadixSort::SortPairsDescending(
+        nullptr, temp_bytes,
+        ws_.d_stage1_doc_scores, ws_.d_topk_scores,
+        ws_.d_topk_indices, ws_.d_sorted_doc_ids,
+        static_cast<int>(required_rows), 0, 32);
+    if (temp_bytes <= ws_.cub_temp_storage_bytes) {
+        return;
+    }
+
+    CUDA_CHECK(cudaFree(ws_.d_cub_temp_storage));
+    ws_.d_cub_temp_storage = nullptr;
+    ws_.cub_temp_storage_bytes = temp_bytes;
+    CUDA_CHECK(cudaMalloc(&ws_.d_cub_temp_storage, ws_.cub_temp_storage_bytes));
+}
+
+void gpu_mvr_index::ensure_compact_doc_capacity(size_t required_rows) {
+    required_rows = std::max<size_t>(required_rows, 1);
+    if (required_rows <= ws_.compact_doc_capacity) {
+        return;
+    }
+
+    const size_t grown_rows = grow_compact_doc_capacity(
+        ws_.compact_doc_capacity,
+        required_rows,
+        static_cast<size_t>(num_docs));
+    const size_t required_topk_capacity =
+        std::max(grown_rows, ws_.max_stage2_candidates);
+    const size_t required_buffer_bytes =
+        compact_doc_arena_bytes(grown_rows, required_topk_capacity);
+
+    std::cout << "[workspace] Growing compact doc capacity from "
+              << ws_.compact_doc_capacity << " to "
+              << grown_rows << " rows"
+              << " (required=" << required_rows << ")" << std::endl;
+
+    CUDA_CHECK(cudaFree(ws_.d_compact_doc_buffer));
+    ws_.d_compact_doc_buffer = nullptr;
+    ws_.compact_doc_buffer_bytes = required_buffer_bytes;
+    CUDA_CHECK(cudaMalloc(&ws_.d_compact_doc_buffer, ws_.compact_doc_buffer_bytes));
+    bind_compact_doc_arena(
+        ws_, ws_.d_compact_doc_buffer, grown_rows, required_topk_capacity);
+
+    ws_.compact_doc_capacity = grown_rows;
+    ws_.topk_buf_capacity = required_topk_capacity;
+    ensure_stage1_sort_capacity(grown_rows);
+}
+#endif
 
 // ======================== doc_len ========================
 
@@ -1105,7 +1352,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     cudaStream_t stream
 ) {
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    size_t doc_matrix_size = ws_.max_compact_docs * Q_DOCLEN;
+    size_t doc_matrix_size = 0;
 #else
     size_t doc_matrix_size = ws_.estimated_num_docs * Q_DOCLEN;
 #endif
@@ -1114,7 +1361,6 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         CUDA_CHECK(cudaEventRecord(ws_.s1_memset_start, ws_.stream_d2h));
     }
 #endif
-    CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_query_max, 0, doc_matrix_size * sizeof(float), ws_.stream_d2h));
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
     CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_bitmap, 0,
                                ws_.doc_bitmap_bucket_count * sizeof(doc_bitmap_bucket_t),
@@ -1239,6 +1485,8 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         stage1_binary_ip_lut_nonclustered_flag_docs_kernel<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_cagra_labels, d_cluster_pos_,
             d_doc_ids_,
+            d_doc_ptrs_,
+            d_doc_block_lut_,
             d_inv_list_,
             ws_.d_doc_bitmap,
             num_docs,
@@ -1280,13 +1528,11 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             actual_k_out = 0;
             return;
         }
-        if ((size_t)h_num_touched > ws_.max_compact_docs) {
-            std::cerr << "ERROR: h_num_touched (" << h_num_touched
-                      << ") exceeds max_compact_docs (" << ws_.max_compact_docs
-                      << "). Increase bitmap compact workspace headroom.\n";
-            actual_k_out = 0;
-            return;
-        }
+        ensure_compact_doc_capacity(static_cast<size_t>(h_num_touched));
+        CUDA_CHECK(cudaMemsetAsync(
+            ws_.d_doc_query_max, 0,
+            static_cast<size_t>(h_num_touched) * Q_DOCLEN * sizeof(float),
+            stream));
 
         bitmap_unique_docs_kernel<<<
             (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
@@ -1307,12 +1553,14 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_cagra_labels, d_cluster_pos_,
             d_doc_ids_,
+            d_doc_ptrs_,
+            d_doc_block_lut_,
             d_inv_list_,
             ws_.d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
             ws_.d_doc_bitmap,
             ws_.d_doc_bitmap_offsets,
-            static_cast<int>(ws_.max_compact_docs),
+            h_num_touched,
 #else
             ws_.d_doc_touched,
             ws_.d_unique_doc_ids,
@@ -1383,13 +1631,11 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             actual_k_out = 0;
             return;
         }
-        if ((size_t)h_num_touched > ws_.max_compact_docs) {
-            std::cerr << "ERROR: h_num_touched (" << h_num_touched
-                      << ") exceeds max_compact_docs (" << ws_.max_compact_docs
-                      << "). Increase bitmap compact workspace headroom.\n";
-            actual_k_out = 0;
-            return;
-        }
+        ensure_compact_doc_capacity(static_cast<size_t>(h_num_touched));
+        CUDA_CHECK(cudaMemsetAsync(
+            ws_.d_doc_query_max, 0,
+            static_cast<size_t>(h_num_touched) * Q_DOCLEN * sizeof(float),
+            stream));
 
         bitmap_unique_docs_kernel<<<
             (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
@@ -1413,7 +1659,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.d_doc_query_max,
             ws_.d_doc_bitmap,
             ws_.d_doc_bitmap_offsets,
-            static_cast<int>(ws_.max_compact_docs),
+            h_num_touched,
             num_docs,
             nprobe,
             ivf->n_clusters
@@ -1437,6 +1683,8 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         stage1_binary_ip_lut_nonclustered_flag_docs_kernel<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_cagra_labels, d_cluster_pos_,
             d_doc_ids_,
+            d_doc_ptrs_,
+            d_doc_block_lut_,
             d_inv_list_,
             ws_.d_doc_bitmap,
             num_docs,
@@ -1478,13 +1726,11 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             actual_k_out = 0;
             return;
         }
-        if ((size_t)h_num_touched > ws_.max_compact_docs) {
-            std::cerr << "ERROR: h_num_touched (" << h_num_touched
-                      << ") exceeds max_compact_docs (" << ws_.max_compact_docs
-                      << "). Increase bitmap compact workspace headroom.\n";
-            actual_k_out = 0;
-            return;
-        }
+        ensure_compact_doc_capacity(static_cast<size_t>(h_num_touched));
+        CUDA_CHECK(cudaMemsetAsync(
+            ws_.d_doc_query_max, 0,
+            static_cast<size_t>(h_num_touched) * Q_DOCLEN * sizeof(float),
+            stream));
 
         bitmap_unique_docs_kernel<<<
             (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
@@ -1505,11 +1751,13 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_cagra_labels, d_cluster_pos_,
             d_doc_ids_,
+            d_doc_ptrs_,
+            d_doc_block_lut_,
             d_inv_list_,
             ws_.d_doc_query_max,
             ws_.d_doc_bitmap,
             ws_.d_doc_bitmap_offsets,
-            static_cast<int>(ws_.max_compact_docs),
+            h_num_touched,
             num_docs,
             nprobe,
             ivf->n_clusters
@@ -2281,6 +2529,7 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaFree(d_one_bit_factor_));
     CUDA_CHECK(cudaFree(d_doc_ids_));
     CUDA_CHECK(cudaFree(d_doc_ptrs_));
+    CUDA_CHECK(cudaFree(d_doc_block_lut_));
     // d_inv_list_ may be allocated in non-LUT path or as fallback in LUT path;
     // cudaFree(nullptr) is a safe no-op
     CUDA_CHECK(cudaFree(d_inv_list_));
@@ -2310,21 +2559,22 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaFree(ws_.d_cagra_dists));
     CUDA_CHECK(cudaFree(ws_.d_cagra_labels));
 
+    CUDA_CHECK(cudaFree(ws_.d_num_unique_docs));
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    CUDA_CHECK(cudaFree(ws_.d_compact_doc_buffer));
+    CUDA_CHECK(cudaFree(ws_.d_doc_bitmap));
+    CUDA_CHECK(cudaFree(ws_.d_doc_bitmap_offsets));
+#else
     CUDA_CHECK(cudaFree(ws_.d_sorted_doc_ids));
     CUDA_CHECK(cudaFree(ws_.d_unique_doc_ids));
     CUDA_CHECK(cudaFree(ws_.d_stage1_doc_scores));
     CUDA_CHECK(cudaFree(ws_.d_doc_query_max));
-    CUDA_CHECK(cudaFree(ws_.d_num_unique_docs));
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    CUDA_CHECK(cudaFree(ws_.d_doc_bitmap));
-    CUDA_CHECK(cudaFree(ws_.d_doc_bitmap_offsets));
-#else
     CUDA_CHECK(cudaFree(ws_.d_doc_touched));
-#endif
-    CUDA_CHECK(cudaFree(ws_.d_cub_temp_storage));
     CUDA_CHECK(cudaFree(ws_.d_topk_scores));
     CUDA_CHECK(cudaFree(ws_.d_topk_doc_ids));
     CUDA_CHECK(cudaFree(ws_.d_topk_indices));
+#endif
+    CUDA_CHECK(cudaFree(ws_.d_cub_temp_storage));
 
     CUDA_CHECK(cudaFreeHost(ws_.h_pinned_queries));
     CUDA_CHECK(cudaFreeHost(ws_.h_pinned_cb1_sumq));

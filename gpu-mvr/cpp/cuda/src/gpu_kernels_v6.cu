@@ -141,6 +141,37 @@ __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
     return __int_as_float(old);
 }
 
+__device__ __forceinline__ int doc_id_from_doc_ptrs_binary_range(
+    const int* __restrict__ d_doc_ptrs,
+    int lo,
+    int hi,
+    uint32_t token_id
+) {
+    while (lo < hi) {
+        const int mid = lo + ((hi - lo + 1) >> 1);
+        const uint32_t mid_start = static_cast<uint32_t>(__ldg(&d_doc_ptrs[mid]));
+        if (mid_start <= token_id) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+__device__ __forceinline__ int doc_id_from_doc_ptrs_blocked(
+    const int* __restrict__ d_doc_ptrs,
+    const int* __restrict__ d_doc_block_lut,
+    uint32_t token_id
+) {
+    const int block = static_cast<int>(token_id >> kDocPtrLookupBlockShift);
+    const int lo = __ldg(&d_doc_block_lut[block]);
+    const int hi = __ldg(&d_doc_block_lut[block + 1]);
+    return (lo >= hi)
+        ? lo
+        : doc_id_from_doc_ptrs_binary_range(d_doc_ptrs, lo, hi, token_id);
+}
+
 __global__ void stage1_binary_ip_kernel_v2(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
@@ -201,7 +232,7 @@ __global__ void stage2_binary_ip_kernel_v2(
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const size_t* __restrict__ d_token_ids,
+    const stage2_token_id_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -222,7 +253,7 @@ __global__ void stage2_binary_ip_kernel_v2(
          tok_idx < batch_tokens;
          tok_idx += (size_t)blockDim.x * gridDim.x)
     {
-        const size_t token_id = d_token_ids[tok_idx];
+        const size_t token_id = static_cast<size_t>(d_token_ids[tok_idx]);
         const float factor = d_one_bit_factor[token_id];
 
         const uint64_t* code_ptr =
@@ -350,7 +381,7 @@ __global__ void stage1_binary_ip_lut_kernel(
     const float*    __restrict__ d_clustered_factor,
     const float*    __restrict__ d_cb1_sumq,
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
     float*       d_doc_query_max,
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
@@ -378,9 +409,10 @@ __global__ void stage1_binary_ip_lut_kernel(
     for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
         uint32_t label = my_labels[p];
         if (label < (uint32_t)n_clusters) {
-            size_t start = d_cluster_pos[label];
+            const size_t start = static_cast<size_t>(d_cluster_pos[label]);
             smem_cstart[p] = (uint32_t)start;
-            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+            smem_prefix[p + 1] =
+                (int)(static_cast<size_t>(d_cluster_pos[label + 1]) - start);
         } else {
             smem_cstart[p] = 0;
             smem_prefix[p + 1] = 0;
@@ -471,7 +503,7 @@ __global__ void stage1_binary_ip_lut_kernel(
 
 __global__ void stage1_binary_ip_lut_flag_docs_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
     doc_bitmap_bucket_t* d_doc_bitmap,
     size_t       num_docs,
@@ -488,9 +520,10 @@ __global__ void stage1_binary_ip_lut_flag_docs_kernel(
     for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
         uint32_t label = my_labels[p];
         if (label < (uint32_t)n_clusters) {
-            size_t start = d_cluster_pos[label];
+            const size_t start = static_cast<size_t>(d_cluster_pos[label]);
             smem_cstart[p] = (uint32_t)start;
-            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+            smem_prefix[p + 1] =
+                (int)(static_cast<size_t>(d_cluster_pos[label + 1]) - start);
         } else {
             smem_cstart[p] = 0;
             smem_prefix[p + 1] = 0;
@@ -548,8 +581,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const float*    __restrict__ d_factor,
     const float*    __restrict__ d_cb1_sumq,
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_doc_ptrs,
+    const int*      __restrict__ d_doc_block_lut,
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
@@ -577,9 +612,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
         uint32_t label = my_labels[p];
         if (label < (uint32_t)n_clusters) {
-            size_t start = d_cluster_pos[label];
+            const size_t start = static_cast<size_t>(d_cluster_pos[label]);
             smem_cstart[p] = (uint32_t)start;
-            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+            smem_prefix[p + 1] =
+                (int)(static_cast<size_t>(d_cluster_pos[label + 1]) - start);
         } else {
             smem_cstart[p] = 0;
             smem_prefix[p + 1] = 0;
@@ -621,7 +657,12 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
         const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
             d_code + (size_t)orig_id * CODE_BYTES));
         const float factor = __ldg(&d_factor[orig_id]);
-        const int   doc_id = __ldg(&d_doc_ids[orig_id]);
+        const int   doc_id = (d_doc_ids != nullptr)
+            ? __ldg(&d_doc_ids[orig_id])
+            : doc_id_from_doc_ptrs_blocked(
+                d_doc_ptrs,
+                d_doc_block_lut,
+                orig_id);
 
         float ip = 0.0f;
         #pragma unroll
@@ -666,8 +707,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
 
 __global__ void stage1_binary_ip_lut_nonclustered_flag_docs_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_doc_ptrs,
+    const int*      __restrict__ d_doc_block_lut,
     const int*      __restrict__ d_inv_list,
     doc_bitmap_bucket_t* d_doc_bitmap,
     size_t       num_docs,
@@ -684,9 +727,10 @@ __global__ void stage1_binary_ip_lut_nonclustered_flag_docs_kernel(
     for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
         uint32_t label = my_labels[p];
         if (label < (uint32_t)n_clusters) {
-            size_t start = d_cluster_pos[label];
+            const size_t start = static_cast<size_t>(d_cluster_pos[label]);
             smem_cstart[p] = (uint32_t)start;
-            smem_prefix[p + 1] = (int)(d_cluster_pos[label + 1] - start);
+            smem_prefix[p + 1] =
+                (int)(static_cast<size_t>(d_cluster_pos[label + 1]) - start);
         } else {
             smem_cstart[p] = 0;
             smem_prefix[p + 1] = 0;
@@ -719,7 +763,12 @@ __global__ void stage1_binary_ip_lut_nonclustered_flag_docs_kernel(
 
         const uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
         const uint32_t orig_id = (uint32_t)__ldg(&d_inv_list[emb_pos]);
-        const int doc_id = __ldg(&d_doc_ids[orig_id]);
+        const int doc_id = (d_doc_ids != nullptr)
+            ? __ldg(&d_doc_ids[orig_id])
+            : doc_id_from_doc_ptrs_blocked(
+                d_doc_ptrs,
+                d_doc_block_lut,
+                orig_id);
 
         if ((size_t)doc_id < num_docs) {
             const unsigned int active_mask = __activemask();
@@ -738,7 +787,7 @@ __global__ void stage2_binary_ip_lut_kernel(
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
-    const size_t* __restrict__ d_token_ids,
+    const stage2_token_id_t* __restrict__ d_token_ids,
     float* __restrict__ d_out_dists,
     size_t total_tokens,
     size_t batch_tokens
@@ -761,7 +810,7 @@ __global__ void stage2_binary_ip_lut_kernel(
         int nibbles[NUM_CHUNKS];
 
         if (valid) {
-            token_id = d_token_ids[tok_idx];
+            token_id = static_cast<size_t>(d_token_ids[tok_idx]);
             factor = d_one_bit_factor[token_id];
 
             const uint64_t* code_ptr =
@@ -948,7 +997,7 @@ __global__ void gather_token_ids_kernel(
     const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
     const size_t* __restrict__ d_candidate_offsets,
-    size_t*       d_out_token_ids,
+    stage2_token_id_t* d_out_token_ids,
     size_t num_candidates
 ) {
     size_t cand_idx = blockIdx.x;
@@ -960,13 +1009,14 @@ __global__ void gather_token_ids_kernel(
     size_t out_offset = d_candidate_offsets[cand_idx];
 
     for (int t = threadIdx.x; t < (doc_end - doc_start); t += blockDim.x) {
-        d_out_token_ids[out_offset + t] = doc_start + t;
+        d_out_token_ids[out_offset + t] =
+            static_cast<stage2_token_id_t>(doc_start + t);
     }
 }
 
 __global__ void compute_query_expansion_sizes_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*       __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     int*                d_query_sizes,
     int                 nprobe,
     size_t              n_clusters,
@@ -980,7 +1030,9 @@ __global__ void compute_query_expansion_sizes_kernel(
         uint32_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
         if (cluster_id >= (uint32_t)n_clusters) continue;
 
-        size_t cluster_size = d_cluster_pos[cluster_id + 1] - d_cluster_pos[cluster_id];
+        size_t cluster_size =
+            static_cast<size_t>(d_cluster_pos[cluster_id + 1]) -
+            static_cast<size_t>(d_cluster_pos[cluster_id]);
         total_size += cluster_size;
     }
 
@@ -990,7 +1042,7 @@ __global__ void compute_query_expansion_sizes_kernel(
 __global__ void expand_cluster_ids_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const int*          __restrict__ d_inv_list,
-    const size_t*       __restrict__ d_cluster_pos,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*          __restrict__ d_query_offsets,
     size_t*             d_emb_ids,
     int                 nprobe,
@@ -1008,8 +1060,8 @@ __global__ void expand_cluster_ids_kernel(
         uint32_t cluster_id = d_cagra_labels[query_idx * nprobe + p];
         if (cluster_id >= (uint32_t)n_clusters) continue;
 
-        size_t cluster_start = d_cluster_pos[cluster_id];
-        size_t cluster_end = d_cluster_pos[cluster_id + 1];
+        size_t cluster_start = static_cast<size_t>(d_cluster_pos[cluster_id]);
+        size_t cluster_end = static_cast<size_t>(d_cluster_pos[cluster_id + 1]);
         size_t cluster_size = cluster_end - cluster_start;
 
         if (use_clustered_layout) {
