@@ -198,14 +198,12 @@ struct gpu_mvr_index {
         cudaEvent_t phase_a_d2h_done_event;
 
         cudaEvent_t pst_compute_done;
-        cudaEvent_t pst_extract_done;
         static constexpr int PST_NUM_D2H_CHUNKS = 8;
         cudaEvent_t pst_d2h_chunk_done[PST_NUM_D2H_CHUNKS];
 
         cudaStream_t stream_compute;
         cudaStream_t stream_h2d;
         cudaStream_t stream_d2h;
-        cudaStream_t stream_extract;
 
         cudaEvent_t event_h2d_done;
 
@@ -229,7 +227,6 @@ struct gpu_mvr_index {
         cudaEvent_t s2_binaryip_start, s2_binaryip_end;
         cudaEvent_t s2_docscore_start, s2_docscore_end;
         cudaEvent_t s2_d2h_start, s2_d2h_end;
-        cudaEvent_t s2_extract_start, s2_extract_end;
 
         float s2_gather_ms   = 0;
         float s2_prefix_ms   = 0;
@@ -238,7 +235,6 @@ struct gpu_mvr_index {
         float s2_docscore_ms = 0;
         float s2_d2h_ms      = 0;
         float s2_topk_cpu_us = 0;
-        float s2_extract_ms  = 0;
         int   s2_num_batches = 0;
 
         cudaEvent_t s23_pst_kernel_start, s23_pst_kernel_end;
@@ -260,8 +256,6 @@ struct gpu_mvr_index {
 #endif
         std::vector<int>                   running_indices;
         std::vector<int>                   h_sel_indices;
-        std::vector<size_t>                h_out_offsets;
-        std::vector<float>                 ip_ex_buf;
         std::vector<std::pair<float, int>> refined_scores;
         std::vector<bool>                  seen_doc_map;
     } ws_{};
@@ -311,20 +305,11 @@ struct gpu_mvr_index {
         query_object* queries,
         std::vector<size_t>& result);
 
-    void cpu_compute_ip_ex(
+    void cpu_refine_scores(
         const int* h_candidate_doc_ids,
         const int* h_sel_indices,
-        const size_t* h_out_offsets,
         int to_refine,
         const float* queries_flat,
-        float* ip_ex_buf);
-
-    void cpu_combine_scores(
-        const int* h_candidate_doc_ids,
-        const int* h_sel_indices,
-        const size_t* h_out_offsets,
-        int to_refine,
         const query_object* queries,
-        const float* ip_full_buf,
         std::pair<float, int>* refined_scores);
 };
