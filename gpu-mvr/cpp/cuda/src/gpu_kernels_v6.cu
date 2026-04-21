@@ -583,8 +583,6 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
-    const int*      __restrict__ d_doc_ptrs,
-    const int*      __restrict__ d_doc_block_lut,
     const int*      __restrict__ d_inv_list,
     float*       d_doc_query_max,
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
@@ -657,12 +655,7 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
         const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
             d_code + (size_t)orig_id * CODE_BYTES));
         const float factor = __ldg(&d_factor[orig_id]);
-        const int   doc_id = (d_doc_ids != nullptr)
-            ? __ldg(&d_doc_ids[orig_id])
-            : doc_id_from_doc_ptrs_blocked(
-                d_doc_ptrs,
-                d_doc_block_lut,
-                orig_id);
+        const int   doc_id = __ldg(&d_doc_ids[orig_id]);
 
         float ip = 0.0f;
         #pragma unroll
@@ -701,6 +694,132 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
                     &d_doc_query_max[(size_t)cid * Q_DOCLEN + query_idx],
                     group_max);
             }
+        }
+    }
+}
+
+__global__ void stage1_binary_ip_lut_nonclustered_docptr_kernel(
+    const float*    __restrict__ d_lut,
+    const char*     __restrict__ d_code,
+    const float*    __restrict__ d_factor,
+    const float*    __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_cagra_labels,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
+    const int*      __restrict__ d_doc_ptrs,
+    const int*      __restrict__ d_doc_block_lut,
+    const int*      __restrict__ d_inv_list,
+    float*       d_doc_query_max,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int          max_touched_docs,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+) {
+    __shared__ float    smem_lut[LUT_ENTRIES_PER_QUERY];
+    __shared__ uint32_t smem_cstart[STAGE1_MAX_NPROBE];
+    __shared__ int      smem_prefix[STAGE1_MAX_NPROBE + 1];
+
+    const int query_idx = blockIdx.y;
+    if (query_idx >= Q_DOCLEN) return;
+
+    const float* lut_ptr = d_lut + query_idx * LUT_ENTRIES_PER_QUERY;
+    for (int i = threadIdx.x; i < LUT_ENTRIES_PER_QUERY; i += blockDim.x) {
+        smem_lut[i] = lut_ptr[i];
+    }
+
+    const uint32_t* my_labels = d_cagra_labels + query_idx * nprobe;
+    for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
+        const uint32_t label = my_labels[p];
+        if (label < static_cast<uint32_t>(n_clusters)) {
+            const size_t start = static_cast<size_t>(d_cluster_pos[label]);
+            smem_cstart[p] = static_cast<uint32_t>(start);
+            smem_prefix[p + 1] =
+                static_cast<int>(static_cast<size_t>(d_cluster_pos[label + 1]) - start);
+        } else {
+            smem_cstart[p] = 0;
+            smem_prefix[p + 1] = 0;
+        }
+    }
+    if (threadIdx.x == 0) smem_prefix[0] = 0;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        for (int i = 1; i <= nprobe; i++) {
+            smem_prefix[i] += smem_prefix[i - 1];
+        }
+    }
+    __syncthreads();
+
+    const int total_elements = smem_prefix[nprobe];
+    const float cb1_sumq = d_cb1_sumq[query_idx];
+
+    for (int flat_idx = threadIdx.x + blockIdx.x * blockDim.x;
+         flat_idx < total_elements;
+         flat_idx += blockDim.x * gridDim.x) {
+        int lo = 0;
+        int hi = nprobe;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (smem_prefix[mid + 1] <= flat_idx) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        const uint32_t emb_pos = smem_cstart[lo] + (flat_idx - smem_prefix[lo]);
+        const uint32_t orig_id = static_cast<uint32_t>(__ldg(&d_inv_list[emb_pos]));
+
+        const uint4 code128 = __ldg(reinterpret_cast<const uint4*>(
+            d_code + static_cast<size_t>(orig_id) * CODE_BYTES));
+        const float factor = __ldg(&d_factor[orig_id]);
+
+        float ip = 0.0f;
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[n * LUT_SIZE + ((code128.x >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(8 + n) * LUT_SIZE + ((code128.y >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(16 + n) * LUT_SIZE + ((code128.z >> (n * 4)) & 0xF)];
+        #pragma unroll
+        for (int n = 0; n < 8; n++)
+            ip += smem_lut[(24 + n) * LUT_SIZE + ((code128.w >> (n * 4)) & 0xF)];
+
+        const float dist = (ip - cb1_sumq) * factor;
+        if (dist <= 0.0f) {
+            continue;
+        }
+
+        const int doc_id = doc_id_from_doc_ptrs_blocked(
+            d_doc_ptrs,
+            d_doc_block_lut,
+            orig_id);
+        if (static_cast<size_t>(doc_id) >= num_docs) {
+            continue;
+        }
+
+        const unsigned int active_mask = __activemask();
+        const unsigned int doc_group =
+            warp_matching_doc_mask(doc_id, active_mask);
+        const int lane = threadIdx.x & 31;
+        const int leader_lane = __ffs(doc_group) - 1;
+        const float group_max = warp_group_max(dist, doc_group, active_mask);
+
+        if (lane == leader_lane) {
+            const int cid = bitmap_compact_id(
+                d_doc_bitmap,
+                d_doc_bitmap_offsets,
+                doc_id);
+            if (cid < 0 || cid >= max_touched_docs) {
+                continue;
+            }
+
+            atomicMaxFloat(
+                &d_doc_query_max[static_cast<size_t>(cid) * Q_DOCLEN + query_idx],
+                group_max);
         }
     }
 }

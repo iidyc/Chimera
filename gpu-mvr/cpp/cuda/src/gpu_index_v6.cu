@@ -1549,27 +1549,42 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
         }
 
-        stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
-            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
-            ws_.d_cagra_labels, d_cluster_pos_,
-            d_doc_ids_,
-            d_doc_ptrs_,
-            d_doc_block_lut_,
-            d_inv_list_,
-            ws_.d_doc_query_max,
+        if (d_doc_ids_ != nullptr) {
+            stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
+                ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                ws_.d_cagra_labels, d_cluster_pos_,
+                d_doc_ids_,
+                d_inv_list_,
+                ws_.d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
-            ws_.d_doc_bitmap,
-            ws_.d_doc_bitmap_offsets,
-            h_num_touched,
+                ws_.d_doc_bitmap,
+                ws_.d_doc_bitmap_offsets,
+                h_num_touched,
 #else
-            ws_.d_doc_touched,
-            ws_.d_unique_doc_ids,
-            ws_.d_num_unique_docs,
+                ws_.d_doc_touched,
+                ws_.d_unique_doc_ids,
+                ws_.d_num_unique_docs,
 #endif
-            num_docs,
-            nprobe,
-            ivf->n_clusters
-        );
+                num_docs,
+                nprobe,
+                ivf->n_clusters
+            );
+        } else {
+            stage1_binary_ip_lut_nonclustered_docptr_kernel<<<grid, threads_per_block, 0, stream>>>(
+                ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                ws_.d_cagra_labels, d_cluster_pos_,
+                d_doc_ptrs_,
+                d_doc_block_lut_,
+                d_inv_list_,
+                ws_.d_doc_query_max,
+                ws_.d_doc_bitmap,
+                ws_.d_doc_bitmap_offsets,
+                h_num_touched,
+                num_docs,
+                nprobe,
+                ivf->n_clusters
+            );
+        }
         CUDA_CHECK(cudaGetLastError());
 
         if constexpr (kProfile) {
@@ -1747,21 +1762,36 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
         }
 
-        stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
-            ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
-            ws_.d_cagra_labels, d_cluster_pos_,
-            d_doc_ids_,
-            d_doc_ptrs_,
-            d_doc_block_lut_,
-            d_inv_list_,
-            ws_.d_doc_query_max,
-            ws_.d_doc_bitmap,
-            ws_.d_doc_bitmap_offsets,
-            h_num_touched,
-            num_docs,
-            nprobe,
-            ivf->n_clusters
-        );
+        if (d_doc_ids_ != nullptr) {
+            stage1_binary_ip_lut_nonclustered_kernel<<<grid, threads_per_block, 0, stream>>>(
+                ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                ws_.d_cagra_labels, d_cluster_pos_,
+                d_doc_ids_,
+                d_inv_list_,
+                ws_.d_doc_query_max,
+                ws_.d_doc_bitmap,
+                ws_.d_doc_bitmap_offsets,
+                h_num_touched,
+                num_docs,
+                nprobe,
+                ivf->n_clusters
+            );
+        } else {
+            stage1_binary_ip_lut_nonclustered_docptr_kernel<<<grid, threads_per_block, 0, stream>>>(
+                ws_.d_lut, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
+                ws_.d_cagra_labels, d_cluster_pos_,
+                d_doc_ptrs_,
+                d_doc_block_lut_,
+                d_inv_list_,
+                ws_.d_doc_query_max,
+                ws_.d_doc_bitmap,
+                ws_.d_doc_bitmap_offsets,
+                h_num_touched,
+                num_docs,
+                nprobe,
+                ivf->n_clusters
+            );
+        }
         CUDA_CHECK(cudaGetLastError());
 
         if constexpr (kProfile) {

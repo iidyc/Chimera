@@ -39,7 +39,7 @@ using stage2_token_id_t = size_t;
 using gpu_cluster_pos_t = size_t;
 #endif
 
-inline constexpr int kDocPtrLookupBlockShift = 10;
+inline constexpr int kDocPtrLookupBlockShift = 9;
 inline constexpr uint32_t kDocPtrLookupBlockSize =
     1u << kDocPtrLookupBlockShift;
 
@@ -108,6 +108,23 @@ __global__ void stage1_binary_ip_lut_nonclustered_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ids,
+    const int*      __restrict__ d_inv_list,
+    float*       d_doc_query_max,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int          max_touched_docs,
+    size_t       num_docs,
+    int          nprobe,
+    size_t       n_clusters
+);
+
+__global__ void stage1_binary_ip_lut_nonclustered_docptr_kernel(
+    const float*    __restrict__ d_lut,
+    const char*     __restrict__ d_code,
+    const float*    __restrict__ d_factor,
+    const float*    __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_cagra_labels,
+    const gpu_cluster_pos_t* __restrict__ d_cluster_pos,
     const int*      __restrict__ d_doc_ptrs,
     const int*      __restrict__ d_doc_block_lut,
     const int*      __restrict__ d_inv_list,
