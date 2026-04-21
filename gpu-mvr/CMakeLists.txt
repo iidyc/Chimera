@@ -59,6 +59,10 @@ option(GPU_MVR_V6_GPU_INDICES_U32
     "Use uint32_t GPU token/cluster indices in v6; limits total token count to 4,294,967,295"
     OFF)
 
+option(GPU_MVR_CPU_V2_STAGE1_PREPACK
+    "Prepack clustered Stage 1 data at startup for cpu_search_v2"
+    ON)
+
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
@@ -88,6 +92,22 @@ target_link_libraries(build PRIVATE gpu_mvr_core)
 add_executable(search cpp/app/search.cpp)
 target_link_libraries(search PRIVATE gpu_mvr_core)
 
+add_executable(cpu_search_v1
+    cpp/app/cpu_search_v1.cpp
+    cpp/src/cpu_kernel_v1.cpp
+)
+target_link_libraries(cpu_search_v1 PRIVATE gpu_mvr_core)
+
+add_executable(cpu_search_v2
+    cpp/app/cpu_search_v2.cpp
+    cpp/src/cpu_kernel_v2.cpp
+    cpp/src/cpu_kernel_v1.cpp
+)
+target_compile_definitions(cpu_search_v2 PRIVATE
+    GPU_MVR_CPU_V2_STAGE1_PREPACK=$<BOOL:${GPU_MVR_CPU_V2_STAGE1_PREPACK}>
+)
+target_link_libraries(cpu_search_v2 PRIVATE gpu_mvr_core)
+
 add_executable(test_gather cpp/app/test_gather.cpp)
 target_link_libraries(test_gather PRIVATE gpu_mvr_core)
 
@@ -96,6 +116,9 @@ target_link_libraries(test_dist_decomp PRIVATE gpu_mvr_core)
 
 add_executable(build_cagra cpp/app/build_cagra.cpp)
 target_link_libraries(build_cagra PRIVATE gpu_mvr_core)
+
+add_executable(build_hnsw_from_cagra cpp/app/build_hnsw_from_cagra.cpp)
+target_link_libraries(build_hnsw_from_cagra PRIVATE gpu_mvr_core)
 
 add_executable(gpu_search
     cpp/app/gpu_search.cu

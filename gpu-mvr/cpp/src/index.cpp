@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <queue>
@@ -484,6 +485,10 @@ void cpu_mvr_index::load(const std::string& filename) {
         exit(0);
     } else {
         ivf = new IVF_PG(n_clusters, d);
-        ivf->load(resolved_paths.ivf_path, resolved_paths.centroids_path);
+        std::string centroid_graph_path = resolved_paths.centroids_hnsw_path;
+        if (centroid_graph_path.empty() || !std::filesystem::exists(centroid_graph_path)) {
+            centroid_graph_path = resolved_paths.centroids_path;
+        }
+        ivf->load(resolved_paths.ivf_path, centroid_graph_path);
     }
 }

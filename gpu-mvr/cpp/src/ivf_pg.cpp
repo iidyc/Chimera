@@ -57,6 +57,10 @@ PG_HNSW::~PG_HNSW() {
     delete hnsw_index;
 }
 
+size_t PG_HNSW::search_ef_for_k(size_t k) {
+    return std::clamp<size_t>(2 * k, 64, 768);
+}
+
 void PG_HNSW::build_index(const float* data) {
 #pragma omp parallel for
     for (size_t i = 0; i < n; ++i) {
@@ -65,7 +69,7 @@ void PG_HNSW::build_index(const float* data) {
 }
 
 void PG_HNSW::search(const float* query, size_t k, std::vector<size_t>& results) {
-    hnsw_index->setEf(std::max(768UL, 2 * k));
+    hnsw_index->setEf(search_ef_for_k(k));
     auto result = hnsw_index->searchKnn(query, k);
     while (!result.empty()) {
         results.push_back(result.top().second);

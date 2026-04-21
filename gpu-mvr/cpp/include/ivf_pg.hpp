@@ -38,6 +38,8 @@ struct PG_HNSW : PG {
     PG_HNSW(size_t n, size_t d);
     ~PG_HNSW() override;
 
+    static size_t search_ef_for_k(size_t k);
+
     void build_index(const float* data) override;
     void search(const float* query, size_t k, std::vector<size_t>& results) override;
     void save(const std::string& filename) const override;

@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "cpu_aligned_allocator.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 #include "estimator.hpp"
 #include "ivf_pg.hpp"
@@ -23,7 +24,7 @@ struct cpu_mvr_index {
     IVFType ivf_type_ = IVFType::PG;
     IVF_PG* ivf = nullptr;
 
-    std::vector<char> one_bit_code_;
+    aligned_vector_64<char> one_bit_code_;
     std::vector<char> ex_code_;
     std::vector<float> one_bit_factor_;
     std::vector<float> ex_factor_;
