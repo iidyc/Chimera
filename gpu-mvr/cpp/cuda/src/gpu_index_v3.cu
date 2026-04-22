@@ -185,8 +185,10 @@ gpu_mvr_index::gpu_mvr_index(
     //           << (total_mem - free_mem) / (1024.0 * 1024.0) << " MB / "
     //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
 
+#ifndef GPU_MVR_V3_SKIP_WORKSPACE_ALLOC
     allocate_workspace();
     startup.mark("allocate_workspace");
+#endif
 
     // Load the persisted cluster-ordered GPU index. Stage-1 and stage-2 both
     // depend on this layout in v3.

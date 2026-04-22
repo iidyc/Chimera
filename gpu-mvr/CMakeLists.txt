@@ -157,6 +157,40 @@ set_target_properties(gpu_search_v3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_definitions(gpu_search_v3 PRIVATE GPU_MVR_IMPL_NAME=\"v3\")
 target_link_libraries(gpu_search_v3 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
+add_executable(gpu_search_v7
+    cpp/app/gpu_search_v7.cu
+    cpp/cuda/src/gpu_index_v7.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v7.cu
+)
+target_include_directories(gpu_search_v7 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v7 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v7 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v7\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+)
+target_link_libraries(gpu_search_v7 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
+add_executable(gpu_search_v8
+    cpp/app/gpu_search_v8.cu
+    cpp/cuda/src/gpu_index_v8.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v8.cu
+)
+target_include_directories(gpu_search_v8 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v8 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v8 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v8\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+)
+target_link_libraries(gpu_search_v8 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
 function(add_gpu_search_v4_nonclustered_target target_name impl_name)
     add_executable(${target_name}
         cpp/app/gpu_search_v4.cu
