@@ -15,6 +15,7 @@ inline constexpr char kDoclensFilename[] = "doclens.bin";
 inline constexpr char kMetadataFilename[] = "index_metadata.json";
 inline constexpr char kCpuIndexFilename[] = "cpu_index.bin";
 inline constexpr char kCentroidsFilename[] = "centroids.carga";
+inline constexpr char kCentroidsHnswFilename[] = "centroids.hnsw";
 inline constexpr char kGpuIndexFilename[] = "gpu_index.bin";
 
 struct ResolvedPaths {
@@ -23,6 +24,7 @@ struct ResolvedPaths {
     std::string doc_4bit_ex_path;
     std::string ivf_path;
     std::string centroids_path;
+    std::string centroids_hnsw_path;
     std::string gpu_index_path;
     std::string metadata_path;
 };
@@ -63,6 +65,10 @@ inline std::string centroids_path(const std::string& index_dir) {
     return (std::filesystem::path(index_dir) / kCentroidsFilename).string();
 }
 
+inline std::string centroids_hnsw_path(const std::string& index_dir) {
+    return (std::filesystem::path(index_dir) / kCentroidsHnswFilename).string();
+}
+
 inline std::string gpu_index_path(const std::string& index_dir) {
     return (std::filesystem::path(index_dir) / kGpuIndexFilename).string();
 }
@@ -90,6 +96,7 @@ inline ResolvedPaths resolve_index_paths(const std::string& path) {
             doc_4bit_ex_path(index_dir),
             ivf_path(index_dir),
             centroids_path(index_dir),
+            centroids_hnsw_path(index_dir),
             cluster_1bit_path(index_dir),
             metadata_path(index_dir),
         };
@@ -103,6 +110,7 @@ inline ResolvedPaths resolve_index_paths(const std::string& path) {
             doc_4bit_ex_path(index_dir),
             ivf_path(index_dir),
             centroids_path(index_dir),
+            centroids_hnsw_path(index_dir),
             cluster_1bit_path(index_dir),
             metadata_path(index_dir),
         };

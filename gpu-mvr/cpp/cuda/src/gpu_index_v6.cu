@@ -1,6 +1,7 @@
 #include "gpu_index_v6.cuh"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -23,6 +24,10 @@
 #endif
 
 namespace {
+
+constexpr size_t kCompactDocRowAlignment = 1u << 16;  // 65536 rows
+constexpr size_t kCompactDocMinSlackRows = 1u << 15;  // 32768 rows
+constexpr size_t kCompactDocBufferAlignment = 128;
 
 size_t sum_top_sorted_counts(std::vector<size_t>& counts, size_t top_n) {
     if (counts.empty() || top_n == 0) {
@@ -83,16 +88,57 @@ size_t align_up(size_t value, size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
+char* align_up_ptr(char* ptr, size_t alignment) {
+    const auto addr = reinterpret_cast<uintptr_t>(ptr);
+    const auto aligned = align_up(addr, alignment);
+    return reinterpret_cast<char*>(aligned);
+}
+
+size_t initial_compact_doc_capacity(
+    size_t num_tokens,
+    size_t num_clusters,
+    size_t max_nprobe,
+    size_t max_compact_docs) {
+    if (max_compact_docs == 0 || num_clusters == 0 || max_nprobe == 0) {
+        return 1;
+    }
+
+    const size_t avg_cluster_tokens =
+        std::max<size_t>(1, (num_tokens + num_clusters - 1) / num_clusters);
+
+    size_t estimate = avg_cluster_tokens;
+    if (estimate > std::numeric_limits<size_t>::max() / max_nprobe) {
+        estimate = max_compact_docs;
+    } else {
+        estimate *= max_nprobe;
+    }
+
+    if (estimate > std::numeric_limits<size_t>::max() / 4) {
+        estimate = max_compact_docs;
+    } else {
+        estimate *= 4;
+    }
+
+    estimate = std::min(max_compact_docs, estimate);
+    estimate = std::min(max_compact_docs, align_up(estimate, kCompactDocRowAlignment));
+    return std::max<size_t>(estimate, 1);
+}
+
 size_t grow_compact_doc_capacity(size_t current, size_t required, size_t limit) {
-    constexpr size_t kRowAlignment = 1u << 16;   // 65536 rows
-    constexpr size_t kMinSlackRows = 1u << 15;   // 32768 rows
-    const size_t aligned_required = align_up(std::max(required, size_t{1}), kRowAlignment);
-    const size_t required_slack = std::max(required / 16, kMinSlackRows);   // ~6.25%
-    const size_t current_slack = std::max(current / 8, kMinSlackRows);      // ~12.5%
+    const size_t aligned_required =
+        align_up(std::max(required, size_t{1}), kCompactDocRowAlignment);
+    const size_t required_slack =
+        std::max(required / 16, kCompactDocMinSlackRows);   // ~6.25%
+    const size_t current_slack =
+        std::max(current / 8, kCompactDocMinSlackRows);      // ~12.5%
     size_t target = aligned_required;
-    target = std::max(target, align_up(required + required_slack, kRowAlignment));
+    target = std::max(
+        target,
+        align_up(required + required_slack, kCompactDocRowAlignment));
     if (current > 0) {
-        target = std::max(target, align_up(current + current_slack, kRowAlignment));
+        target = std::max(
+            target,
+            align_up(current + current_slack, kCompactDocRowAlignment));
     }
     return std::min(limit, target);
 }
@@ -100,21 +146,30 @@ size_t grow_compact_doc_capacity(size_t current, size_t required, size_t limit) 
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
 size_t compact_doc_arena_bytes(size_t row_capacity, size_t topk_capacity) {
     size_t offset = 0;
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     offset += row_capacity * sizeof(int);     // d_sorted_doc_ids
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     offset += row_capacity * sizeof(int);     // d_unique_doc_ids
-    offset = align_up(offset, alignof(float));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     offset += row_capacity * sizeof(float);   // d_stage1_doc_scores
-    offset = align_up(offset, alignof(float));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     offset += row_capacity * Q_DOCLEN * sizeof(float);  // d_doc_query_max
-    offset = align_up(offset, alignof(float));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     offset += topk_capacity * sizeof(float);  // d_topk_scores
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     offset += topk_capacity * sizeof(int);    // d_topk_doc_ids
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     offset += topk_capacity * sizeof(int);    // d_topk_indices
     return offset;
+}
+
+void check_compact_doc_alignment(const void* ptr, const char* name) {
+    const auto addr = reinterpret_cast<uintptr_t>(ptr);
+    if (addr % kCompactDocBufferAlignment != 0) {
+        throw std::runtime_error(
+            std::string("Compact doc buffer ") + name +
+            " is not 128-byte aligned");
+    }
 }
 
 void bind_compact_doc_arena(
@@ -123,26 +178,35 @@ void bind_compact_doc_arena(
     size_t row_capacity,
     size_t topk_capacity) {
     size_t offset = 0;
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     ws.d_sorted_doc_ids = reinterpret_cast<int*>(base + offset);
     offset += row_capacity * sizeof(int);
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     ws.d_unique_doc_ids = reinterpret_cast<int*>(base + offset);
     offset += row_capacity * sizeof(int);
-    offset = align_up(offset, alignof(float));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     ws.d_stage1_doc_scores = reinterpret_cast<float*>(base + offset);
     offset += row_capacity * sizeof(float);
-    offset = align_up(offset, alignof(float));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     ws.d_doc_query_max = reinterpret_cast<float*>(base + offset);
     offset += row_capacity * Q_DOCLEN * sizeof(float);
-    offset = align_up(offset, alignof(float));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     ws.d_topk_scores = reinterpret_cast<float*>(base + offset);
     offset += topk_capacity * sizeof(float);
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     ws.d_topk_doc_ids = reinterpret_cast<int*>(base + offset);
     offset += topk_capacity * sizeof(int);
-    offset = align_up(offset, alignof(int));
+    offset = align_up(offset, kCompactDocBufferAlignment);
     ws.d_topk_indices = reinterpret_cast<int*>(base + offset);
+
+    check_compact_doc_alignment(base, "base");
+    check_compact_doc_alignment(ws.d_sorted_doc_ids, "d_sorted_doc_ids");
+    check_compact_doc_alignment(ws.d_unique_doc_ids, "d_unique_doc_ids");
+    check_compact_doc_alignment(ws.d_stage1_doc_scores, "d_stage1_doc_scores");
+    check_compact_doc_alignment(ws.d_doc_query_max, "d_doc_query_max");
+    check_compact_doc_alignment(ws.d_topk_scores, "d_topk_scores");
+    check_compact_doc_alignment(ws.d_topk_doc_ids, "d_topk_doc_ids");
+    check_compact_doc_alignment(ws.d_topk_indices, "d_topk_indices");
 }
 #endif
 
@@ -725,7 +789,11 @@ void gpu_mvr_index::allocate_workspace() {
     ws_.doc_bitmap_bucket_count = doc_bitmap_num_buckets(num_docs);
     ws_.doc_bitmap_offset_count =
         doc_bitmap_num_offsets(ws_.doc_bitmap_bucket_count);
-    ws_.compact_doc_capacity = 1;
+    ws_.compact_doc_capacity = initial_compact_doc_capacity(
+        n,
+        n_clusters,
+        workspace_probe_cluster_bound_,
+        ws_.max_compact_docs);
     const size_t doc_buf_rows = ws_.compact_doc_capacity;
 
     std::cout << "max cluster size: " << max_cluster_size << std::endl;
@@ -739,7 +807,8 @@ void gpu_mvr_index::allocate_workspace() {
               << "  (num_docs=" << num_docs << ")" << std::endl;
     std::cout << "initial_compact_doc_capacity: "
               << ws_.compact_doc_capacity
-              << "  (grows to observed touched docs)" << std::endl;
+              << "  (4 * avg_cluster_tokens * max_nprobe, then grows to observed touched docs)"
+              << std::endl;
     std::cout << "workspace_stage2_candidate_token_bound: "
               << ws_.max_stage2_tokens << std::endl;
     std::cout << "workspace_stage2_topk_token_bound: "
@@ -891,6 +960,7 @@ void gpu_mvr_index::allocate_workspace() {
     //           << (total_mem / (1024.0 * 1024.0)) << " MB\n";
 
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
+    ws_.d_compact_doc_buffer_raw = nullptr;
     ws_.d_compact_doc_buffer = nullptr;
     ws_.compact_doc_buffer_bytes = 0;
     ws_.compact_doc_capacity = 0;
@@ -1082,10 +1152,15 @@ void gpu_mvr_index::ensure_compact_doc_capacity(size_t required_rows) {
               << grown_rows << " rows"
               << " (required=" << required_rows << ")" << std::endl;
 
-    CUDA_CHECK(cudaFree(ws_.d_compact_doc_buffer));
+    CUDA_CHECK(cudaFree(ws_.d_compact_doc_buffer_raw));
+    ws_.d_compact_doc_buffer_raw = nullptr;
     ws_.d_compact_doc_buffer = nullptr;
     ws_.compact_doc_buffer_bytes = required_buffer_bytes;
-    CUDA_CHECK(cudaMalloc(&ws_.d_compact_doc_buffer, ws_.compact_doc_buffer_bytes));
+    CUDA_CHECK(cudaMalloc(
+        &ws_.d_compact_doc_buffer_raw,
+        ws_.compact_doc_buffer_bytes + kCompactDocBufferAlignment - 1));
+    ws_.d_compact_doc_buffer =
+        align_up_ptr(ws_.d_compact_doc_buffer_raw, kCompactDocBufferAlignment);
     bind_compact_doc_arena(
         ws_, ws_.d_compact_doc_buffer, grown_rows, required_topk_capacity);
 
@@ -2591,7 +2666,7 @@ gpu_mvr_index::~gpu_mvr_index() {
 
     CUDA_CHECK(cudaFree(ws_.d_num_unique_docs));
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    CUDA_CHECK(cudaFree(ws_.d_compact_doc_buffer));
+    CUDA_CHECK(cudaFree(ws_.d_compact_doc_buffer_raw));
     CUDA_CHECK(cudaFree(ws_.d_doc_bitmap));
     CUDA_CHECK(cudaFree(ws_.d_doc_bitmap_offsets));
 #else

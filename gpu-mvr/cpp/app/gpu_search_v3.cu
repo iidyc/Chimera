@@ -66,7 +66,12 @@ int main(int argc, char** argv) {
         gpu_memory.sample("config_begin:" + runtime_config.label);
 
         for (int i = 0; i < warmup_queries; ++i) {
-            index.search_profiled(&Q[i * Q_DOCLEN * d], args.k);
+            const float* query_ptr = &Q[i * Q_DOCLEN * d];
+            if (i + 1 == warmup_queries) {
+                index.search_profiled(query_ptr, args.k);
+            } else {
+                index.search(query_ptr, args.k);
+            }
             gpu_memory.sample_query_if_needed(
                 "warmup:" + runtime_config.label,
                 static_cast<size_t>(i),

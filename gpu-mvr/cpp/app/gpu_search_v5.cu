@@ -135,7 +135,12 @@ int main(int argc, char** argv) {
         const auto warmup_start = std::chrono::steady_clock::now();
         auto warmup_last_log = warmup_start;
         for (int i = 0; i < warmup_queries; ++i) {
-            index.search_profiled(&Q[i * Q_DOCLEN * d], args.k);
+            const float* query_ptr = &Q[i * Q_DOCLEN * d];
+            if (i + 1 == warmup_queries) {
+                index.search_profiled(query_ptr, args.k);
+            } else {
+                index.search(query_ptr, args.k);
+            }
             maybe_print_phase_progress(
                 runtime_config.label,
                 "warmup",

@@ -172,6 +172,7 @@ struct gpu_mvr_index {
         size_t  doc_bitmap_offset_count;
         size_t  max_compact_docs;    // conservative estimate for unique docs
         size_t  compact_doc_capacity;
+        char*   d_compact_doc_buffer_raw;
         char*   d_compact_doc_buffer;
         size_t  compact_doc_buffer_bytes;
 #else

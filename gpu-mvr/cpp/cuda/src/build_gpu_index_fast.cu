@@ -588,7 +588,8 @@ void write_optional_u64_json(
 void write_index_metadata_json(
     const std::string& index_dir,
     const mvr_index_file_format::Header& header,
-    const BuildMetadataOptions& options)
+    const BuildMetadataOptions& options,
+    int max_cluster_size_tokens)
 {
     validate_output_sizes(index_dir, header);
 
@@ -610,16 +611,22 @@ void write_index_metadata_json(
 
     const auto doc_1bit_path = gpu_index_layout::doc_1bit_path(index_dir);
     const auto doc_4bit_path = gpu_index_layout::doc_4bit_path(index_dir);
+    const auto doc_4bit_ex_path = gpu_index_layout::doc_4bit_ex_path(index_dir);
     const auto cluster_1bit_path = gpu_index_layout::cluster_1bit_path(index_dir);
     const auto ivf_path = gpu_index_layout::ivf_path(index_dir);
     const auto centroids_path = gpu_index_layout::centroids_path(index_dir);
+    const auto centroids_hnsw_path = gpu_index_layout::centroids_hnsw_path(index_dir);
     const auto doclens_path = gpu_index_layout::doclens_path(index_dir);
+    auto ex_sidecar_header = header;
+    ex_sidecar_header.ex_bits = 4;
 
     const auto one_bit_code_bytes = mvr_index_file_format::one_bit_code_bytes(header);
     const auto one_bit_factor_bytes = mvr_index_file_format::one_bit_factor_bytes(header);
     const auto ex_factor_bytes = mvr_index_file_format::ex_factor_bytes(header);
     const auto full_code_bytes = mvr_index_file_format::full_code_bytes(header);
+    const auto legacy_ex_code_bytes = mvr_index_file_format::legacy_ex_code_bytes(ex_sidecar_header);
     const auto doc_prefix_bytes = mvr_index_file_format::prefix_bytes(header);
+    const auto doc_4bit_ex_prefix_bytes = mvr_index_file_format::prefix_bytes(ex_sidecar_header);
     const auto cluster_prefix_bytes = clustered_stage1_file_format::prefix_bytes(cluster_header);
     const auto cluster_code_bytes = header.n * cluster_header.code_bytes_per_vector;
     const auto cluster_factor_bytes = header.n * sizeof(float);
@@ -646,6 +653,7 @@ void write_index_metadata_json(
         << "  \"n_clusters\": " << header.n_clusters << ",\n"
         << "  \"ex_bits\": " << header.ex_bits << ",\n"
         << "  \"padded_dim\": " << header.padded_dim << ",\n"
+        << "  \"max_cluster_size_tokens\": " << max_cluster_size_tokens << ",\n"
         << "  \"raw_embedding_bytes\": " << (header.n * header.d * sizeof(float)) << ",\n"
         << "  \"rotator_type\": \"" << mvr_index_file_format::rotator_type_name(header.rotator_type) << "\",\n"
         << "  \"rotator_serialized_bytes\": " << mvr_index_file_format::rotator_bytes(header) << ",\n"
@@ -677,6 +685,17 @@ void write_index_metadata_json(
         << "      \"full_code_offset_bytes\": " << doc_prefix_bytes << ",\n"
         << "      \"full_code_bytes\": " << full_code_bytes << "\n"
         << "    },\n"
+        << "    \"doc_4bit_ex\": {\n"
+        << "      \"filename\": \"" << gpu_index_layout::kDoc4BitExFilename << "\",\n"
+        << "      \"size_bytes\": " << file_size_or_zero(doc_4bit_ex_path) << ",\n"
+        << "      \"prefix_bytes\": " << doc_4bit_ex_prefix_bytes << ",\n"
+        << "      \"ex_bits\": 4,\n"
+        << "      \"ex_code_offset_bytes\": " << doc_4bit_ex_prefix_bytes << ",\n"
+        << "      \"ex_code_bytes\": " << legacy_ex_code_bytes << ",\n"
+        << "      \"ex_factor_offset_bytes\": " << (doc_4bit_ex_prefix_bytes + legacy_ex_code_bytes) << ",\n"
+        << "      \"ex_factor_bytes\": " << mvr_index_file_format::ex_factor_bytes(ex_sidecar_header) << ",\n"
+        << "      \"content\": \"original-order residual ex-bit sidecar for CPU reranking\"\n"
+        << "    },\n"
         << "    \"cluster_1bit\": {\n"
         << "      \"filename\": \"" << gpu_index_layout::kCluster1BitFilename << "\",\n"
         << "      \"size_bytes\": " << file_size_or_zero(cluster_1bit_path) << ",\n"
@@ -702,6 +721,11 @@ void write_index_metadata_json(
         << "      \"filename\": \"" << gpu_index_layout::kCentroidsFilename << "\",\n"
         << "      \"size_bytes\": " << file_size_or_zero(centroids_path) << ",\n"
         << "      \"content\": \"persisted rotated centroid graph backing IVF_PG\"\n"
+        << "    },\n"
+        << "    \"centroids_hnsw\": {\n"
+        << "      \"filename\": \"" << gpu_index_layout::kCentroidsHnswFilename << "\",\n"
+        << "      \"size_bytes\": " << file_size_or_zero(centroids_hnsw_path) << ",\n"
+        << "      \"content\": \"hnswlib HNSW index for the centroid set when available\"\n"
         << "    }\n"
         << "  }\n"
         << "}\n";
@@ -714,7 +738,9 @@ void write_index_metadata_json(
 void copy_split_quantized_layout_fast(
     const gpu_index_layout::ResolvedPaths& source_paths,
     const std::string& target_doc_1bit_path,
-    const std::string& target_doc_4bit_path)
+    const std::string& target_doc_4bit_path,
+    const std::string& target_doc_4bit_ex_path,
+    const std::string& target_centroids_hnsw_path)
 {
     if (source_paths.doc_4bit_path.empty())
     {
@@ -734,6 +760,24 @@ void copy_split_quantized_layout_fast(
         std::filesystem::copy_file(
             source_paths.doc_4bit_path,
             target_doc_4bit_path,
+            std::filesystem::copy_options::overwrite_existing);
+    }
+    if (!source_paths.doc_4bit_ex_path.empty() &&
+        std::filesystem::exists(source_paths.doc_4bit_ex_path) &&
+        source_paths.doc_4bit_ex_path != target_doc_4bit_ex_path)
+    {
+        std::filesystem::copy_file(
+            source_paths.doc_4bit_ex_path,
+            target_doc_4bit_ex_path,
+            std::filesystem::copy_options::overwrite_existing);
+    }
+    if (!source_paths.centroids_hnsw_path.empty() &&
+        std::filesystem::exists(source_paths.centroids_hnsw_path) &&
+        source_paths.centroids_hnsw_path != target_centroids_hnsw_path)
+    {
+        std::filesystem::copy_file(
+            source_paths.centroids_hnsw_path,
+            target_centroids_hnsw_path,
             std::filesystem::copy_options::overwrite_existing);
     }
 }
@@ -1111,6 +1155,7 @@ void build_index_fast(
     ivf->pg_index = pg_cagra.release();
     ivf->build_from_assignments(list_nos.data(), n);
     ivf->save(ivf_path, centroids_path);
+    const int max_cluster_size_tokens = ivf->max_cluster_size();
     centroids.clear();
     centroids.shrink_to_fit();
     rotated_centroids.clear();
@@ -1119,7 +1164,8 @@ void build_index_fast(
     const auto step4_end = Clock::now();
     std::cout << "[build_fast] Step 4 done in "
               << format_elapsed(elapsed_ms(step4_start, step4_end))
-              << ". IVF_PG assembled and saved." << std::endl;
+              << ". IVF_PG assembled and saved. max_cluster_size_tokens="
+              << max_cluster_size_tokens << "." << std::endl;
 
     std::cout << "[build_fast] Step 5: Writing quantized payloads to disk ..." << std::endl;
     const auto step5_start = Clock::now();
@@ -1141,7 +1187,7 @@ void build_index_fast(
     metadata_options.centroid_sample_seed = kDefaultCentroidSampleSeed;
     metadata_options.rotator_seed = kDefaultRotatorSeed;
     build_clustered_stage1_sidecar_fast(doc_lens, index_dir, index_dir);
-    write_index_metadata_json(index_dir, header, metadata_options);
+    write_index_metadata_json(index_dir, header, metadata_options, max_cluster_size_tokens);
     const auto step6_end = Clock::now();
     std::cout << "[build_fast] Step 6 done in "
               << format_elapsed(elapsed_ms(step6_start, step6_end))
@@ -1181,10 +1227,16 @@ void build_clustered_stage1_sidecar_fast(
             gpu_index_layout::doc_4bit_path(index_dir), cleanup_ec);
         cleanup_ec.clear();
         std::filesystem::remove(
+            gpu_index_layout::doc_4bit_ex_path(index_dir), cleanup_ec);
+        cleanup_ec.clear();
+        std::filesystem::remove(
             gpu_index_layout::metadata_path(index_dir), cleanup_ec);
         cleanup_ec.clear();
         std::filesystem::remove(
             gpu_index_layout::cpu_index_path(index_dir), cleanup_ec);
+        cleanup_ec.clear();
+        std::filesystem::remove(
+            gpu_index_layout::centroids_hnsw_path(index_dir), cleanup_ec);
     }
     std::filesystem::remove(
         gpu_index_layout::cluster_1bit_path(index_dir), cleanup_ec);
@@ -1198,8 +1250,10 @@ void build_clustered_stage1_sidecar_fast(
 
     const auto target_doc_1bit_path = gpu_index_layout::doc_1bit_path(index_dir);
     const auto target_doc_4bit_path = gpu_index_layout::doc_4bit_path(index_dir);
+    const auto target_doc_4bit_ex_path = gpu_index_layout::doc_4bit_ex_path(index_dir);
     const auto target_ivf_path = gpu_index_layout::ivf_path(index_dir);
     const auto target_centroids_path = gpu_index_layout::centroids_path(index_dir);
+    const auto target_centroids_hnsw_path = gpu_index_layout::centroids_hnsw_path(index_dir);
     const auto target_clustered_stage1_path = gpu_index_layout::cluster_1bit_path(index_dir);
 
     std::cout << "[build_fast] Sidecar mode: cloning base index from "
@@ -1209,7 +1263,9 @@ void build_clustered_stage1_sidecar_fast(
     copy_split_quantized_layout_fast(
         source_paths,
         target_doc_1bit_path,
-        target_doc_4bit_path);
+        target_doc_4bit_path,
+        target_doc_4bit_ex_path,
+        target_centroids_hnsw_path);
     if (source_ivf_path != target_ivf_path)
     {
         std::filesystem::copy_file(
@@ -1248,6 +1304,7 @@ void build_clustered_stage1_sidecar_fast(
 
     IVF_PG ivf(header.n_clusters, header.d, PGType::CAGRA);
     ivf.load(target_ivf_path, target_centroids_path);
+    const int max_cluster_size_tokens = ivf.max_cluster_size();
     if (ivf.inv_list.size() != n)
     {
         throw std::runtime_error(
@@ -1324,7 +1381,7 @@ void build_clustered_stage1_sidecar_fast(
     {
         metadata_options.rotator_seed = rotator->seed();
     }
-    write_index_metadata_json(index_dir, header, metadata_options);
+    write_index_metadata_json(index_dir, header, metadata_options, max_cluster_size_tokens);
 
     std::cout << "[build_fast] cluster_1bit.bin generated in "
               << format_elapsed(elapsed_ms(sidecar_start, Clock::now())) << std::endl;

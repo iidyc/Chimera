@@ -176,7 +176,7 @@ If your shell exports a conflicting `CPATH` from another toolchain, unset it bef
 If you only need specific binaries:
 
 ```bash
-cmake --build build --target gpu_build gpu_search gpu_search_v0 gpu_search_v1 gpu_search_v2 gpu_search_v3 -j 4
+cmake --build build --target gpu_build gpu_search gpu_search_v0 gpu_search_v1 gpu_search_v2 gpu_search_v3 build_cagra build_hnsw_from_cagra -j 4
 ```
 
 This direct configure command replaces the removed `cmake.sh` wrapper.
@@ -213,9 +213,13 @@ Arguments:
 Output:
 
 - `<index_dir>/ivf.bin`
-- `<index_dir>/cpu_index.bin`
-- `<index_dir>/gpu_index.bin`
+- `<index_dir>/doc_1bit.bin`
+- `<index_dir>/doc_4bit.bin`
+- `<index_dir>/doc_4bit_ex.bin`
+- `<index_dir>/cluster_1bit.bin`
+- `<index_dir>/index_metadata.json`
 - `<index_dir>/centroids.carga`
+- `<index_dir>/centroids.hnsw`
 
 Example:
 
@@ -232,7 +236,9 @@ Operational notes:
 - This is the primary build binary for the current GPU index format.
 - It memory-maps the embedding file instead of loading the whole dataset eagerly.
 - It currently fixes `ex_bits = 3` in the app wrapper.
-- Search binaries can be pointed either at the index directory or directly at `cpu_index.bin`.
+- It also writes a separate `doc_4bit_ex.bin` residual sidecar with `ex_bits = 4`.
+- The `hnswlib` centroid graph is built directly from the in-memory rotated centroids during the build; it does not need to round-trip through `centroids.carga`.
+- Within each cluster, `cluster_1bit.bin` already follows original token order, which is equivalent to doc-id then token-id order for natural document packing.
 
 ### `gpu_search`
 
@@ -403,6 +409,32 @@ Notes:
 
 - This writes `<graph_prefix>.cagra`.
 - It is a helper utility, not the main end-to-end build path.
+
+### `build_hnsw_from_cagra`
+
+Source: [cpp/app/build_hnsw_from_cagra.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/build_hnsw_from_cagra.cpp)
+
+Purpose:
+
+- Deserialize a persisted `centroids.carga` CAGRA graph with cuVS.
+- Read the centroid embeddings stored in that index.
+- Rebuild an `hnswlib` HNSW index from those centroid embeddings.
+
+CLI:
+
+```bash
+./build/build_hnsw_from_cagra \
+  --input <index_dir>/centroids.carga \
+  --output <index_dir>/centroids.hnsw \
+  [--M 16] \
+  [--ef-construction 500] \
+  [--batch-rows 65536]
+```
+
+Notes:
+
+- `gpu_build` now emits `centroids.hnsw` directly as part of the normal build path.
+- This helper still exists for rebuilding the HNSW artifact from an existing `centroids.carga`.
 
 ### `test_gather`
 

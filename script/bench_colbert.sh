@@ -494,7 +494,7 @@ benchmark_dataset() {
 
     if [[ $dry_run -eq 0 ]]; then
         printf '%s\n' \
-            "implementation,dataset,label,ncells,ndocs,index_source,index_root,index_path,query_file,gt_file,queries,k,num_runs,avg_time_s,qps,recall" \
+            "implementation,dataset,label,ncells,ndocs,index_source,index_root,index_path,query_file,gt_file,queries,k,num_runs,avg_time_s,qps,recall,gpu_mem_current_mib,gpu_mem_peak_mib,gpu_mem_total_mib,torch_peak_allocated_mib,torch_peak_reserved_mib" \
             > "$results_csv"
     fi
 
@@ -549,21 +549,34 @@ benchmark_dataset() {
     local -A avg_time_by_pair=()
     local -A qps_by_pair=()
     local -A recall_by_pair=()
+    local -A gpu_mem_current_by_pair=()
+    local -A gpu_mem_peak_by_pair=()
+    local -A gpu_mem_total_by_pair=()
+    local -A torch_peak_allocated_by_pair=()
+    local -A torch_peak_reserved_by_pair=()
     local parsed_ncells=""
     local parsed_ndocs=""
     local avg_time_s=""
+    local parsed_qps=""
     local recall=""
-    local qps=""
+    local gpu_mem_current_mib=""
+    local gpu_mem_peak_mib=""
+    local gpu_mem_total_mib=""
+    local torch_peak_allocated_mib=""
+    local torch_peak_reserved_mib=""
 
-    while IFS=, read -r parsed_ncells parsed_ndocs avg_time_s recall; do
+    while IFS=, read -r parsed_ncells parsed_ndocs avg_time_s parsed_qps recall gpu_mem_current_mib gpu_mem_peak_mib gpu_mem_total_mib torch_peak_allocated_mib torch_peak_reserved_mib; do
+        [[ "$parsed_ncells" == "ncells" ]] && continue
         local pair_key="${parsed_ncells},${parsed_ndocs}"
-        qps="$(awk -v t="$avg_time_s" 'BEGIN { if (t > 0.0) printf "%.6f", 1.0 / t; else printf "0.000000" }')"
         avg_time_by_pair["$pair_key"]="$avg_time_s"
-        qps_by_pair["$pair_key"]="$qps"
+        qps_by_pair["$pair_key"]="$parsed_qps"
         recall_by_pair["$pair_key"]="$recall"
-    done < <(
-        sed -nE 's/^ncells=([0-9]+) ndocs=([0-9]+) avg_time=([0-9.]+)s recall@[0-9]+=([0-9.]+)$/\1,\2,\3,\4/p' "$run_output"
-    )
+        gpu_mem_current_by_pair["$pair_key"]="$gpu_mem_current_mib"
+        gpu_mem_peak_by_pair["$pair_key"]="$gpu_mem_peak_mib"
+        gpu_mem_total_by_pair["$pair_key"]="$gpu_mem_total_mib"
+        torch_peak_allocated_by_pair["$pair_key"]="$torch_peak_allocated_mib"
+        torch_peak_reserved_by_pair["$pair_key"]="$torch_peak_reserved_mib"
+    done < "$search_py_output_csv"
 
     local idx=0
     local label=""
@@ -579,7 +592,7 @@ benchmark_dataset() {
         [[ -n "${avg_time_by_pair[$pair_key]-}" ]] || die "missing ColBERT output for pair ${pair_key}"
 
         printf '%s\n' \
-            "${implementation_label},${dataset_name},${label},${ncells},${ndocs},${index_source},${active_root_path},${active_experiment_dir}/indexes/${active_index_name},${query_file},${gt_file},${query_count},${k},3,${avg_time_by_pair[$pair_key]},${qps_by_pair[$pair_key]},${recall_by_pair[$pair_key]}" \
+            "${implementation_label},${dataset_name},${label},${ncells},${ndocs},${index_source},${active_root_path},${active_experiment_dir}/indexes/${active_index_name},${query_file},${gt_file},${query_count},${k},3,${avg_time_by_pair[$pair_key]},${qps_by_pair[$pair_key]},${recall_by_pair[$pair_key]},${gpu_mem_current_by_pair[$pair_key]},${gpu_mem_peak_by_pair[$pair_key]},${gpu_mem_total_by_pair[$pair_key]},${torch_peak_allocated_by_pair[$pair_key]},${torch_peak_reserved_by_pair[$pair_key]}" \
             >> "$results_csv"
     done
 
