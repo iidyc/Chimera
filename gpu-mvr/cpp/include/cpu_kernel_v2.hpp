@@ -113,6 +113,9 @@ class clustered_stage1_cache {
     const char* code_data_ = nullptr;
     const float* factor_data_ = nullptr;
     const int* doc_id_data_ = nullptr;
+    aligned_vector_64<char> raw_codes_;
+    aligned_vector_64<float> raw_factors_;
+    aligned_vector_64<int> raw_doc_ids_;
     std::vector<packed_cluster_pos> packed_cluster_pos_;
     aligned_vector_64<uint8_t> packed_codes_;
     aligned_vector_64<float> packed_factors_;

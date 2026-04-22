@@ -108,6 +108,13 @@ target_compile_definitions(cpu_search_v2 PRIVATE
 )
 target_link_libraries(cpu_search_v2 PRIVATE gpu_mvr_core)
 
+add_executable(cpu_search_v3
+    cpp/app/cpu_search_v3.cpp
+    cpp/src/cpu_kernel_v3.cpp
+    cpp/src/cpu_kernel_v1.cpp
+)
+target_link_libraries(cpu_search_v3 PRIVATE gpu_mvr_core)
+
 add_executable(test_gather cpp/app/test_gather.cpp)
 target_link_libraries(test_gather PRIVATE gpu_mvr_core)
 
