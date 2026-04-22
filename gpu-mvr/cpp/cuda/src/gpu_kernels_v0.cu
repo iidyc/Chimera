@@ -1,8 +1,8 @@
-#include "gpu_kernels_baseline.cuh"
+#include "gpu_kernels_v0.cuh"
 
 #include <cfloat>
 
-__global__ void stage1_binary_ip_baseline_kernel(
+__global__ void stage1_binary_ip_v0_kernel(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
@@ -43,7 +43,7 @@ __global__ void stage1_binary_ip_baseline_kernel(
     }
 }
 
-__global__ void stage2_binary_ip_baseline_kernel(
+__global__ void stage2_binary_ip_v0_kernel(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
@@ -82,7 +82,7 @@ __global__ void stage2_binary_ip_baseline_kernel(
     }
 }
 
-__global__ void doc_score_baseline_kernel(
+__global__ void doc_score_v0_kernel(
     const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
     float*        d_doc_scores,
@@ -108,7 +108,7 @@ __global__ void doc_score_baseline_kernel(
     d_doc_scores[cand_idx] = score;
 }
 
-__global__ void extract_one_bit_dists_baseline_kernel(
+__global__ void extract_one_bit_dists_v0_kernel(
     const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
     const int*    __restrict__ d_selected_indices,
@@ -135,7 +135,7 @@ __global__ void extract_one_bit_dists_baseline_kernel(
     }
 }
 
-__device__ __forceinline__ float atomicMaxFloat_baseline(float* address, float val) {
+__device__ __forceinline__ float atomicMaxFloat_v0(float* address, float val) {
     int* address_as_int = (int*)address;
     int old = *address_as_int, assumed;
     do {
@@ -146,7 +146,7 @@ __device__ __forceinline__ float atomicMaxFloat_baseline(float* address, float v
     return __int_as_float(old);
 }
 
-__global__ void aggregate_stage1_baseline_kernel(
+__global__ void aggregate_stage1_v0_kernel(
     const size_t* __restrict__ d_emb_ids,
     const float*  __restrict__ d_emb_dists,
     const int*    __restrict__ d_pair_offsets,
@@ -175,10 +175,10 @@ __global__ void aggregate_stage1_baseline_kernel(
     if (doc_id >= (int)num_docs) return;
 
     size_t matrix_idx = (size_t)q_idx * num_docs + doc_id;
-    atomicMaxFloat_baseline(&d_doc_query_max[matrix_idx], dist);
+    atomicMaxFloat_v0(&d_doc_query_max[matrix_idx], dist);
 }
 
-__global__ void sum_doc_scores_baseline_kernel(
+__global__ void sum_doc_scores_v0_kernel(
     const float* __restrict__ d_doc_query_max,
     float*       d_doc_scores,
     int*         d_doc_ids_out,
@@ -195,7 +195,7 @@ __global__ void sum_doc_scores_baseline_kernel(
     d_doc_ids_out[doc_id] = (int)doc_id;
 }
 
-__global__ void gather_token_ids_baseline_kernel(
+__global__ void gather_token_ids_v0_kernel(
     const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
     const size_t* __restrict__ d_candidate_offsets,
@@ -215,7 +215,7 @@ __global__ void gather_token_ids_baseline_kernel(
     }
 }
 
-__global__ void compute_query_expansion_sizes_baseline_kernel(
+__global__ void compute_query_expansion_sizes_v0_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*       __restrict__ d_cluster_pos,
     int*                d_query_sizes,
@@ -236,7 +236,7 @@ __global__ void compute_query_expansion_sizes_baseline_kernel(
     d_query_sizes[query_idx] = total_size;
 }
 
-__global__ void expand_cluster_ids_baseline_kernel(
+__global__ void expand_cluster_ids_v0_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const uint32_t*     __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
@@ -269,7 +269,7 @@ __global__ void expand_cluster_ids_baseline_kernel(
     }
 }
 
-__global__ void gather_doc_lengths_baseline_kernel(
+__global__ void gather_doc_lengths_v0_kernel(
     const int* __restrict__ d_topk_doc_ids,
     const int* __restrict__ d_doc_ptrs,
     int*       d_doc_lengths,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -58,6 +59,70 @@ inline std::vector<std::string> split_gpu_search_csv_line(const std::string& lin
     return fields;
 }
 
+inline const std::array<std::string, 6>& gpu_search_required_csv_columns() {
+    static const std::array<std::string, 6> kColumns = {
+        "label",
+        "nprobe",
+        "k_rank_cluster",
+        "k_rank_all_tokens",
+        "itopk_size",
+        "overlap_chunks",
+    };
+    return kColumns;
+}
+
+inline bool is_gpu_search_config_header_row(const std::vector<std::string>& fields) {
+    const auto& required = gpu_search_required_csv_columns();
+    for (const auto& name : required) {
+        if (std::find(fields.begin(), fields.end(), name) == fields.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline std::array<size_t, 6> gpu_search_csv_column_indices_from_header(
+    const std::vector<std::string>& header,
+    const std::string& config_file)
+{
+    std::array<size_t, 6> indices{};
+    const auto& required = gpu_search_required_csv_columns();
+    for (size_t i = 0; i < required.size(); ++i) {
+        auto it = std::find(header.begin(), header.end(), required[i]);
+        if (it == header.end()) {
+            throw std::runtime_error(
+                "Missing required CSV column '" + required[i] + "' in " + config_file);
+        }
+        indices[i] = static_cast<size_t>(std::distance(header.begin(), it));
+    }
+    return indices;
+}
+
+inline gpu_search_named_runtime_config parse_gpu_search_runtime_config_row(
+    const std::vector<std::string>& fields,
+    const std::array<size_t, 6>& column_indices,
+    const std::string& config_file)
+{
+    size_t max_index = 0;
+    for (size_t idx : column_indices) {
+        max_index = std::max(max_index, idx);
+    }
+    if (fields.size() <= max_index) {
+        throw std::runtime_error(
+            "CSV row in " + config_file +
+            " does not contain all required columns for the configured header");
+    }
+
+    gpu_search_named_runtime_config config;
+    config.label = fields[column_indices[0]];
+    config.runtime.nprobe = std::stoi(fields[column_indices[1]]);
+    config.runtime.k_rank_cluster = std::stoi(fields[column_indices[2]]);
+    config.runtime.k_rank_all_tokens = std::stoi(fields[column_indices[3]]);
+    config.runtime.itopk_size = std::stoi(fields[column_indices[4]]);
+    config.runtime.overlap_chunks = std::stoi(fields[column_indices[5]]);
+    return config;
+}
+
 inline void validate_gpu_search_runtime_options(const gpu_search_runtime_options& runtime) {
     if (runtime.nprobe <= 0) {
         throw std::runtime_error("--nprobe must be > 0");
@@ -88,27 +153,40 @@ inline std::vector<gpu_search_named_runtime_config> load_gpu_search_runtime_conf
 
     std::vector<gpu_search_named_runtime_config> configs;
     std::string line;
+    bool header_checked = false;
+    bool use_header_columns = false;
+    std::array<size_t, 6> column_indices{0, 1, 2, 3, 4, 5};
     while (std::getline(file, line)) {
         const auto fields = split_gpu_search_csv_line(line);
         if (fields.empty()) {
             continue;
         }
-        if (fields[0].empty() || fields[0] == "label" || fields[0][0] == '#') {
+        if (fields[0].empty() || fields[0][0] == '#') {
             continue;
         }
-        if (fields.size() != 6) {
-            throw std::runtime_error(
-                "Expected 6 CSV columns in " + args.config_file +
-                " (label,nprobe,k_rank_cluster,k_rank_all_tokens,itopk_size,overlap_chunks)");
+
+        if (!header_checked) {
+            header_checked = true;
+            if (is_gpu_search_config_header_row(fields)) {
+                column_indices = gpu_search_csv_column_indices_from_header(fields, args.config_file);
+                use_header_columns = true;
+                continue;
+            }
         }
 
-        gpu_search_named_runtime_config config;
-        config.label = fields[0];
-        config.runtime.nprobe = std::stoi(fields[1]);
-        config.runtime.k_rank_cluster = std::stoi(fields[2]);
-        config.runtime.k_rank_all_tokens = std::stoi(fields[3]);
-        config.runtime.itopk_size = std::stoi(fields[4]);
-        config.runtime.overlap_chunks = std::stoi(fields[5]);
+        if (!use_header_columns && fields[0] == "label") {
+            continue;
+        }
+
+        if (!use_header_columns && fields.size() != 6) {
+            throw std::runtime_error(
+                "Expected 6 CSV columns in " + args.config_file +
+                " (label,nprobe,k_rank_cluster,k_rank_all_tokens,itopk_size,overlap_chunks) "
+                "or a header row containing those names");
+        }
+
+        auto config =
+            parse_gpu_search_runtime_config_row(fields, column_indices, args.config_file);
         validate_gpu_search_runtime_options(config.runtime);
         configs.push_back(config);
     }

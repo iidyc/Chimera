@@ -1,0 +1,4 @@
+*
+!.gitignore
+!colbert_config.csv
+!gpu_mvr_config.csv

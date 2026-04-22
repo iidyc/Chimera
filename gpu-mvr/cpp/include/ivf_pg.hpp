@@ -6,14 +6,17 @@
 #include <string>
 #include <vector>
 
+#ifdef GPU_MVR_HAVE_CUVS
 #include <cuda_runtime_api.h>
-
-#include "rabitqlib/third/hnswlib/hnswlib.h"
-
 #include <cuvs/neighbors/cagra.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#else
+using cudaStream_t = void*;
+#endif
+
+#include "rabitqlib/third/hnswlib/hnswlib.h"
 
 // abstract class for PG index
 struct PG {
@@ -46,6 +49,7 @@ struct PG_HNSW : PG {
     void load(const std::string& filename) override;
 };
 
+#ifdef GPU_MVR_HAVE_CUVS
 struct PG_CAGRA : PG {
     raft::resources res_;
     std::unique_ptr<cuvs::neighbors::cagra::index<float, uint32_t>> index_cagra;
@@ -64,6 +68,7 @@ struct PG_CAGRA : PG {
     void save(const std::string& filename) const override;
     void load(const std::string& filename) override;
 };
+#endif
 
 enum class PGType { HNSW, CAGRA };
 

@@ -1,4 +1,4 @@
-#include "gpu_search_cli.hpp"
+#include "search_cli.hpp"
 #include "gpu_memory_tracker.hpp"
 #include "gpu_index_v5.cuh"
 #include "io.hpp"

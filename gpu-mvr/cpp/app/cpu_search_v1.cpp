@@ -1,4 +1,4 @@
-#include "gpu_search_cli.hpp"
+#include "search_cli.hpp"
 #include "cpu_kernel_v1.hpp"
 #include "index.hpp"
 #include "io.hpp"

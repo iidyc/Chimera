@@ -1,4 +1,4 @@
-#include "gpu_index_baseline.cuh"
+#include "gpu_index_v0.cuh"
 
 #include <omp.h>
 
@@ -7,7 +7,7 @@
 
 // ======================== CONSTRUCTOR ========================
 
-gpu_mvr_index_baseline::gpu_mvr_index_baseline(
+gpu_mvr_index_v0::gpu_mvr_index_v0(
     const std::string& filename,
     const std::vector<int>& doc_lens,
     const gpu_search_runtime_options& runtime_options) {
@@ -104,7 +104,7 @@ gpu_mvr_index_baseline::gpu_mvr_index_baseline(
 
 // ======================== set_doc_mapping ========================
 
-void gpu_mvr_index_baseline::set_doc_mapping(const std::vector<int>& doc_lens) {
+void gpu_mvr_index_v0::set_doc_mapping(const std::vector<int>& doc_lens) {
     num_docs = doc_lens.size();
     doc_ptrs_.resize(num_docs + 1, 0);
     for (size_t i = 0; i < num_docs; ++i) {
@@ -121,7 +121,7 @@ void gpu_mvr_index_baseline::set_doc_mapping(const std::vector<int>& doc_lens) {
 
 // ======================== allocate_workspace ========================
 
-void gpu_mvr_index_baseline::allocate_workspace() {
+void gpu_mvr_index_v0::allocate_workspace() {
     ws_.max_q_doclen = Q_DOCLEN;
     ws_.max_stage1_pairs = (size_t)nprobe * max_cluster_size * Q_DOCLEN;
     ws_.max_stage2_candidates = k_rank_cluster;
@@ -189,7 +189,7 @@ void gpu_mvr_index_baseline::allocate_workspace() {
 
     {
         thrust::device_ptr<int> len_ptr(ws_.d_pair_doc_ids);
-        auto xform_iter = thrust::make_transform_iterator(len_ptr, cast_int_size_t_baseline());
+        auto xform_iter = thrust::make_transform_iterator(len_ptr, cast_int_size_t_v0());
         temp_bytes = 0;
         cub::DeviceScan::InclusiveScan(
             nullptr, temp_bytes,
@@ -217,13 +217,13 @@ void gpu_mvr_index_baseline::allocate_workspace() {
 
 // ======================== doc_len ========================
 
-size_t gpu_mvr_index_baseline::doc_len(size_t doc_id) const {
+size_t gpu_mvr_index_v0::doc_len(size_t doc_id) const {
     return doc_ptrs_[doc_id + 1] - doc_ptrs_[doc_id];
 }
 
 // ======================== SEARCH PIPELINE ========================
 
-std::vector<size_t> gpu_mvr_index_baseline::search(const float* queries, size_t k) {
+std::vector<size_t> gpu_mvr_index_v0::search(const float* queries, size_t k) {
     for (size_t i = 0; i < Q_DOCLEN; ++i) {
         rotator_->rotate(&queries[i * d], &ws_.h_pinned_queries[i * PADDED_DIM]);
     }
@@ -245,13 +245,13 @@ std::vector<size_t> gpu_mvr_index_baseline::search(const float* queries, size_t 
     CUDA_CHECK(cudaStreamWaitEvent(ws_.stream_compute, ws_.event_h2d_done));
 
     int actual_k_stage1 = 0;
-    rank_cluster_dists_baseline(query_objs.data(), nprobe, k_rank_cluster,
+    rank_cluster_dists_v0(query_objs.data(), nprobe, k_rank_cluster,
                                  actual_k_stage1, ws_.stream_compute);
 
     std::vector<size_t> stage2_doc_ids;
     std::vector<float>  stage2_one_bit_dists;
 
-    rank_all_tokens_1bit_baseline(actual_k_stage1, k_rank_all_tokens,
+    rank_all_tokens_1bit_v0(actual_k_stage1, k_rank_all_tokens,
                                    stage2_doc_ids, stage2_one_bit_dists,
                                    ws_.stream_compute);
 
@@ -265,7 +265,7 @@ std::vector<size_t> gpu_mvr_index_baseline::search(const float* queries, size_t 
 
 // ======================== STAGE 1: GPU ========================
 
-void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
+void gpu_mvr_index_v0::rank_cluster_dists_v0(
     query_object* h_query_objs,
     size_t nprobe, size_t k,
     int& actual_k_out,
@@ -283,7 +283,7 @@ void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
         stream,
         static_cast<size_t>(itopk_size));
 
-    compute_query_expansion_sizes_baseline_kernel<<<(Q_DOCLEN + 255) / 256, 256, 0, stream>>>(
+    compute_query_expansion_sizes_v0_kernel<<<(Q_DOCLEN + 255) / 256, 256, 0, stream>>>(
         ws_.d_cagra_labels, d_cluster_pos_,
         ws_.d_pair_offsets + 1,
         nprobe, ivf->n_clusters, Q_DOCLEN
@@ -309,7 +309,7 @@ void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
         return;
     }
 
-    expand_cluster_ids_baseline_kernel<<<Q_DOCLEN, 256, 0, stream>>>(
+    expand_cluster_ids_v0_kernel<<<Q_DOCLEN, 256, 0, stream>>>(
         ws_.d_cagra_labels, d_inv_list_, d_cluster_pos_,
         ws_.d_pair_offsets, ws_.d_emb_ids,
         nprobe, ivf->n_clusters, Q_DOCLEN
@@ -320,7 +320,7 @@ void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
     int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
     dim3 grid(blocks_x, Q_DOCLEN);
 
-    stage1_binary_ip_baseline_kernel<<<grid, threads_per_block, 0, stream>>>(
+    stage1_binary_ip_v0_kernel<<<grid, threads_per_block, 0, stream>>>(
         ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
         ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
         max_embs_per_query
@@ -330,7 +330,7 @@ void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
     int agg_threads = 256;
     int agg_blocks = (total_pairs + agg_threads - 1) / agg_threads;
 
-    aggregate_stage1_baseline_kernel<<<agg_blocks, agg_threads, 0, stream>>>(
+    aggregate_stage1_v0_kernel<<<agg_blocks, agg_threads, 0, stream>>>(
         ws_.d_emb_ids, ws_.d_emb_dists, ws_.d_pair_offsets, d_doc_ids_,
         ws_.d_doc_query_max,
         num_docs, total_pairs, max_embs_per_query
@@ -340,7 +340,7 @@ void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
     int sum_threads = 256;
     int sum_blocks = ((int)num_docs + sum_threads - 1) / sum_threads;
 
-    sum_doc_scores_baseline_kernel<<<sum_blocks, sum_threads, 0, stream>>>(
+    sum_doc_scores_v0_kernel<<<sum_blocks, sum_threads, 0, stream>>>(
         ws_.d_doc_query_max,
         ws_.d_stage1_doc_scores,
         ws_.d_topk_doc_ids,
@@ -364,7 +364,7 @@ void gpu_mvr_index_baseline::rank_cluster_dists_baseline(
 
 // ======================== STAGE 2: GPU ========================
 
-void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
+void gpu_mvr_index_v0::rank_all_tokens_1bit_v0(
     int num_candidates,
     size_t k,
     std::vector<size_t>& output_ids,
@@ -376,7 +376,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
     int threads = 256;
     int blocks = (num_candidates + threads - 1) / threads;
 
-    gather_doc_lengths_baseline_kernel<<<blocks, threads, 0, stream>>>(
+    gather_doc_lengths_v0_kernel<<<blocks, threads, 0, stream>>>(
         ws_.d_topk_doc_ids, d_doc_ptrs_,
         ws_.d_pair_doc_ids,
         num_candidates
@@ -386,7 +386,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
     CUDA_CHECK(cudaMemsetAsync(ws_.d_candidate_offsets, 0, sizeof(size_t), stream));
     {
         thrust::device_ptr<int> len_ptr(ws_.d_pair_doc_ids);
-        auto xform_iter = thrust::make_transform_iterator(len_ptr, cast_int_size_t_baseline());
+        auto xform_iter = thrust::make_transform_iterator(len_ptr, cast_int_size_t_v0());
         size_t scan_temp = ws_.cub_temp_storage_bytes;
         cub::DeviceScan::InclusiveScan(
             ws_.d_cub_temp_storage, scan_temp,
@@ -399,7 +399,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
                                sizeof(size_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    gather_token_ids_baseline_kernel<<<num_candidates, 256, 0, stream>>>(
+    gather_token_ids_v0_kernel<<<num_candidates, 256, 0, stream>>>(
         ws_.d_topk_doc_ids, d_doc_ptrs_,
         ws_.d_candidate_offsets, ws_.d_token_ids,
         num_candidates
@@ -410,7 +410,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
     int bip_blocks_x = (total_tokens + bip_threads - 1) / bip_threads;
     dim3 bip_grid(bip_blocks_x, Q_DOCLEN);
 
-    stage2_binary_ip_baseline_kernel<<<bip_grid, bip_threads, 0, stream>>>(
+    stage2_binary_ip_v0_kernel<<<bip_grid, bip_threads, 0, stream>>>(
         ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
         ws_.d_token_ids, ws_.d_token_dists,
         total_tokens, total_tokens
@@ -420,7 +420,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
     int score_threads = 256;
     int score_blocks = (num_candidates + score_threads - 1) / score_threads;
 
-    doc_score_baseline_kernel<<<score_blocks, score_threads, 0, stream>>>(
+    doc_score_v0_kernel<<<score_blocks, score_threads, 0, stream>>>(
         ws_.d_token_dists, ws_.d_candidate_offsets, ws_.d_doc_scores,
         total_tokens, num_candidates
     );
@@ -463,7 +463,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
     CUDA_CHECK(cudaMemcpyAsync(ws_.d_out_offsets, out_offsets.data(),
                                (actual_k + 1) * sizeof(size_t), cudaMemcpyHostToDevice, stream));
 
-    extract_one_bit_dists_baseline_kernel<<<actual_k, 256, 0, stream>>>(
+    extract_one_bit_dists_v0_kernel<<<actual_k, 256, 0, stream>>>(
         ws_.d_token_dists, ws_.d_candidate_offsets,
         ws_.d_selected_indices, ws_.d_out_one_bit_dists,
         ws_.d_out_offsets, total_tokens, actual_k
@@ -488,7 +488,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_1bit_baseline(
 
 // ======================== STAGE 3: CPU ========================
 
-void gpu_mvr_index_baseline::rank_all_tokens_exbits_cpu(
+void gpu_mvr_index_v0::rank_all_tokens_exbits_cpu(
     query_object* queries,
     std::vector<size_t>& input_ids,
     std::vector<float>& one_bit_dists,
@@ -532,7 +532,7 @@ void gpu_mvr_index_baseline::rank_all_tokens_exbits_cpu(
 
 // ======================== DESTRUCTOR ========================
 
-gpu_mvr_index_baseline::~gpu_mvr_index_baseline() {
+gpu_mvr_index_v0::~gpu_mvr_index_v0() {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // PG_CAGRA stores a RAFT resource whose active stream is rebound during search.

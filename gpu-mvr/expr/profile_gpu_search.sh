@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # profile_gpu_search.sh
-# Profiles gpu_search to determine if kernels are memory-bound or compute-bound.
+# Profiles gpu_search_v3 to determine if kernels are memory-bound or compute-bound.
 # Uses nsys (Nsight Systems) — works without elevated permissions (unlike ncu).
 #
 # Usage:
@@ -9,14 +9,14 @@
 #
 # Requirements:
 #   - nsys (Nsight Systems CLI) in PATH
-#   - gpu_search binary built in current directory
+#   - gpu_search_v3 binary built in current directory
 #   - All data files (index, queries, etc.) in current directory
 # =============================================================================
 
 set -euo pipefail
 
 # ---------- Configuration ----------
-BINARY="./gpu_search"
+BINARY="./gpu_search_v3"
 NSYS_REPORT="gpu_search_profile"
 
 # A100-SXM4-80GB reference specs
@@ -363,7 +363,7 @@ print(f"""
 
   NOTE: For precise hardware-counter-based classification, run ncu with admin
   permissions:
-    sudo ncu --set roofline ./gpu_search
+    sudo ncu --set roofline ./gpu_search_v3
   This gives exact compute vs memory utilization percentages per kernel.
 """)
 

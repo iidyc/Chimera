@@ -28,7 +28,7 @@
 #include "query.hpp"
 #include "ivf_pg.hpp"
 #include "gpu_config.cuh"
-#include "gpu_kernels_baseline.cuh"
+#include "gpu_kernels_v0.cuh"
 
 using namespace rabitqlib;
 
@@ -43,11 +43,11 @@ using namespace rabitqlib;
 } while(0)
 #endif
 
-struct cast_int_size_t_baseline {
+struct cast_int_size_t_v0 {
     __host__ __device__ size_t operator()(int x) const { return (size_t)x; };
 };
 
-struct gpu_mvr_index_baseline {
+struct gpu_mvr_index_v0 {
     size_t n = 0;
     size_t d = 0;
     size_t n_clusters = 0;
@@ -132,11 +132,11 @@ struct gpu_mvr_index_baseline {
         int    max_embs_per_query_bound;
     } ws_{};
 
-    gpu_mvr_index_baseline(
+    gpu_mvr_index_v0(
         const std::string& filename,
         const std::vector<int>& doc_lens,
         const gpu_search_runtime_options& runtime_options);
-    ~gpu_mvr_index_baseline();
+    ~gpu_mvr_index_v0();
 
     void set_doc_mapping(const std::vector<int>& doc_lens);
     void allocate_workspace();
@@ -144,13 +144,13 @@ struct gpu_mvr_index_baseline {
 
     std::vector<size_t> search(const float* queries, size_t k);
 
-    void rank_cluster_dists_baseline(
+    void rank_cluster_dists_v0(
         query_object* h_query_objs,
         size_t nprobe, size_t k,
         int& actual_k_out,
         cudaStream_t stream = 0);
 
-    void rank_all_tokens_1bit_baseline(
+    void rank_all_tokens_1bit_v0(
         int num_candidates,
         size_t k,
         std::vector<size_t>& output_ids,

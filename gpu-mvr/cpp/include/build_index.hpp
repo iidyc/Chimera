@@ -24,8 +24,3 @@ void build_index(
     size_t ex_bits,
     const std::vector<int>& doc_lens,
     const std::string& index_dir);
-
-void build_clustered_stage1_sidecar(
-    const std::vector<int>& doc_lens,
-    const std::string& source_index_dir,
-    const std::string& index_dir);

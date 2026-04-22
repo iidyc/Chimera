@@ -1,6 +1,6 @@
-#include "gpu_search_cli.hpp"
+#include "search_cli.hpp"
 #include "gpu_memory_tracker.hpp"
-#include "gpu_index_baseline.cuh"
+#include "gpu_index_v0.cuh"
 #include "io.hpp"
 #include "utils.hpp"
 
@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
         ground_truth.begin(),
         ground_truth.begin() + run_queries);
 
-    gpu_mvr_index_baseline index(args.index_file, doclens, allocation_runtime);
+    gpu_mvr_index_v0 index(args.index_file, doclens, allocation_runtime);
     gpu_mvr::GpuMemoryTracker gpu_memory;
     gpu_memory.sample("after_index_construct");
 

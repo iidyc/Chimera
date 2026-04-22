@@ -6,17 +6,23 @@
 #include <fstream>
 #include <stdexcept>
 
+#ifdef GPU_MVR_HAVE_CUVS
 #include <rmm/cuda_stream_view.hpp>
+#endif
 
 namespace {
 
+#ifdef GPU_MVR_HAVE_CUVS
 using cagra_index_t = cuvs::neighbors::cagra::index<float, uint32_t>;
+#endif
 
 void save_graph_file(const PG* pg_index, const std::string& graph_path) {
+#ifdef GPU_MVR_HAVE_CUVS
     if (const auto* cagra = dynamic_cast<const PG_CAGRA*>(pg_index)) {
         cuvs::neighbors::cagra::serialize(cagra->res_, graph_path, *cagra->index_cagra);
         return;
     }
+#endif
 
     if (const auto* hnsw = dynamic_cast<const PG_HNSW*>(pg_index)) {
         hnsw->hnsw_index->saveIndex(graph_path);
@@ -27,11 +33,13 @@ void save_graph_file(const PG* pg_index, const std::string& graph_path) {
 }
 
 void load_graph_file(PG* pg_index, const std::string& graph_path) {
+#ifdef GPU_MVR_HAVE_CUVS
     if (auto* cagra = dynamic_cast<PG_CAGRA*>(pg_index)) {
         cagra->index_cagra = std::make_unique<cagra_index_t>(cagra->res_);
         cuvs::neighbors::cagra::deserialize(cagra->res_, graph_path, cagra->index_cagra.get());
         return;
     }
+#endif
 
     if (auto* hnsw = dynamic_cast<PG_HNSW*>(pg_index)) {
         hnsw->hnsw_index->loadIndex(graph_path, &hnsw->space_, hnsw->n);
@@ -86,7 +94,7 @@ void PG_HNSW::load(const std::string& filename) {
 }
 
 // ---------------- PG_CAGRA ----------------
-
+#ifdef GPU_MVR_HAVE_CUVS
 PG_CAGRA::PG_CAGRA(size_t n, size_t d) : PG(n, d) {}
 
 void PG_CAGRA::build_index(const float* data) {
@@ -137,12 +145,17 @@ void PG_CAGRA::load(const std::string& filename) {
     index_cagra = std::make_unique<cagra_index_t>(res_);
     cuvs::neighbors::cagra::deserialize(res_, filename + ".cagra", index_cagra.get());
 }
+#endif
 
 // ---------------- IVF_PG ----------------
 
 IVF_PG::IVF_PG(size_t n_clusters, size_t d, PGType type) : n_clusters(n_clusters), d(d) {
     if (type == PGType::CAGRA) {
+#ifdef GPU_MVR_HAVE_CUVS
         pg_index = new PG_CAGRA(n_clusters, d);
+#else
+        throw std::runtime_error("PG_CAGRA requires GPU_MVR_HAVE_CUVS");
+#endif
     } else {
         pg_index = new PG_HNSW(n_clusters, d);
     }
@@ -167,6 +180,7 @@ void IVF_PG::search(const float* query, size_t n_probe, std::vector<size_t>& res
 void IVF_PG::search_batch_gpu(const float* d_queries, size_t n_queries, size_t n_probe,
                               float* d_dists, uint32_t* d_labels, cudaStream_t stream,
                               size_t itopk_size) {
+#ifdef GPU_MVR_HAVE_CUVS
     auto* cagra = dynamic_cast<PG_CAGRA*>(pg_index);
     if (cagra) {
         cagra->search_batch_gpu(
@@ -174,6 +188,16 @@ void IVF_PG::search_batch_gpu(const float* d_queries, size_t n_queries, size_t n
     } else {
         throw std::runtime_error("search_batch_gpu requires PG_CAGRA");
     }
+#else
+    (void)d_queries;
+    (void)n_queries;
+    (void)n_probe;
+    (void)d_dists;
+    (void)d_labels;
+    (void)stream;
+    (void)itopk_size;
+    throw std::runtime_error("search_batch_gpu requires GPU_MVR_HAVE_CUVS");
+#endif
 }
 
 void IVF_PG::build_index(const float* /*data*/) {}

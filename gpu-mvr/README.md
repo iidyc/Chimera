@@ -20,15 +20,15 @@ Key directories:
 - `cpp/src`: core CPU-side implementation
 - `cpp/cuda/src`: GPU index build/search implementation and CUDA kernels
 - `cpp/include`: public/shared headers
+- `cpp/dep`: vendored header-only third-party dependencies
 - `cpp/cuda/include`: GPU-specific headers
 
 Important files:
 
 - [CMakeLists.txt](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/CMakeLists.txt)
-- [cpp/app/gpu_build.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_build.cu)
+- [cpp/app/gpu_build.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_build.cpp)
 - [cpp/app/gpu_search_v3.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search_v3.cu)
-- [cpp/cuda/src/build_gpu_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/build_gpu_index.cu)
-- [cpp/cuda/src/gpu_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index.cu)
+- [cpp/cuda/src/build_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/build_index.cu)
 - [cpp/cuda/src/gpu_index_v3.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index_v3.cu)
 - [cpp/src/ivf_pg.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/src/ivf_pg.cpp)
 - [cpp/include/gpu_index_layout.hpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/include/gpu_index_layout.hpp)
@@ -43,13 +43,13 @@ The codebase is organized around four layers:
 - Core index structures
   `cpp/src/index.cpp` and `cpp/src/ivf_pg.cpp` implement the CPU-side quantized index and IVF/CAGRA metadata structures.
 - GPU implementations
-  `cpp/cuda/src/build_gpu_index.cu`, `gpu_index.cu`, and the CUDA kernels implement the high-throughput build and search paths.
+  `cpp/cuda/src/build_index.cu`, `gpu_index_v3.cu`, and the CUDA kernels implement the high-throughput build and search paths.
 - App wrappers
   `cpp/app` contains small binaries that glue together file loading, index construction, search, and evaluation.
 
 The current production-oriented path is:
 
-`embeddings.bin` + `doclens.bin` -> `gpu_build` -> split index directory -> `gpu_search`
+`embeddings.bin` + `doclens.bin` -> `gpu_build` -> split index directory -> `gpu_search_v3`
 
 The split index directory contains:
 
@@ -119,8 +119,8 @@ The current recommended build flow is the GPU build path:
 
 The implementation lives in:
 
-- [cpp/cuda/src/build_gpu_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/build_gpu_index.cu)
-- [cpp/include/build_gpu_index.hpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/include/build_gpu_index.hpp)
+- [cpp/cuda/src/build_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/build_index.cu)
+- [cpp/include/build_index.hpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/include/build_index.hpp)
 
 Recent behavior worth knowing:
 
@@ -131,7 +131,7 @@ Recent behavior worth knowing:
 
 ## Search Pipeline
 
-The main GPU search path is implemented in [cpp/cuda/src/gpu_index.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index.cu).
+The main GPU search path is implemented in [cpp/cuda/src/gpu_index_v3.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index_v3.cu).
 
 At a high level:
 
@@ -143,7 +143,7 @@ At a high level:
 6. Aggregate token scores into document scores.
 7. Re-rank a reduced candidate set.
 
-There is also a `v0` comparison path in [cpp/cuda/src/gpu_index_baseline.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index_baseline.cu).
+There is also a `v0` comparison path in [cpp/cuda/src/gpu_index_v0.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/cuda/src/gpu_index_v0.cu).
 
 ## Building
 
@@ -176,7 +176,7 @@ If your shell exports a conflicting `CPATH` from another toolchain, unset it bef
 If you only need specific binaries:
 
 ```bash
-cmake --build build --target gpu_build gpu_search gpu_search_v0 gpu_search_v1 gpu_search_v2 gpu_search_v3 build_cagra build_hnsw_from_cagra -j 4
+cmake --build build --target gpu_build gpu_search_v0 gpu_search_v1 gpu_search_v2 gpu_search_v3 -j 4
 ```
 
 This direct configure command replaces the removed `cmake.sh` wrapper.
@@ -187,7 +187,7 @@ Executables are defined in [CMakeLists.txt](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr
 
 ### `gpu_build`
 
-Source: [cpp/app/gpu_build.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_build.cu)
+Source: [cpp/app/gpu_build.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_build.cpp)
 
 Purpose:
 
@@ -240,50 +240,13 @@ Operational notes:
 - The `hnswlib` centroid graph is built directly from the in-memory rotated centroids during the build; it does not need to round-trip through `centroids.carga`.
 - Within each cluster, `cluster_1bit.bin` already follows original token order, which is equivalent to doc-id then token-id order for natural document packing.
 
-### `gpu_search`
-
-Source: [cpp/app/gpu_search.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search.cu)
-
-Purpose:
-
-- Run the main GPU search pipeline and compute recall against a TSV ground-truth file.
-
-CLI:
-
-```bash
-./build/gpu_search \
-  --query <query_embeddings.bin> \
-  --doclens <doclens.bin> \
-  --gt <groundtruth.tsv> \
-  --index <index_dir_or_cpu_index.bin> \
-  [--k <top_k>] \
-  [--nprobe <num_probes>] \
-  [--k-rank-cluster <count>] \
-  [--k-rank-all-tokens <count>] \
-  [--itopk-size <count>] \
-  [--overlap-chunks <count>] \
-  [--nq <num_queries_to_run>] \
-  [--warmup <num_warmup_queries>]
-```
-
-Notes:
-
-- `Q_DOCLEN` in `gpu_config.cuh` must match the `q_doclen` stored in `query_embeddings.bin`.
-- `--nq` and `--warmup` are clamped to the number of queries in the query file.
-- `gpu_search` is the default `v3` build target; [cpp/app/gpu_search.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search.cu) simply includes `gpu_search_v3.cu`.
-- The GPU search binaries share one standardized CLI parser, so `gpu_search`, `gpu_search_v0`, `gpu_search_v1`, `gpu_search_v2`, and `gpu_search_v3` accept the same search-tuning flags.
-- Default values still differ by binary where the code previously differed, especially `--k-rank-cluster`.
-- `--itopk-size` controls CAGRA's internal intermediate top-k during centroid search.
-- `--overlap-chunks` is used by the persistent overlap pipeline in `v1`/`v2`/`v3` and is ignored by `v0`.
-- For `gpu_search`/`gpu_search_v3`, `--index` must resolve to a split index directory: pass either the directory itself or its `cpu_index.bin`, and keep `gpu_index.bin` beside it. Older directories can still fall back to `clustered_stage1.bin`.
-
 ### `gpu_search_v3`
 
 Source: [cpp/app/gpu_search_v3.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search_v3.cu)
 
 Purpose:
 
-- Run the explicit `v3` GPU search binary. This is the same implementation as `gpu_search`, but exposed as a versioned executable for comparisons and artifact runs.
+- Run the explicit `v3` GPU search binary for the main optimized GPU search path.
 
 CLI:
 
@@ -305,13 +268,19 @@ CLI:
 
 Notes:
 
-- `gpu_search_v3` uses the same parser and defaults as `gpu_search`.
+- The GPU search binaries share one standardized CLI parser, so `gpu_search_v0`, `gpu_search_v1`, `gpu_search_v2`, and `gpu_search_v3` accept the same search-tuning flags.
+- Default values still differ by binary where the code previously differed, especially `--k-rank-cluster`.
+- `--itopk-size` controls CAGRA's internal intermediate top-k during centroid search.
+- `--overlap-chunks` is used by the persistent overlap pipeline in `v1`/`v2`/`v3` and is ignored by `v0`.
 - The v3 loader requires the split GPU layout because stage 1 and stage 2 both read `gpu_index.bin`.
 - Passing `--index <index_dir>` or `--index <index_dir>/cpu_index.bin` is supported. Passing only a monolithic legacy index file is not supported for `v3`.
+- `Q_DOCLEN` in `gpu_config.cuh` must match the `q_doclen` stored in `query_embeddings.bin`.
+- `--nq` and `--warmup` are clamped to the number of queries in the query file.
+- `--index` must resolve to a split index directory: pass either the directory itself or its `cpu_index.bin`, and keep `gpu_index.bin` beside it. Older directories can still fall back to `clustered_stage1.bin`.
 
 ### `gpu_search_v0`
 
-Source: [cpp/app/gpu_search_baseline.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search_baseline.cu)
+Source: [cpp/app/gpu_search_v0.cu](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/gpu_search_v0.cu)
 
 Purpose:
 
@@ -338,37 +307,11 @@ CLI:
 Notes:
 
 - This is the comparison/baseline GPU path, not the main optimized one.
-- Like `gpu_search`, it requires `Q_DOCLEN` to match the query file.
+- Like `gpu_search_v3`, it requires `Q_DOCLEN` to match the query file.
 
-### `search`
+### `cpu_build`
 
-Source: [cpp/app/search.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/search.cpp)
-
-Purpose:
-
-- Run the CPU search path over the current split-format index.
-
-CLI:
-
-```bash
-./build/search \
-  --query <query_embeddings.bin> \
-  --doclens <doclens.bin> \
-  --gt <groundtruth.tsv> \
-  --index <index_dir_or_cpu_index.bin> \
-  [--k <top_k>] \
-  [--nprobe <num_probes>] \
-  [--nq <num_queries_to_run>]
-```
-
-Notes:
-
-- This is the CPU search path.
-- It accepts the same split index entry point as the GPU loaders.
-
-### `build`
-
-Source: [cpp/app/build.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/build.cpp)
+Source: [cpp/app/cpu_build.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/cpu_build.cpp)
 
 Purpose:
 
@@ -377,7 +320,7 @@ Purpose:
 CLI:
 
 ```bash
-./build/build \
+./build/cpu_build \
   --data <embeddings.bin> \
   --output <index_file> \
   --n_clusters <num_centroids> \
@@ -389,56 +332,9 @@ Notes:
 - This builds the older monolithic CPU index format.
 - It is not the recommended path for the current split GPU index layout.
 
-### `build_cagra`
-
-Source: [cpp/app/build_cagra.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/build_cagra.cpp)
-
-Purpose:
-
-- Small utility to build only a persisted CAGRA graph from `centroids.bin`.
-
-CLI:
-
-```bash
-./build/build_cagra \
-  --centroids <centroids.bin> \
-  --output <graph_prefix>
-```
-
-Notes:
-
-- This writes `<graph_prefix>.cagra`.
-- It is a helper utility, not the main end-to-end build path.
-
-### `build_hnsw_from_cagra`
-
-Source: [cpp/app/build_hnsw_from_cagra.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/build_hnsw_from_cagra.cpp)
-
-Purpose:
-
-- Deserialize a persisted `centroids.carga` CAGRA graph with cuVS.
-- Read the centroid embeddings stored in that index.
-- Rebuild an `hnswlib` HNSW index from those centroid embeddings.
-
-CLI:
-
-```bash
-./build/build_hnsw_from_cagra \
-  --input <index_dir>/centroids.carga \
-  --output <index_dir>/centroids.hnsw \
-  [--M 16] \
-  [--ef-construction 500] \
-  [--batch-rows 65536]
-```
-
-Notes:
-
-- `gpu_build` now emits `centroids.hnsw` directly as part of the normal build path.
-- This helper still exists for rebuilding the HNSW artifact from an existing `centroids.carga`.
-
 ### `test_gather`
 
-Source: [cpp/app/test_gather.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/test_gather.cpp)
+Source: [cpp/test/test_gather.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/test/test_gather.cpp)
 
 Purpose:
 
@@ -465,7 +361,7 @@ Notes:
 
 ### `test_dist_decomp`
 
-Source: [cpp/app/test_dist_decomp.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/app/test_dist_decomp.cpp)
+Source: [cpp/test/test_dist_decomp.cpp](/data/juelin/gpu-mvr/gpu-mvr/gpu-mvr/cpp/test/test_dist_decomp.cpp)
 
 Purpose:
 
@@ -496,7 +392,7 @@ If you are new to the repo, start here:
 
 1. Configure and build with the direct CMake/Ninja commands above.
 2. Use `gpu_build` to generate a split-format index directory.
-3. Use `gpu_search_v3` for the explicit `v3` path, or `gpu_search` if you want the default alias.
+3. Use `gpu_search_v3` as the primary GPU search binary.
 
 Example:
 

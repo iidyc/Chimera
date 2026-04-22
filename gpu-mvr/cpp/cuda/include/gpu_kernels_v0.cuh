@@ -6,7 +6,7 @@
 
 #include "gpu_config.cuh"
 
-__global__ void stage1_binary_ip_baseline_kernel(
+__global__ void stage1_binary_ip_v0_kernel(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
@@ -17,7 +17,7 @@ __global__ void stage1_binary_ip_baseline_kernel(
     size_t max_embs_per_query
 );
 
-__global__ void stage2_binary_ip_baseline_kernel(
+__global__ void stage2_binary_ip_v0_kernel(
     const float* __restrict__ d_queries,
     const char*  __restrict__ d_one_bit_code,
     const float* __restrict__ d_one_bit_factor,
@@ -28,7 +28,7 @@ __global__ void stage2_binary_ip_baseline_kernel(
     size_t batch_tokens
 );
 
-__global__ void doc_score_baseline_kernel(
+__global__ void doc_score_v0_kernel(
     const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
     float*        d_doc_scores,
@@ -36,7 +36,7 @@ __global__ void doc_score_baseline_kernel(
     size_t num_candidates
 );
 
-__global__ void extract_one_bit_dists_baseline_kernel(
+__global__ void extract_one_bit_dists_v0_kernel(
     const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
     const int*    __restrict__ d_selected_indices,
@@ -46,7 +46,7 @@ __global__ void extract_one_bit_dists_baseline_kernel(
     size_t k
 );
 
-__global__ void aggregate_stage1_baseline_kernel(
+__global__ void aggregate_stage1_v0_kernel(
     const size_t* __restrict__ d_emb_ids,
     const float*  __restrict__ d_emb_dists,
     const int*    __restrict__ d_pair_offsets,
@@ -57,14 +57,14 @@ __global__ void aggregate_stage1_baseline_kernel(
     size_t        max_embs_per_query
 );
 
-__global__ void sum_doc_scores_baseline_kernel(
+__global__ void sum_doc_scores_v0_kernel(
     const float* __restrict__ d_doc_query_max,
     float*       d_doc_scores,
     int*         d_doc_ids_out,
     size_t       num_docs
 );
 
-__global__ void gather_token_ids_baseline_kernel(
+__global__ void gather_token_ids_v0_kernel(
     const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
     const size_t* __restrict__ d_candidate_offsets,
@@ -72,7 +72,7 @@ __global__ void gather_token_ids_baseline_kernel(
     size_t num_candidates
 );
 
-__global__ void compute_query_expansion_sizes_baseline_kernel(
+__global__ void compute_query_expansion_sizes_v0_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*       __restrict__ d_cluster_pos,
     int*                d_query_sizes,
@@ -81,7 +81,7 @@ __global__ void compute_query_expansion_sizes_baseline_kernel(
     size_t              num_queries
 );
 
-__global__ void expand_cluster_ids_baseline_kernel(
+__global__ void expand_cluster_ids_v0_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const uint32_t*     __restrict__ d_inv_list,
     const size_t*       __restrict__ d_cluster_pos,
@@ -92,7 +92,7 @@ __global__ void expand_cluster_ids_baseline_kernel(
     size_t              num_queries
 );
 
-__global__ void gather_doc_lengths_baseline_kernel(
+__global__ void gather_doc_lengths_v0_kernel(
     const int* __restrict__ d_topk_doc_ids,
     const int* __restrict__ d_doc_ptrs,
     int*       d_doc_lengths,

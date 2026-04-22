@@ -9,7 +9,7 @@ Usage:
   script/build_gpu_mvr_index.sh --dataset <name> [options]
 
 Description:
-  Build a GPU-MVR index from raw dataset files using gpu-mvr/build/gpu_build_fast.
+  Build a GPU-MVR index from raw dataset files using gpu-mvr/build/gpu_build.
   By default the builder is executed via micromamba in the gpu-mvr env when
   micromamba is available. Set GPU_MVR_USE_MICROMAMBA=0 to run directly in the
   current shell environment instead.
@@ -22,7 +22,7 @@ Outputs:
   dataset/<name>/gpu_mvr_2m/     when --n-clusters is 2000000 or 2M (default)
   dataset/<name>/gpu_mvr_1m/     when --n-clusters is 1000000 or 1M
   dataset/<name>/gpu_mvr_<count>/ for other cluster counts
-  log/build/<dataset>/<index_dir>/gpu_build_fast_<run_id>.log
+  log/build/<dataset>/<index_dir>/gpu_build_<run_id>.log
 
 Arguments:
   dataset_name           Dataset name under dataset/. Defaults to hotpot.
@@ -169,7 +169,7 @@ esac
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-gpu_build_bin="${repo_root}/gpu-mvr/build/gpu_build_fast"
+gpu_build_bin="${repo_root}/gpu-mvr/build/gpu_build"
 use_micromamba="${GPU_MVR_USE_MICROMAMBA:-1}"
 micromamba_bin=""
 if [[ "$use_micromamba" != "0" ]]; then
@@ -196,7 +196,7 @@ log_dir="${log_dir}/${dataset_name}/${index_dir_name}"
 mkdir -p "$index_dir" "$log_dir"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-full_log="${log_dir}/gpu_build_fast_${run_id}.log"
+full_log="${log_dir}/gpu_build_${run_id}.log"
 
 if [[ $dry_run -eq 0 ]]; then
     : > "$full_log"
