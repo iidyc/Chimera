@@ -15,7 +15,7 @@ Description:
   By default, the script benchmarks:
     hotpot
     lotte
-
+    msmarco
   It reads search configurations from profiling/gpu_mvr_config.csv and writes
   a unique log file for each dataset run:
     log/bench/<implementation>/<dataset>/benchmark_<run_id>.log
@@ -26,7 +26,7 @@ Description:
 
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
-  --version <v0|v1|v2|v3|v4|v5|v6>  GPU-MVR search version. Default: v3
+  --version <v0|v1|v2|v3|v4|v5|v6|v7|v8>  GPU-MVR search version. Default: v3
   --implementation-label <label>
                            Output folder label. Default: gpu_search_<version>
   --config-file <path>     Config CSV. Default: profiling/gpu_mvr_config.csv
@@ -421,14 +421,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $dataset_set -eq 0 ]]; then
-    datasets=(hotpot lotte)
+    datasets=(hotpot lotte msmarco)
 fi
 
 case "$version" in
-    v0|v1|v2|v3|v4|v5|v6)
+    v0|v1|v2|v3|v4|v5|v6|v7|v8)
         ;;
     *)
-        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6"
+        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6, v7, v8"
         ;;
 esac
 

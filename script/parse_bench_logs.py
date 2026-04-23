@@ -116,18 +116,58 @@ class ParsedOutputs:
     row_count: int
 
 
+class HelpFormatter(
+    argparse.RawDescriptionHelpFormatter,
+    argparse.ArgumentDefaultsHelpFormatter,
+):
+    pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        formatter_class=HelpFormatter,
         description=(
-            "Parse raw benchmark logs written under log/bench and regenerate "
-            "the structured CSV outputs under profiling/."
-        )
+            "Parse raw benchmark logs and regenerate the structured CSV outputs.\n"
+            "\n"
+            "The parser reads benchmark*.log files produced by the benchmark drivers\n"
+            "under log/bench, extracts the recorded metadata and metrics, and writes\n"
+            "the corresponding CSV artifacts back to the output paths stored in the\n"
+            "log itself.\n"
+            "\n"
+            "Generated outputs:\n"
+            "  GPU-MVR logs: benchmark_results_*.csv and pareto_frontier_*.csv\n"
+            "  ColBERT logs: benchmark_results.csv, pareto_frontier.csv, and\n"
+            "                search_py_output.csv when the log records that path"
+        ),
+        epilog=(
+            "Examples:\n"
+            "  Parse one GPU-MVR log file:\n"
+            "    python script/parse_bench_logs.py \\\n"
+            "      log/bench/gpu_search_v4/lotte/benchmark_20260418T145245Z_job55741087.log\n"
+            "\n"
+            "  Parse every GPU-MVR benchmark log under a directory:\n"
+            "    python script/parse_bench_logs.py --mode gpu-mvr log/bench/gpu_search_v4\n"
+            "\n"
+            "  Parse every ColBERT benchmark log under a directory:\n"
+            "    python script/parse_bench_logs.py --mode colbert log/bench/colbert\n"
+            "\n"
+            "  Parse multiple roots at once:\n"
+            "    python script/parse_bench_logs.py log/bench/gpu_search_v4 log/bench/colbert\n"
+            "\n"
+            "  Replay logs from another checkout into the current repo layout:\n"
+            "    python script/parse_bench_logs.py --repo-root /scratch3/workspace/.../gpu-mvr \\\n"
+            "      /path/to/copied/log/bench"
+        ),
     )
     parser.add_argument(
         "--mode",
         choices=("auto", "gpu-mvr", "colbert"),
         default="auto",
-        help="Benchmark family to parse. Default: auto-detect.",
+        help=(
+            "Benchmark family to parse. Use 'auto' to infer the format from the log "
+            "contents and [driver] metadata. Use 'gpu-mvr' or 'colbert' to force one "
+            "parser when you already know the log type or want stricter validation."
+        ),
     )
     parser.add_argument(
         "--repo-root",
@@ -135,14 +175,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Override the repo root recorded in the log when resolving output paths. "
-            "Useful when replaying logs from another checkout."
+            "This is mainly for replaying logs that were produced from a different "
+            "checkout or filesystem location. Only paths that originally lived under "
+            "the logged repo_root are remapped; external absolute paths are left "
+            "unchanged."
         ),
     )
     parser.add_argument(
         "paths",
         nargs="+",
         type=Path,
-        help="One or more benchmark*.log files or directories containing them.",
+        metavar="PATH",
+        help=(
+            "One or more inputs to parse. Each PATH may be either: "
+            "(1) a single benchmark*.log file, or (2) a directory, in which case the "
+            "script recursively discovers every matching benchmark*.log beneath it. "
+            "You can mix files and directories in one command."
+        ),
     )
     return parser.parse_args()
 

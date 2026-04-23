@@ -117,7 +117,7 @@ if [[ -n "${target}" ]]; then
     echo "[cmake] target=${target}"
 fi
 
-conda_activate
+# conda_activate
 
 cmake "${cmake_configure_args[@]}"
 
