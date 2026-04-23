@@ -13,6 +13,12 @@
 
 enum class IVFType { PG, DocKMeans };
 
+enum class cpu_quantized_payload_mode {
+    DecodeDoc4,
+    PreferDoc4ExSidecar,
+    RequireDoc4ExSidecar,
+};
+
 struct cpu_mvr_index {
     size_t n;            // number of vectors
     size_t d;            // dimension
@@ -35,7 +41,9 @@ struct cpu_mvr_index {
 
     float (*ip_func_)(const float*, const uint8_t*, size_t);
 
-    explicit cpu_mvr_index(const std::string& filename);
+    explicit cpu_mvr_index(
+        const std::string& filename,
+        cpu_quantized_payload_mode payload_mode = cpu_quantized_payload_mode::DecodeDoc4);
     cpu_mvr_index(
         size_t n,
         size_t d,
@@ -79,4 +87,16 @@ struct cpu_mvr_index {
 
     void save(const std::string& filename) const;
     void load(const std::string& filename);
+
+    [[nodiscard]] bool uses_doc4ex_sidecar() const {
+        return loaded_payload_mode_ != cpu_quantized_payload_mode::DecodeDoc4;
+    }
+
+    [[nodiscard]] const char* quantized_payload_mode_name() const;
+
+private:
+    cpu_quantized_payload_mode requested_payload_mode_ =
+        cpu_quantized_payload_mode::DecodeDoc4;
+    cpu_quantized_payload_mode loaded_payload_mode_ =
+        cpu_quantized_payload_mode::DecodeDoc4;
 };

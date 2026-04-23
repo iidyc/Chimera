@@ -260,8 +260,10 @@ void rank_all_tokens_1bit_fastscan(
     const std::vector<size_t>& input_ids,
     size_t k,
     std::vector<size_t>& output_ids,
-    std::vector<float>& one_bit_dists)
+    std::vector<float>& one_bit_dists,
+    search_profile* profile)
 {
+    const auto t_stage2_start = std::chrono::high_resolution_clock::now();
     output_ids.clear();
     one_bit_dists.clear();
 
@@ -270,6 +272,7 @@ void rank_all_tokens_1bit_fastscan(
     for (size_t j = 0; j < q_doclen; ++j) {
         luts.emplace_back(std::make_unique<rabitqlib::Lut<float>>(queries[j].rotated_query, index.padded_dim_, true));
     }
+    const auto t_lut_done = std::chrono::high_resolution_clock::now();
 
     std::vector<float> doc_scores(input_ids.size(), 0.0f);
 #pragma omp parallel for
@@ -282,6 +285,7 @@ void rank_all_tokens_1bit_fastscan(
             q_doclen,
             input_ids[idx]);
     }
+    const auto t_score_done = std::chrono::high_resolution_clock::now();
 
     const size_t topk_count = std::min(k, input_ids.size());
     std::vector<size_t> selected_doc_indices(input_ids.size());
@@ -303,6 +307,7 @@ void rank_all_tokens_1bit_fastscan(
         output_ids[i] = input_ids[selected_doc_indices[i]];
         selected_doc_ptrs[i + 1] = selected_doc_ptrs[i] + index.doc_len(output_ids[i]);
     }
+    const auto t_select_done = std::chrono::high_resolution_clock::now();
 
     one_bit_dists.resize(selected_doc_ptrs.back() * q_doclen);
 #pragma omp parallel for
@@ -316,6 +321,15 @@ void rank_all_tokens_1bit_fastscan(
             q_doclen,
             doc_id,
             one_bit_dists.data() + selected_doc_ptrs[idx] * q_doclen);
+    }
+    const auto t_materialize_done = std::chrono::high_resolution_clock::now();
+
+    if (profile != nullptr) {
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        profile->stage2_lut_ms = ms(t_stage2_start, t_lut_done);
+        profile->stage2_score_docs_ms = ms(t_lut_done, t_score_done);
+        profile->stage2_select_topk_ms = ms(t_score_done, t_select_done);
+        profile->stage2_materialize_ms = ms(t_select_done, t_materialize_done);
     }
 }
 
@@ -354,9 +368,11 @@ std::vector<size_t> search_impl(
     const gpu_search_runtime_options& runtime,
     search_profile* profile)
 {
+    const auto t_query_setup_start = std::chrono::high_resolution_clock::now();
     std::vector<float> rotated_queries;
     std::vector<query_object> query_objs;
     build_query_objects(index, queries, q_doclen, rotated_queries, query_objs);
+    const auto t_query_setup_done = std::chrono::high_resolution_clock::now();
 
     const auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<size_t> rank_cluster_doc_ids;
@@ -381,7 +397,8 @@ std::vector<size_t> search_impl(
         rank_cluster_doc_ids,
         static_cast<size_t>(runtime.k_rank_all_tokens),
         rank_all_tokens_ids,
-        one_bit_dists);
+        one_bit_dists,
+        profile);
     const auto t2 = std::chrono::high_resolution_clock::now();
 
     std::vector<size_t> result;
@@ -392,15 +409,18 @@ std::vector<size_t> search_impl(
         rank_all_tokens_ids,
         one_bit_dists,
         k,
-        result);
+        result,
+        profile);
     const auto t3 = std::chrono::high_resolution_clock::now();
 
     if (profile != nullptr) {
         auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        profile->query_setup_ms = ms(t_query_setup_start, t_query_setup_done);
         profile->stage1_cluster_ms = ms(t0, t1);
         profile->stage2_1bit_ms = ms(t1, t2);
         profile->stage3_exbits_ms = ms(t2, t3);
         profile->total_ms = ms(t0, t3);
+        profile->end_to_end_ms = ms(t_query_setup_start, t3);
     }
 
     return result;
@@ -703,161 +723,169 @@ void rank_cluster_dists(
     output_ids.clear();
 
     const auto t_stage1_start = steady_clock::now();
-    std::vector<std::vector<size_t>> clusters_per_query(q_doclen);
-    if (auto* hnsw = dynamic_cast<PG_HNSW*>(index.ivf->pg_index)) {
-        hnsw->hnsw_index->setEf(PG_HNSW::search_ef_for_k(nprobe));
+    steady_clock::time_point t_probe_done;
+    steady_clock::time_point t_prepare_done;
+    steady_clock::time_point t_scan_done;
+    steady_clock::time_point t_reduce_done;
+    {
+        std::vector<std::vector<size_t>> clusters_per_query(q_doclen);
+        if (auto* hnsw = dynamic_cast<PG_HNSW*>(index.ivf->pg_index)) {
+            hnsw->hnsw_index->setEf(PG_HNSW::search_ef_for_k(nprobe));
 #pragma omp parallel for
-        for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
-            auto result = hnsw->hnsw_index->searchKnn(queries[j].rotated_query, nprobe);
-            auto& clusters = clusters_per_query[static_cast<size_t>(j)];
-            while (!result.empty()) {
-                clusters.push_back(static_cast<size_t>(result.top().second));
-                result.pop();
+            for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
+                auto result = hnsw->hnsw_index->searchKnn(queries[j].rotated_query, nprobe);
+                auto& clusters = clusters_per_query[static_cast<size_t>(j)];
+                while (!result.empty()) {
+                    clusters.push_back(static_cast<size_t>(result.top().second));
+                    result.pop();
+                }
+            }
+        } else {
+            for (size_t j = 0; j < q_doclen; ++j) {
+                index.ivf->pg_index->search(queries[j].rotated_query, nprobe, clusters_per_query[j]);
             }
         }
-    } else {
-        for (size_t j = 0; j < q_doclen; ++j) {
-            index.ivf->pg_index->search(queries[j].rotated_query, nprobe, clusters_per_query[j]);
-        }
-    }
-    const auto t_probe_done = steady_clock::now();
+        t_probe_done = steady_clock::now();
 
-    std::vector<std::unordered_map<size_t, repacked_cluster>> local_repacked_by_query;
+        std::vector<std::unordered_map<size_t, repacked_cluster>> local_repacked_by_query;
 #if !defined(GPU_MVR_CPU_V2_STAGE1_PREPACK) || !GPU_MVR_CPU_V2_STAGE1_PREPACK
-    local_repacked_by_query.resize(q_doclen);
-    for (size_t j = 0; j < q_doclen; ++j) {
-        auto& cache = local_repacked_by_query[j];
-        cache.reserve(clusters_per_query[j].size());
-        for (size_t cid : clusters_per_query[j]) {
-            if (cache.find(cid) != cache.end()) continue;
-            const size_t cluster_start = index.ivf->cluster_pos[cid];
-            const size_t cluster_size = index.ivf->cluster_pos[cid + 1] - cluster_start;
-            cache.emplace(cid, repack_cluster(stage1_cache, cluster_start, cluster_size));
+        local_repacked_by_query.resize(q_doclen);
+        for (size_t j = 0; j < q_doclen; ++j) {
+            auto& cache = local_repacked_by_query[j];
+            cache.reserve(clusters_per_query[j].size());
+            for (size_t cid : clusters_per_query[j]) {
+                if (cache.find(cid) != cache.end()) continue;
+                const size_t cluster_start = index.ivf->cluster_pos[cid];
+                const size_t cluster_size = index.ivf->cluster_pos[cid + 1] - cluster_start;
+                cache.emplace(cid, repack_cluster(stage1_cache, cluster_start, cluster_size));
+            }
         }
-    }
 #endif
-    const auto t_prepare_done = steady_clock::now();
+        t_prepare_done = steady_clock::now();
 
-    std::vector<std::unordered_map<int, float>> query_doc_max(q_doclen);
+        std::vector<std::unordered_map<int, float>> query_doc_max(q_doclen);
 #pragma omp parallel for
-    for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
-        const rabitqlib::Lut<float> lut(
-            queries[j].rotated_query,
-            index.padded_dim_,
-            true);
+        for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
+            const rabitqlib::Lut<float> lut(
+                queries[j].rotated_query,
+                index.padded_dim_,
+                true);
 
-        auto& doc_max = query_doc_max[static_cast<size_t>(j)];
-        doc_max.reserve(clusters_per_query[static_cast<size_t>(j)].size() * 64);
+            auto& doc_max = query_doc_max[static_cast<size_t>(j)];
+            doc_max.reserve(clusters_per_query[static_cast<size_t>(j)].size() * 64);
 
-        std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
+            std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
 
-        for (size_t cid : clusters_per_query[j]) {
-            size_t cluster_size = 0;
+            for (size_t cid : clusters_per_query[j]) {
+                size_t cluster_size = 0;
 #if defined(GPU_MVR_CPU_V2_STAGE1_PREPACK) && GPU_MVR_CPU_V2_STAGE1_PREPACK
-            const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cid);
-            const float* packed_factors = stage1_cache.packed_cluster_factors(cid);
-            const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cid);
-            cluster_size = stage1_cache.packed_cluster_token_count(cid);
+                const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cid);
+                const float* packed_factors = stage1_cache.packed_cluster_factors(cid);
+                const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cid);
+                cluster_size = stage1_cache.packed_cluster_token_count(cid);
 #else
-            const auto& repacked = local_repacked_by_query[static_cast<size_t>(j)].at(cid);
-            const uint8_t* packed_codes = repacked.packed_codes.data();
-            const float* packed_factors = repacked.packed_factors.data();
-            const int* packed_doc_ids = repacked.packed_doc_ids.data();
-            const size_t cluster_start = index.ivf->cluster_pos[cid];
-            cluster_size = index.ivf->cluster_pos[cid + 1] - cluster_start;
+                const auto& repacked = local_repacked_by_query[static_cast<size_t>(j)].at(cid);
+                const uint8_t* packed_codes = repacked.packed_codes.data();
+                const float* packed_factors = repacked.packed_factors.data();
+                const int* packed_doc_ids = repacked.packed_doc_ids.data();
+                const size_t cluster_start = index.ivf->cluster_pos[cid];
+                cluster_size = index.ivf->cluster_pos[cid + 1] - cluster_start;
 #endif
-            const size_t num_batches =
-                (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
-                rabitqlib::fastscan::kBatchSize;
+                const size_t num_batches =
+                    (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
+                    rabitqlib::fastscan::kBatchSize;
 
-            for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-                const uint8_t* batch_ptr =
-                    packed_codes +
-                    batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
-                rabitqlib::fastscan::accumulate_hacc(
-                    batch_ptr,
-                    lut.lut(),
-                    accum.data(),
-                    index.padded_dim_);
+                for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+                    const uint8_t* batch_ptr =
+                        packed_codes +
+                        batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
+                    rabitqlib::fastscan::accumulate_hacc(
+                        batch_ptr,
+                        lut.lut(),
+                        accum.data(),
+                        index.padded_dim_);
 
-                const size_t valid =
-                    std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
-                const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
+                    const size_t valid =
+                        std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
+                    const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
 
-                for (size_t lane = 0; lane < valid; ++lane) {
-                    const int doc_id = packed_doc_ids[lane_base + lane];
-                    const float ip =
-                        lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
-                    const float dist =
-                        (ip - queries[j].cb1_sumq) * packed_factors[lane_base + lane];
-                    auto [it, inserted] = doc_max.try_emplace(doc_id, dist);
-                    if (!inserted && dist > it->second) {
-                        it->second = dist;
+                    for (size_t lane = 0; lane < valid; ++lane) {
+                        const int doc_id = packed_doc_ids[lane_base + lane];
+                        const float ip =
+                            lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
+                        const float dist =
+                            (ip - queries[j].cb1_sumq) * packed_factors[lane_base + lane];
+                        auto [it, inserted] = doc_max.try_emplace(doc_id, dist);
+                        if (!inserted && dist > it->second) {
+                            it->second = dist;
+                        }
                     }
                 }
             }
         }
-    }
-    const auto t_scan_done = steady_clock::now();
+        t_scan_done = steady_clock::now();
 
-    size_t total_touched_docs = 0;
-    for (const auto& doc_max : query_doc_max) {
-        total_touched_docs += doc_max.size();
-    }
-
-    std::vector<std::pair<int, float>> all_doc_scores;
-    all_doc_scores.reserve(total_touched_docs);
-    for (const auto& doc_max : query_doc_max) {
-        for (const auto& [doc_id, score] : doc_max) {
-            all_doc_scores.emplace_back(doc_id, score);
+        size_t total_touched_docs = 0;
+        for (const auto& doc_max : query_doc_max) {
+            total_touched_docs += doc_max.size();
         }
-    }
 
-    std::sort(
-        all_doc_scores.begin(),
-        all_doc_scores.end(),
-        [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<std::pair<int, float>> all_doc_scores;
+        all_doc_scores.reserve(total_touched_docs);
+        for (const auto& doc_max : query_doc_max) {
+            for (const auto& [doc_id, score] : doc_max) {
+                all_doc_scores.emplace_back(doc_id, score);
+            }
+        }
 
-    std::vector<std::pair<float, int>> reduced_scores;
-    reduced_scores.reserve(all_doc_scores.size());
-    for (size_t i = 0; i < all_doc_scores.size();) {
-        const int doc_id = all_doc_scores[i].first;
-        float score_sum = 0.0f;
-        do {
-            score_sum += all_doc_scores[i].second;
-            ++i;
-        } while (i < all_doc_scores.size() && all_doc_scores[i].first == doc_id);
-        reduced_scores.emplace_back(score_sum, doc_id);
-    }
+        std::sort(
+            all_doc_scores.begin(),
+            all_doc_scores.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    const size_t topk_count = std::min(k, reduced_scores.size());
-    auto topk_order = [](const auto& a, const auto& b) {
-        if (a.first != b.first) return a.first > b.first;
-        return a.second < b.second;
-    };
-    if (topk_count < reduced_scores.size()) {
-        std::partial_sort(
-            reduced_scores.begin(),
-            reduced_scores.begin() + topk_count,
-            reduced_scores.end(),
-            topk_order);
-        reduced_scores.resize(topk_count);
-    } else {
-        std::sort(reduced_scores.begin(), reduced_scores.end(), topk_order);
-    }
+        std::vector<std::pair<float, int>> reduced_scores;
+        reduced_scores.reserve(all_doc_scores.size());
+        for (size_t i = 0; i < all_doc_scores.size();) {
+            const int doc_id = all_doc_scores[i].first;
+            float score_sum = 0.0f;
+            do {
+                score_sum += all_doc_scores[i].second;
+                ++i;
+            } while (i < all_doc_scores.size() && all_doc_scores[i].first == doc_id);
+            reduced_scores.emplace_back(score_sum, doc_id);
+        }
 
-    output_ids.reserve(topk_count);
-    for (const auto& [score, doc_id] : reduced_scores) {
-        (void)score;
-        output_ids.push_back(static_cast<size_t>(doc_id));
+        const size_t topk_count = std::min(k, reduced_scores.size());
+        auto topk_order = [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second < b.second;
+        };
+        if (topk_count < reduced_scores.size()) {
+            std::partial_sort(
+                reduced_scores.begin(),
+                reduced_scores.begin() + topk_count,
+                reduced_scores.end(),
+                topk_order);
+            reduced_scores.resize(topk_count);
+        } else {
+            std::sort(reduced_scores.begin(), reduced_scores.end(), topk_order);
+        }
+
+        output_ids.reserve(topk_count);
+        for (const auto& [score, doc_id] : reduced_scores) {
+            (void)score;
+            output_ids.push_back(static_cast<size_t>(doc_id));
+        }
+        t_reduce_done = steady_clock::now();
     }
-    const auto t_reduce_done = steady_clock::now();
+    const auto t_cleanup_done = steady_clock::now();
 
     if (profile != nullptr) {
         profile->stage1_probe_ms = ms_between(t_stage1_start, t_probe_done);
         profile->stage1_prepare_ms = ms_between(t_probe_done, t_prepare_done);
         profile->stage1_scan_ms = ms_between(t_prepare_done, t_scan_done);
         profile->stage1_reduce_ms = ms_between(t_scan_done, t_reduce_done);
+        profile->stage1_cleanup_ms = ms_between(t_reduce_done, t_cleanup_done);
     }
 }
 
@@ -881,7 +909,8 @@ std::vector<size_t> search_profiled(
     size_t q_doclen,
     size_t k,
     const gpu_search_runtime_options& runtime,
-    search_profile* profile)
+    search_profile* profile,
+    bool print_profile)
 {
     search_profile local_profile;
     std::vector<size_t> result =
@@ -889,7 +918,9 @@ std::vector<size_t> search_profiled(
     if (profile != nullptr) {
         *profile = local_profile;
     }
-    cpu_kernel_v2::print_search_profile(local_profile);
+    if (print_profile) {
+        cpu_kernel_v2::print_search_profile(local_profile);
+    }
     return result;
 }
 
@@ -900,6 +931,7 @@ void print_search_profile(const search_profile& profile)
               << "stage1_prepare: " << profile.stage1_prepare_ms << " ms, "
               << "stage1_scan: " << profile.stage1_scan_ms << " ms, "
               << "stage1_reduce: " << profile.stage1_reduce_ms << " ms, "
+              << "stage1_cleanup: " << profile.stage1_cleanup_ms << " ms, "
               << "stage2_1bit: " << profile.stage2_1bit_ms << " ms, "
               << "stage3_exbits: " << profile.stage3_exbits_ms << " ms, "
               << "total: " << profile.total_ms << " ms\n";

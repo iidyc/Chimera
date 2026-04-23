@@ -158,8 +158,12 @@ std::vector<size_t> search_profiled(
     size_t q_doclen,
     size_t k,
     const gpu_search_runtime_options& runtime,
-    search_profile* profile = nullptr);
+    search_profile* profile = nullptr,
+    bool print_profile = true);
 
+using cpu_kernel_v1::accumulate_search_profile;
+using cpu_kernel_v1::average_search_profile;
 void print_search_profile(const search_profile& profile);
+using cpu_kernel_v1::print_search_profile_summary;
 
 }  // namespace cpu_kernel_v2

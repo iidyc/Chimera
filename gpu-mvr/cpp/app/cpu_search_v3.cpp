@@ -71,7 +71,9 @@ int main(int argc, char** argv) {
     std::vector<int> doclens = load_doclens(args.doclens_file);
     auto ground_truth = read_gt_tsv(static_cast<int>(num_q), 1000, args.gt_file);
 
-    cpu_mvr_index index(args.index_file);
+    cpu_mvr_index index(
+        args.index_file,
+        cpu_quantized_payload_mode::RequireDoc4ExSidecar);
     index.set_doc_mapping(doclens);
     cpu_kernel_v3::clustered_stage1_cache stage1_cache(args.index_file, index);
     cpu_kernel_v3::packed_token_stream_cache stage2_cache(index);
@@ -99,6 +101,11 @@ int main(int argc, char** argv) {
     std::cout
         << "[RUN] cpu_search_v3 uses prepacked clustered fastscan Stage 1 from cluster_1bit.bin; "
         << "Stage 2 and Stage 3 reuse the packed v2 CPU kernels."
+        << std::endl;
+    std::cout
+        << "[RUN] stage3_quantized_payload=" << index.quantized_payload_mode_name()
+        << " ex_bits=" << index.ex_bits
+        << " combine_mode=one_bit_plus_ex_bits"
         << std::endl;
     std::cout
         << "[RUN] stage1_prepack=enabled packed_stage1_cache original_code_mib="
@@ -133,6 +140,8 @@ int main(int argc, char** argv) {
             << " warmup_queries=" << warmup_queries
             << " eval_queries=" << run_queries
             << " k=" << args.k
+            << " profile_eval_all_queries="
+            << (args.profile_eval_all_queries ? "true" : "false")
             << std::endl;
         print_gpu_search_runtime_config_banner(runtime_config);
 
@@ -140,7 +149,7 @@ int main(int argc, char** argv) {
         auto warmup_last_log = warmup_start;
         for (int i = 0; i < warmup_queries; ++i) {
             const float* query_ptr = &Q[static_cast<size_t>(i) * q_doclen_file * d];
-            if (i + 1 == warmup_queries) {
+            if (!args.profile_eval_all_queries && i + 1 == warmup_queries) {
                 cpu_kernel_v3::search_profiled(
                     index,
                     stage1_cache,
@@ -173,18 +182,34 @@ int main(int argc, char** argv) {
         std::vector<std::vector<size_t>> results(run_queries);
         std::vector<double> query_latencies_ms;
         query_latencies_ms.reserve(run_queries);
+        cpu_kernel_v3::search_profile total_profile;
         const auto eval_start = std::chrono::steady_clock::now();
         auto eval_last_log = eval_start;
         for (int i = 0; i < run_queries; ++i) {
             const auto query_start = std::chrono::high_resolution_clock::now();
-            results[i] = cpu_kernel_v3::search(
-                index,
-                stage1_cache,
-                stage2_cache,
-                &Q[static_cast<size_t>(i) * q_doclen_file * d],
-                q_doclen_file,
-                static_cast<size_t>(args.k),
-                runtime_config.runtime);
+            if (args.profile_eval_all_queries) {
+                cpu_kernel_v3::search_profile query_profile;
+                results[i] = cpu_kernel_v3::search_profiled(
+                    index,
+                    stage1_cache,
+                    stage2_cache,
+                    &Q[static_cast<size_t>(i) * q_doclen_file * d],
+                    q_doclen_file,
+                    static_cast<size_t>(args.k),
+                    runtime_config.runtime,
+                    &query_profile,
+                    false);
+                cpu_kernel_v3::accumulate_search_profile(total_profile, query_profile);
+            } else {
+                results[i] = cpu_kernel_v3::search(
+                    index,
+                    stage1_cache,
+                    stage2_cache,
+                    &Q[static_cast<size_t>(i) * q_doclen_file * d],
+                    q_doclen_file,
+                    static_cast<size_t>(args.k),
+                    runtime_config.runtime);
+            }
             const auto query_end = std::chrono::high_resolution_clock::now();
             query_latencies_ms.push_back(
                 std::chrono::duration<double, std::milli>(query_end - query_start).count());
@@ -202,6 +227,11 @@ int main(int argc, char** argv) {
             std::to_string(run_queries) + " queries.");
         print_query_latency_summary(query_latencies_ms, total_seconds);
         compute_recall(eval_ground_truth, results, args.k);
+        if (args.profile_eval_all_queries) {
+            cpu_kernel_v3::print_search_profile_summary(
+                total_profile,
+                static_cast<size_t>(run_queries));
+        }
     }
 
     return 0;

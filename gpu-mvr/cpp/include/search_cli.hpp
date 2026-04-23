@@ -23,6 +23,7 @@ struct gpu_search_cli_args {
     int k = 100;
     int nq = -1;
     int warmup = 5;
+    bool profile_eval_all_queries = false;
     std::string query_file;
     std::string doclens_file;
     std::string gt_file;
@@ -238,6 +239,7 @@ inline void print_gpu_search_help(const char* program, const gpu_search_cli_args
         << "  [--k <top_k>]                   Final number of documents returned. Default: " << defaults.k << "\n"
         << "  [--nq <num_queries_to_run>]     Number of evaluation queries timed after warmup; evaluation restarts from query 0. -1 means all queries. Default: " << defaults.nq << "\n"
         << "  [--warmup <num_warmup_queries>] Warmup queries run before timing/recall; evaluation still restarts from query 0. Default: " << defaults.warmup << "\n"
+        << "  [--profile-eval-all-queries]    Collect CPU stage timing on every evaluation query and print only averaged breakdowns at the end.\n"
         << "  [--nprobe <num_probes>]         Number of IVF clusters probed per query token. Default: " << defaults.runtime.nprobe << "\n"
         << "  [--k-rank-cluster <count>]      Stage-1 document candidates kept after cluster scoring. Default: " << defaults.runtime.k_rank_cluster << "\n"
         << "  [--k-rank-all-tokens <count>]   Stage-2 candidates kept before final CPU/GPU rerank. Default: " << defaults.runtime.k_rank_all_tokens << "\n"
@@ -274,6 +276,8 @@ inline gpu_search_cli_args parse_gpu_search_args(
             args.nq = std::stoi(require_gpu_search_arg_value(argc, argv, i, arg));
         } else if (arg == "--warmup") {
             args.warmup = std::stoi(require_gpu_search_arg_value(argc, argv, i, arg));
+        } else if (arg == "--profile-eval-all-queries") {
+            args.profile_eval_all_queries = true;
         } else if (arg == "--nprobe") {
             args.runtime.nprobe = std::stoi(require_gpu_search_arg_value(argc, argv, i, arg));
         } else if (arg == "--k-rank-cluster") {
