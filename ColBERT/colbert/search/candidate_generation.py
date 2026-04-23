@@ -2,6 +2,7 @@ import torch
 
 from colbert.search.strided_tensor import StridedTensor
 from .strided_tensor_core import _create_mask, _create_view
+from .profiling import move_to_cuda, profile_section
 
 
 class CandidateGeneration:
@@ -10,37 +11,42 @@ class CandidateGeneration:
         self.use_gpu = use_gpu
 
     def get_cells(self, Q, ncells):
-        scores = (self.codec.centroids @ Q.T)
-        if ncells == 1:
-            cells = scores.argmax(dim=0, keepdim=True).permute(1, 0)
-        else:
-            cells = scores.topk(ncells, dim=0, sorted=False).indices.permute(1, 0)  # (32, ncells)
-        cells = cells.flatten().contiguous()  # (32 * ncells,)
-        cells = cells.unique(sorted=False)
+        with profile_section("candidate.centroid_score", cuda=self.use_gpu):
+            scores = (self.codec.centroids @ Q.T)
+        with profile_section("candidate.cell_select", cuda=self.use_gpu):
+            if ncells == 1:
+                cells = scores.argmax(dim=0, keepdim=True).permute(1, 0)
+            else:
+                cells = scores.topk(ncells, dim=0, sorted=False).indices.permute(1, 0)  # (32, ncells)
+            cells = cells.flatten().contiguous()  # (32 * ncells,)
+            cells = cells.unique(sorted=False)
         return cells, scores
 
     def generate_candidate_eids(self, Q, ncells):
         cells, scores = self.get_cells(Q, ncells)
 
-        eids, cell_lengths = self.ivf.lookup(cells)  # eids = (packedlen,)  lengths = (32 * ncells,)
+        with profile_section("candidate.ivf_lookup", cuda=self.use_gpu):
+            eids, cell_lengths = self.ivf.lookup(cells)  # eids = (packedlen,)  lengths = (32 * ncells,)
         eids = eids.long()
         if self.use_gpu:
-            eids = eids.cuda()
+            eids = move_to_cuda(eids, transfer_name="candidate_eids")
         return eids, scores
 
     def generate_candidate_pids(self, Q, ncells):
         cells, scores = self.get_cells(Q, ncells)
 
-        pids, cell_lengths = self.ivf.lookup(cells)
+        with profile_section("candidate.ivf_lookup", cuda=self.use_gpu):
+            pids, cell_lengths = self.ivf.lookup(cells)
         if self.use_gpu:
-            pids = pids.cuda()
+            pids = move_to_cuda(pids, transfer_name="candidate_pids")
         return pids, scores
 
     def generate_candidate_scores(self, Q, eids):
         E = self.lookup_eids(eids)
         if self.use_gpu:
-            E = E.cuda()
-        return (Q.unsqueeze(0) @ E.unsqueeze(2)).squeeze(-1).T
+            E = move_to_cuda(E, transfer_name="candidate_embeddings")
+        with profile_section("candidate.score_candidates", cuda=self.use_gpu):
+            return (Q.unsqueeze(0) @ E.unsqueeze(2)).squeeze(-1).T
 
     def generate_candidates(self, config, Q):
         ncells = config.ncells
@@ -49,16 +55,18 @@ class CandidateGeneration:
 
         Q = Q.squeeze(0)
         if self.use_gpu:
-            Q = Q.cuda().half()
+            Q = move_to_cuda(Q, transfer_name="query", dtype=torch.float16)
         assert Q.dim() == 2
 
         pids, centroid_scores = self.generate_candidate_pids(Q, ncells)
 
-        sorter = pids.sort()
-        pids = sorter.values
+        with profile_section("candidate.pid_dedup", cuda=self.use_gpu):
+            sorter = pids.sort()
+            pids = sorter.values
 
-        pids, pids_counts = torch.unique_consecutive(pids, return_counts=True)
-        if self.use_gpu:
-            pids, pids_counts = pids.cuda(), pids_counts.cuda()
+            pids, pids_counts = torch.unique_consecutive(pids, return_counts=True)
+            if self.use_gpu:
+                pids = move_to_cuda(pids, transfer_name="candidate_unique_pids")
+                pids_counts = move_to_cuda(pids_counts, transfer_name="candidate_unique_counts")
 
         return pids, centroid_scores

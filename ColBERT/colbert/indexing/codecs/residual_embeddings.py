@@ -9,7 +9,13 @@ from colbert.utils.utils import print_message
 class ResidualEmbeddings:
     Strided = ResidualEmbeddingsStrided
 
-    def __init__(self, codes, residuals):
+    def __init__(
+        self,
+        codes,
+        residuals,
+        compressed_embeddings_storage="cpu",
+        keep_cpu_copy=True,
+    ):
         """
             Supply the already compressed residuals.
         """
@@ -19,13 +25,51 @@ class ResidualEmbeddings:
         assert codes.dim() == 1 and residuals.dim() == 2, (codes.size(), residuals.size())
         assert residuals.dtype == torch.uint8
 
-        self.codes = codes.to(torch.int32)  # (num_embeddings,) int32
-        self.residuals = residuals   # (num_embeddings, compressed_dim) uint8
-        self.residuals_cpu = residuals.cpu()
-        self.codes_cpu = codes.cpu()
+        if compressed_embeddings_storage not in {"cpu", "gpu"}:
+            raise ValueError(
+                "compressed_embeddings_storage must be one of: cpu, gpu"
+            )
+        if compressed_embeddings_storage == "gpu" and not torch.cuda.is_available():
+            raise ValueError(
+                "compressed_embeddings_storage=gpu requires torch.cuda.is_available()"
+            )
+
+        codes = codes.to(torch.int32)
+        residuals = residuals.to(torch.uint8)
+
+        self.storage_device = compressed_embeddings_storage
+        self.codes_cpu = None
+        self.residuals_cpu = None
+
+        if keep_cpu_copy:
+            self.codes_cpu = codes.cpu()
+            self.residuals_cpu = residuals.cpu()
+
+        if compressed_embeddings_storage == "gpu":
+            if keep_cpu_copy:
+                print_message("#> Moving compressed embeddings to GPU...")
+                self.codes = self.codes_cpu.cuda()
+                self.residuals = self.residuals_cpu.cuda()
+            else:
+                self.codes = codes.cuda()
+                self.residuals = residuals.cuda()
+        else:
+            if keep_cpu_copy:
+                self.codes = self.codes_cpu  # (num_embeddings,) int32
+                self.residuals = self.residuals_cpu   # (num_embeddings, compressed_dim) uint8
+            else:
+                self.codes = codes
+                self.residuals = residuals
 
     @classmethod
-    def load_chunks(cls, index_path, chunk_idxs, num_embeddings, load_index_with_mmap=False):
+    def load_chunks(
+        cls,
+        index_path,
+        chunk_idxs,
+        num_embeddings,
+        load_index_with_mmap=False,
+        compressed_embeddings_storage="cpu",
+    ):
         num_embeddings += 512  # pad for access with strides
 
         dim, nbits = get_dim_and_nbits(index_path)
@@ -73,7 +117,11 @@ class ResidualEmbeddings:
 
                 codes_offset = codes_endpos
 
-        return cls(codes, residuals)
+        return cls(
+            codes,
+            residuals,
+            compressed_embeddings_storage=compressed_embeddings_storage,
+        )
 
     @classmethod
     def load(cls, index_path, chunk_idx):

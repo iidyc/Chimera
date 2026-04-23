@@ -11,6 +11,7 @@ import torch
 from colbert import EmbeddingIndexer, Searcher
 from colbert.infra import Run, RunConfig, ColBERTConfig
 from colbert.modeling.colbert import ColBERT
+from colbert.search.profiling import SearchBreakdownProfiler, activated_profiler
 
 
 def bytes_to_mib(value):
@@ -84,6 +85,23 @@ class ProcessGpuMemoryMonitor:
         self._sample_once()
 
 
+PROFILE_BREAKDOWN_HEADER = [
+    "implementation",
+    "dataset",
+    "k",
+    "ncells",
+    "ndocs",
+    "compressed_embeddings_storage",
+    "gpu_index_resident",
+    "queries",
+    "metric_type",
+    "metric_name",
+    "avg_ms",
+    "calls_per_query",
+    "avg_mib",
+]
+
+
 def read_gt_tsv(num_queries, top_k, filename):
     ground_truth = [[-1] * top_k for _ in range(num_queries)]
     try:
@@ -117,7 +135,53 @@ def parse_args():
                    help="List of ncells,ndocs pairs, e.g. --pairs 1,1000 2,4000 4,8000")
     p.add_argument("--k", type=int, default=100)
     p.add_argument("--warmup", type=int, default=5)
+    p.add_argument(
+        "--compressed-embeddings-storage",
+        choices=("cpu", "gpu"),
+        default="cpu",
+        help=(
+            "Where to keep the packed ColBERT codes/residuals during search. "
+            "'cpu' keeps the compressed tensors on host memory and migrates "
+            "slices on demand. 'gpu' preloads the compressed tensors into "
+            "GPU memory to avoid those host-to-device copies."
+        ),
+    )
+    p.add_argument(
+        "--gpu-index-resident",
+        action="store_true",
+        help=(
+            "Preload IVF lists and doclens onto GPU and keep the compressed "
+            "index resident there. Requires --compressed-embeddings-storage gpu."
+        ),
+    )
+    p.add_argument("--dataset-name", default="", help="Dataset label for profiling output.")
+    p.add_argument("--implementation-label", default="", help="Implementation label for profiling output.")
+    p.add_argument(
+        "--profile-breakdown-csv",
+        default="",
+        help=(
+            "Optional long-form CSV path for aggregated stage/transfer timings. "
+            "When set, the script runs one extra profiling pass per configuration "
+            "and appends one averaged summary per metric."
+        ),
+    )
     return p.parse_args()
+
+
+def append_profile_rows(csv_path, rows):
+    if not rows:
+        return
+
+    parent = os.path.dirname(csv_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PROFILE_BREAKDOWN_HEADER)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def main():
@@ -136,6 +200,8 @@ def main():
 
     warmup_queries = min(int(args.warmup), int(n))
     run_queries = int(n)
+    if args.gpu_index_resident and args.compressed_embeddings_storage != "gpu":
+        raise ValueError("--gpu-index-resident requires --compressed-embeddings-storage gpu")
 
     ground_truth = read_gt_tsv(num_queries=n, top_k=1000, filename=args.ground_truth_path)
 
@@ -157,7 +223,12 @@ def main():
         with Run().context(RunConfig(experiment=args.experiment_name, root=args.root_path)):
             ColBERT.try_load_torch_extensions(False)
             for ncells, ndocs in args.pairs:
-                config = ColBERTConfig(ncells=ncells, ndocs=ndocs)
+                config = ColBERTConfig(
+                    ncells=ncells,
+                    ndocs=ndocs,
+                    compressed_embeddings_storage=args.compressed_embeddings_storage,
+                    gpu_index_resident=args.gpu_index_resident,
+                )
                 searcher = Searcher(index=args.index_name, checkpoint=None, config=config)
                 num_runs = 3
                 run_times = []
@@ -168,7 +239,9 @@ def main():
                 torch_peak_reserved_mib = 0.0
                 print(
                     f"[RUN] ncells={ncells} ndocs={ndocs} "
-                    f"warmup_queries={warmup_queries} eval_queries={run_queries}"
+                    f"warmup_queries={warmup_queries} eval_queries={run_queries} "
+                    f"compressed_embeddings_storage={args.compressed_embeddings_storage} "
+                    f"gpu_index_resident={args.gpu_index_resident}"
                 )
                 if torch.cuda.is_available():
                     _, total_bytes = torch.cuda.mem_get_info()
@@ -231,6 +304,44 @@ def main():
                     f"{torch_peak_reserved_mib:.2f}",
                 ])
                 csv_file.flush()
+
+                if args.profile_breakdown_csv:
+                    profiler = SearchBreakdownProfiler(use_cuda=torch.cuda.is_available())
+                    print(
+                        f"[PROFILE] ncells={ncells} ndocs={ndocs} "
+                        f"queries={run_queries} output={args.profile_breakdown_csv}"
+                    )
+                    for qid in range(warmup_queries):
+                        searcher.search_from_embeddings(query_emb[qid], k=args.k)
+                    with activated_profiler(profiler):
+                        for qid in range(run_queries):
+                            searcher.search_from_embeddings(query_emb[qid], k=args.k)
+
+                    metadata = {
+                        "implementation": args.implementation_label,
+                        "dataset": args.dataset_name,
+                        "k": args.k,
+                        "ncells": ncells,
+                        "ndocs": ndocs,
+                        "compressed_embeddings_storage": args.compressed_embeddings_storage,
+                        "gpu_index_resident": str(bool(args.gpu_index_resident)).lower(),
+                        "queries": profiler.query_count,
+                    }
+                    rows = profiler.summary_rows(metadata)
+                    append_profile_rows(args.profile_breakdown_csv, rows)
+                    print(f"[PROFILE] wrote_rows={len(rows)}")
+                    for row in rows:
+                        if row["metric_type"] == "stage":
+                            print(
+                                f"[PROFILE_STAGE] name={row['metric_name']} "
+                                f"avg_ms={row['avg_ms']} calls_per_query={row['calls_per_query']}"
+                            )
+                        else:
+                            print(
+                                f"[PROFILE_TRANSFER] name={row['metric_name']} "
+                                f"avg_ms={row['avg_ms']} avg_mib={row['avg_mib']} "
+                                f"calls_per_query={row['calls_per_query']}"
+                            )
 
 if __name__ == "__main__":
     main()

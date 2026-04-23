@@ -5,6 +5,7 @@ from torch._C import device
 from colbert.utils.utils import flatten, print_message
 
 from .strided_tensor_core import StridedTensorCore, _create_mask, _create_view
+from .profiling import move_to_cuda
 
 import os
 import pathlib
@@ -12,8 +13,8 @@ from torch.utils.cpp_extension import load
 
 
 class StridedTensor(StridedTensorCore):
-    def __init__(self, packed_tensor, lengths, dim=None, use_gpu=True):
-        super().__init__(packed_tensor, lengths, dim=dim, use_gpu=use_gpu)
+    def __init__(self, packed_tensor, lengths, dim=None, use_gpu=True, profile_name=None):
+        super().__init__(packed_tensor, lengths, dim=dim, use_gpu=use_gpu, profile_name=profile_name)
 
         StridedTensor.try_load_torch_extensions(use_gpu)
 
@@ -61,7 +62,8 @@ class StridedTensor(StridedTensorCore):
 
         assert pids.dim() == 1
 
-        pids = pids.long().cpu()
+        lookup_device = self.tensor.device if (self.use_gpu and self.tensor.is_cuda and self.lengths.is_cuda and self.offsets.is_cuda) else torch.device("cpu")
+        pids = pids.long().to(device=lookup_device)
         lengths = self.lengths[pids]
         offsets = self.offsets[pids]
 
@@ -75,8 +77,8 @@ class StridedTensor(StridedTensorCore):
             stride = next(s for s in self.strides if stride <= s)
 
             tensor = self.views[stride][offsets]
-            if self.use_gpu:
-                tensor = tensor.cuda()
+            if self.use_gpu and not tensor.is_cuda:
+                tensor = move_to_cuda(tensor, transfer_name=self.profile_name)
 
             mask = _create_mask(lengths, stride, use_gpu=self.use_gpu)
 
@@ -124,7 +126,7 @@ class StridedTensor(StridedTensorCore):
 
         lengths2 = lengths.clone()
         sentinel = self.strides[-1] + 1
-        order = torch.arange(pids.size(0), device='cuda' if self.use_gpu else 'cpu')
+        order = torch.arange(pids.size(0), device=lengths.device)
 
         all_orders = []
         all_tensors = []
@@ -147,7 +149,7 @@ class StridedTensor(StridedTensorCore):
 
             lengths2[is_shorter] = sentinel
 
-        assert lengths2.allclose(torch.tensor([sentinel], device='cuda' if self.use_gpu else 'cpu'))
+        assert lengths2.allclose(torch.tensor([sentinel], device=lengths2.device, dtype=lengths2.dtype))
 
         all_orders = torch.cat(all_orders)
         permute_idxs = torch.sort(all_orders).indices
@@ -156,8 +158,8 @@ class StridedTensor(StridedTensorCore):
 
     def _lookup_with_stride(self, stride, lengths, offsets):
         tensor = self.views[stride][offsets]
-        if self.use_gpu:
-            tensor = tensor.cuda()
+        if self.use_gpu and not tensor.is_cuda:
+            tensor = move_to_cuda(tensor, transfer_name=self.profile_name)
 
         mask = _create_mask(lengths, stride, use_gpu=self.use_gpu)
         # tensor = tensor[mask]

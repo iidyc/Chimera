@@ -31,9 +31,11 @@ Options:
   --log-dir <path>           Passed through to bench_colbert.sh.
   --k <top_k>                Passed through to bench_colbert.sh.
   --warmup <count>           Passed through to bench_colbert.sh.
-  --copy-index-to-tmp        Passed through to bench_colbert.sh.
-  --refresh-tmp-index        Passed through to bench_colbert.sh.
-  --tmp-root <path>          Passed through to bench_colbert.sh.
+  --compressed-embeddings-storage <cpu|gpu>
+                             Passed through to bench_colbert.sh.
+  --gpu-index-resident       Passed through to bench_colbert.sh.
+  --profile-breakdown-csv <path>
+                             Passed through to bench_colbert.sh.
   --dry-run                  Print commands without executing them.
   -h, --help                 Show this help message.
 EOF
@@ -94,12 +96,12 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
-        --config-file|--env-name|--search-script|--experiment-name|--index-name|--implementation-label|--output-dir|--log-dir|--k|--warmup|--tmp-root)
+        --config-file|--env-name|--search-script|--experiment-name|--index-name|--implementation-label|--output-dir|--log-dir|--k|--warmup|--compressed-embeddings-storage|--profile-breakdown-csv)
             [[ $# -ge 2 ]] || die "missing value for $1"
             pass_through_args+=("$1" "$2")
             shift 2
             ;;
-        --copy-index-to-tmp|--refresh-tmp-index)
+        --gpu-index-resident)
             pass_through_args+=("$1")
             shift
             ;;

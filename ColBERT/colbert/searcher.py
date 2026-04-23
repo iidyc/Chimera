@@ -16,6 +16,8 @@ from colbert.infra.launcher import print_memory_stats
 
 import time
 
+from colbert.search.profiling import get_active_profiler, profile_section
+
 TextQueries = Union[str, 'list[str]', 'dict[int, str]', Queries]
 
 
@@ -65,9 +67,33 @@ class Searcher:
 
         use_gpu = self.config.total_visible_gpus > 0
         load_index_with_mmap = self.config.load_index_with_mmap
+        compressed_embeddings_storage = self.config.compressed_embeddings_storage
+        gpu_index_resident = self.config.gpu_index_resident
         if load_index_with_mmap and use_gpu:
             raise ValueError(f"Memory-mapped index can only be used with CPU!")
-        self.ranker = IndexScorer(self.index, use_gpu, load_index_with_mmap)
+        if compressed_embeddings_storage not in {"cpu", "gpu"}:
+            raise ValueError(
+                "compressed_embeddings_storage must be one of: cpu, gpu"
+            )
+        if compressed_embeddings_storage == "gpu" and not use_gpu:
+            raise ValueError(
+                "compressed_embeddings_storage=gpu requires CUDA-enabled search"
+            )
+        if gpu_index_resident and not use_gpu:
+            raise ValueError("gpu_index_resident requires CUDA-enabled search")
+        if gpu_index_resident and load_index_with_mmap:
+            raise ValueError("gpu_index_resident is incompatible with memory-mapped index loading")
+        if gpu_index_resident and compressed_embeddings_storage != "gpu":
+            raise ValueError(
+                "gpu_index_resident requires compressed_embeddings_storage=gpu"
+            )
+        self.ranker = IndexScorer(
+            self.index,
+            use_gpu,
+            load_index_with_mmap,
+            compressed_embeddings_storage=compressed_embeddings_storage,
+            gpu_index_resident=gpu_index_resident,
+        )
 
         print_memory_stats()
 
@@ -241,6 +267,11 @@ class Searcher:
             if self.config.ndocs is None:
                 self.configure(ndocs=max(k * 4, 4096))
 
-        pids, scores = self.ranker.rank(self.config, Q, filter_fn=filter_fn, pids=pids, force_cpu_scoring=force_cpu_scoring)
+        profiler = get_active_profiler()
+        if profiler is not None:
+            profiler.mark_query()
+
+        with profile_section("search.total", cuda=self.config.total_visible_gpus > 0):
+            pids, scores = self.ranker.rank(self.config, Q, filter_fn=filter_fn, pids=pids, force_cpu_scoring=force_cpu_scoring)
 
         return pids[:k], list(range(1, k+1)), scores[:k]

@@ -186,3 +186,5 @@ class SearchSettings:
     centroid_score_threshold: float = DefaultVal(None)
     ndocs: int = DefaultVal(None)
     load_index_with_mmap: bool = DefaultVal(False)
+    compressed_embeddings_storage: str = DefaultVal("cpu")
+    gpu_index_resident: bool = DefaultVal(False)

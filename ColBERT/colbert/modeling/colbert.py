@@ -11,6 +11,8 @@ import os
 import pathlib
 from torch.utils.cpp_extension import load
 
+from colbert.search.profiling import move_to_cuda, profile_section
+
 
 class ColBERT(BaseColBERT):
     """
@@ -166,15 +168,18 @@ def colbert_score(Q, D_padded, D_mask, config=ColBERTConfig()):
 
     use_gpu = config.total_visible_gpus > 0
     if use_gpu:
-        Q, D_padded, D_mask = Q.cuda(), D_padded.cuda(), D_mask.cuda()
+        Q = move_to_cuda(Q, transfer_name="score_q")
+        D_padded = move_to_cuda(D_padded, transfer_name="score_d_padded")
+        D_mask = move_to_cuda(D_mask, transfer_name="score_d_mask")
 
     assert Q.dim() == 3, Q.size()
     assert D_padded.dim() == 3, D_padded.size()
     assert Q.size(0) in [1, D_padded.size(0)]
 
-    scores = D_padded @ Q.to(dtype=D_padded.dtype).permute(0, 2, 1)
-
-    return colbert_score_reduce(scores, D_mask, config)
+    with profile_section("final.matmul", cuda=use_gpu):
+        scores = D_padded @ Q.to(dtype=D_padded.dtype).permute(0, 2, 1)
+    with profile_section("final.reduce", cuda=use_gpu):
+        return colbert_score_reduce(scores, D_mask, config)
 
 
 def colbert_score_packed(Q, D_packed, D_lengths, config=ColBERTConfig()):
@@ -185,18 +190,22 @@ def colbert_score_packed(Q, D_packed, D_lengths, config=ColBERTConfig()):
     use_gpu = config.total_visible_gpus > 0
 
     if use_gpu:
-        Q, D_packed, D_lengths = Q.cuda(), D_packed.cuda(), D_lengths.cuda()
+        Q = move_to_cuda(Q, transfer_name="score_q")
+        D_packed = move_to_cuda(D_packed, transfer_name="score_d_packed")
+        D_lengths = move_to_cuda(D_lengths, transfer_name="score_d_lengths")
 
     Q = Q.squeeze(0)
 
     assert Q.dim() == 2, Q.size()
     assert D_packed.dim() == 2, D_packed.size()
 
-    scores = D_packed @ Q.to(dtype=D_packed.dtype).T
+    with profile_section("final.matmul", cuda=use_gpu):
+        scores = D_packed @ Q.to(dtype=D_packed.dtype).T
 
     if use_gpu or config.interaction == "flipr":
-        scores_padded, scores_mask = StridedTensor(scores, D_lengths, use_gpu=use_gpu).as_padded_tensor()
-
-        return colbert_score_reduce(scores_padded, scores_mask, config)
+        with profile_section("final.pack_scores", cuda=use_gpu):
+            scores_padded, scores_mask = StridedTensor(scores, D_lengths, use_gpu=use_gpu).as_padded_tensor()
+        with profile_section("final.reduce", cuda=use_gpu):
+            return colbert_score_reduce(scores_padded, scores_mask, config)
     else:
         return ColBERT.segmented_maxsim(scores, D_lengths)

@@ -16,11 +16,12 @@ atexit.register(profile.print_stats)
 
 class StridedTensorCore:
     # # @profile
-    def __init__(self, packed_tensor, lengths, dim=None, use_gpu=True):
+    def __init__(self, packed_tensor, lengths, dim=None, use_gpu=True, profile_name=None):
         self.dim = dim
         self.tensor = packed_tensor
         self.inner_dims = self.tensor.size()[1:]
         self.use_gpu = use_gpu
+        self.profile_name = profile_name
 
         self.lengths = lengths.long() if torch.is_tensor(lengths) else torch.LongTensor(lengths)
 
@@ -77,8 +78,11 @@ class StridedTensorCore:
     # # @profile
     def as_padded_tensor(self):
         if self.use_gpu:
-            view = _create_view(self.tensor.cuda(), self.max_stride, self.inner_dims)[self.offsets[:-1]]
-            mask = _create_mask(self.lengths.cuda(), self.max_stride, like=view, use_gpu=self.use_gpu)
+            tensor = self.tensor if self.tensor.is_cuda else self.tensor.cuda()
+            offsets = self.offsets if self.offsets.device == tensor.device else self.offsets.to(device=tensor.device)
+            lengths = self.lengths if self.lengths.device == tensor.device else self.lengths.to(device=tensor.device)
+            view = _create_view(tensor, self.max_stride, self.inner_dims)[offsets[:-1]]
+            mask = _create_mask(lengths, self.max_stride, like=view, use_gpu=self.use_gpu)
         else:
             #import pdb
             #pdb.set_trace()
@@ -117,8 +121,9 @@ def _create_view(tensor, stride, inner_dims):
 
 def _create_mask(lengths, stride, like=None, use_gpu=True):
     if use_gpu:
-        mask = torch.arange(stride).cuda() + 1
-        mask = mask.unsqueeze(0) <= lengths.cuda().unsqueeze(-1)
+        device = like.device if like is not None else torch.device("cuda")
+        mask = torch.arange(stride, device=device) + 1
+        mask = mask.unsqueeze(0) <= lengths.to(device=device).unsqueeze(-1)
     else:
         mask = torch.arange(stride) + 1
         mask = mask.unsqueeze(0) <= lengths.unsqueeze(-1)

@@ -22,9 +22,6 @@ Description:
     profiling/<dataset>/colbert/search_py_output.csv
     log/bench/colbert/<dataset>/benchmark.log
 
-  Optional /tmp staging can copy dataset/<name>/colbert into local storage
-  first and run the benchmark from there to avoid NFS index reads.
-
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
   --config-file <path>     Config CSV. Default: profiling/colbert_config.csv
@@ -38,10 +35,16 @@ Options:
   --log-dir <path>         Log output directory. Default: log/bench
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
   --warmup <count>         Warmup query count before timed runs restart from query 0. Default: 5
-  --copy-index-to-tmp      Copy the ColBERT experiment directory into /tmp first.
-  --refresh-tmp-index      Re-copy the /tmp index even if it already exists.
-  --tmp-root <path>        Root directory for /tmp ColBERT copies.
-                           Default: /tmp/$USER/colbert_benchmark
+  --compressed-embeddings-storage <cpu|gpu>
+                           Where to keep ColBERT's packed codes/residuals during search.
+                           Default: cpu
+  --gpu-index-resident     Preload IVF/doclens plus packed embeddings onto GPU for
+                           a GPU-resident ColBERT baseline. Requires
+                           --compressed-embeddings-storage gpu.
+  --profile-breakdown-csv <path>
+                           Optional long-form CSV for aggregated stage and H2D
+                           transfer profiling. Runs one extra profiling pass per
+                           configuration and reports the average once.
   --dry-run                Print planned commands without executing them.
   -h, --help               Show this help message.
 EOF
@@ -66,15 +69,6 @@ log_line() {
         echo "$line"
     else
         echo "$line" | tee -a "$current_log_file"
-    fi
-}
-
-log_capture_safe_line() {
-    local line="$1"
-    if [[ $dry_run -eq 1 ]]; then
-        echo "$line" >&2
-    else
-        echo "$line" | tee -a "$current_log_file" >&2
     fi
 }
 
@@ -285,78 +279,6 @@ resolve_index_name() {
     die "multiple ColBERT indices found for ${dataset_name}; pass --index-name explicitly"
 }
 
-copy_experiment_to_tmp_if_needed() {
-    local dataset_name="$1"
-    local source_experiment_dir="$2"
-    local dest_experiment_dir="${tmp_root}/${dataset_name}/${experiment_name}"
-
-    if [[ $copy_index_to_tmp -eq 0 ]]; then
-        printf '%s' "$source_experiment_dir"
-        return
-    fi
-
-    if [[ -d "$dest_experiment_dir" && $refresh_tmp_index -eq 0 && -d "$dest_experiment_dir/indexes" ]]; then
-        log_capture_safe_line "[driver] reusing_tmp_index=${dest_experiment_dir}"
-        printf '%s' "$dest_experiment_dir"
-        return
-    fi
-
-    log_capture_safe_line "[driver] tmp_index_source=${source_experiment_dir}"
-    log_capture_safe_line "[driver] tmp_index_target=${dest_experiment_dir}"
-
-    if [[ $dry_run -eq 1 ]]; then
-        if command -v rsync >/dev/null 2>&1; then
-            echo "+ rsync -a --delete ${source_experiment_dir}/ ${dest_experiment_dir}/" >&2
-        else
-            echo "+ rm -rf ${dest_experiment_dir}" >&2
-            echo "+ mkdir -p $(dirname "$dest_experiment_dir") ${dest_experiment_dir}" >&2
-            echo "+ cp -a ${source_experiment_dir}/. ${dest_experiment_dir}/" >&2
-        fi
-        printf '%s' "$dest_experiment_dir"
-        return
-    fi
-
-    local parent_dir
-    parent_dir="$(dirname "$dest_experiment_dir")"
-    mkdir -p "$parent_dir"
-
-    local source_size_bytes
-    local available_bytes
-    source_size_bytes="$(du -sb "$source_experiment_dir" | awk '{print $1}')"
-    available_bytes="$(df -B1 "$parent_dir" | awk 'NR==2 {print $4}')"
-    if (( available_bytes < source_size_bytes )); then
-        die "not enough free space under ${parent_dir} to copy ${source_experiment_dir}"
-    fi
-
-    local copy_start_utc
-    local copy_end_utc
-    local copy_start_s
-    local copy_end_s
-    copy_start_utc="$(date -u +%Y%m%dT%H%M%SZ)"
-    copy_start_s="$(date +%s)"
-    log_capture_safe_line "[driver] tmp_copy_start_utc=${copy_start_utc}"
-
-    if command -v rsync >/dev/null 2>&1; then
-        echo "+ $(printf '%q ' rsync -a --delete "${source_experiment_dir}/" "${dest_experiment_dir}/")" | tee -a "$current_log_file" >&2
-        rsync -a --delete "${source_experiment_dir}/" "${dest_experiment_dir}/"
-    else
-        echo "+ $(printf '%q ' rm -rf "$dest_experiment_dir")" | tee -a "$current_log_file" >&2
-        rm -rf "$dest_experiment_dir"
-        echo "+ $(printf '%q ' mkdir -p "$dest_experiment_dir")" | tee -a "$current_log_file" >&2
-        mkdir -p "$dest_experiment_dir"
-        echo "+ $(printf '%q ' cp -a "${source_experiment_dir}/." "${dest_experiment_dir}/")" | tee -a "$current_log_file" >&2
-        cp -a "${source_experiment_dir}/." "${dest_experiment_dir}/"
-    fi
-
-    copy_end_utc="$(date -u +%Y%m%dT%H%M%SZ)"
-    copy_end_s="$(date +%s)"
-    log_capture_safe_line "[driver] tmp_copy_end_utc=${copy_end_utc}"
-    log_capture_safe_line "[driver] tmp_copy_elapsed_seconds=$((copy_end_s - copy_start_s))"
-    log_capture_safe_line "[driver] tmp_index_size=$(du -sh "$dest_experiment_dir" | awk '{print $1}')"
-
-    printf '%s' "$dest_experiment_dir"
-}
-
 write_pareto_frontier() {
     local results_csv="$1"
     local pareto_csv="$2"
@@ -410,7 +332,7 @@ benchmark_dataset() {
     local pareto_csv="${impl_output_dir}/pareto_frontier.csv"
     local search_py_output_csv="${impl_output_dir}/search_py_output.csv"
     local log_file="${impl_log_dir}/benchmark.log"
-    local index_source="nfs"
+    local index_source="dataset"
     local pair_args=()
     local labels=()
     local ncells_values=()
@@ -434,12 +356,9 @@ benchmark_dataset() {
         : > "$log_file"
     fi
 
-    active_experiment_dir="$(copy_experiment_to_tmp_if_needed "$dataset_name" "$source_experiment_dir")"
-    if [[ "$active_experiment_dir" != "$source_experiment_dir" ]]; then
-        index_source="tmp"
-    fi
+    active_experiment_dir="$source_experiment_dir"
     active_root_path="$(dirname "$active_experiment_dir")"
-    active_index_name="$(resolve_index_name "$dataset_name" "$source_experiment_dir")"
+    active_index_name="$(resolve_index_name "$dataset_name" "$active_experiment_dir")"
 
     while IFS=, read -r raw_label raw_ncells raw_ndocs || [[ -n "${raw_label}${raw_ncells}${raw_ndocs}" ]]; do
         local label=""
@@ -486,9 +405,9 @@ benchmark_dataset() {
     log_line "[driver] search_py_output_csv=${search_py_output_csv}"
     log_line "[driver] k=${k}"
     log_line "[driver] warmup=${warmup}"
-    log_line "[driver] copy_index_to_tmp=${copy_index_to_tmp}"
-    log_line "[driver] refresh_tmp_index=${refresh_tmp_index}"
-    log_line "[driver] tmp_root=${tmp_root}"
+    log_line "[driver] compressed_embeddings_storage=${compressed_embeddings_storage}"
+    log_line "[driver] gpu_index_resident=${gpu_index_resident}"
+    log_line "[driver] profile_breakdown_csv=${profile_breakdown_csv:-<unset>}"
     log_line "[driver] torch_extensions_dir=${torch_extensions_dir}"
     print_hardware_info
 
@@ -510,7 +429,16 @@ benchmark_dataset() {
         --pairs "${pair_args[@]}"
         --k "$k"
         --warmup "$warmup"
+        --compressed-embeddings-storage "$compressed_embeddings_storage"
+        --dataset-name "$dataset_name"
+        --implementation-label "$implementation_label"
     )
+    if [[ $gpu_index_resident -eq 1 ]]; then
+        cmd+=(--gpu-index-resident)
+    fi
+    if [[ -n "$profile_breakdown_csv" ]]; then
+        cmd+=(--profile-breakdown-csv "$profile_breakdown_csv")
+    fi
 
     log_line "[run] command=$(printf '%q ' "${cmd[@]}")"
 
@@ -613,12 +541,12 @@ index_name_override=""
 implementation_label="colbert"
 output_dir="${repo_root}/profiling"
 log_dir="${repo_root}/log/bench"
-tmp_root="/tmp/${USER:-user}/colbert_benchmark"
 env_name="colbert"
 k=100
 warmup=5
-copy_index_to_tmp=0
-refresh_tmp_index=0
+compressed_embeddings_storage="cpu"
+gpu_index_resident=0
+profile_breakdown_csv=""
 dry_run=0
 dataset_set=0
 current_log_file=""
@@ -683,17 +611,18 @@ while [[ $# -gt 0 ]]; do
             warmup="$2"
             shift 2
             ;;
-        --copy-index-to-tmp)
-            copy_index_to_tmp=1
+        --compressed-embeddings-storage)
+            [[ $# -ge 2 ]] || die "missing value for --compressed-embeddings-storage"
+            compressed_embeddings_storage="$2"
+            shift 2
+            ;;
+        --gpu-index-resident)
+            gpu_index_resident=1
             shift
             ;;
-        --refresh-tmp-index)
-            refresh_tmp_index=1
-            shift
-            ;;
-        --tmp-root)
-            [[ $# -ge 2 ]] || die "missing value for --tmp-root"
-            tmp_root="$2"
+        --profile-breakdown-csv)
+            [[ $# -ge 2 ]] || die "missing value for --profile-breakdown-csv"
+            profile_breakdown_csv="$2"
             shift 2
             ;;
         --dry-run)
@@ -721,6 +650,16 @@ validate_path_component "$implementation_label" "implementation label"
 require_positive_int "--k" "$k"
 (( k > 0 )) || die "--k must be > 0"
 require_positive_int "--warmup" "$warmup"
+case "$compressed_embeddings_storage" in
+    cpu|gpu)
+        ;;
+    *)
+        die "--compressed-embeddings-storage must be one of: cpu, gpu"
+        ;;
+esac
+if [[ $gpu_index_resident -eq 1 && "$compressed_embeddings_storage" != "gpu" ]]; then
+    die "--gpu-index-resident requires --compressed-embeddings-storage gpu"
+fi
 [[ -f "$config_file" ]] || die "config CSV not found: ${config_file}"
 [[ -f "$search_script" ]] || die "search script not found: ${search_script}"
 
