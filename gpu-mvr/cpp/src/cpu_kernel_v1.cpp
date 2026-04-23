@@ -234,20 +234,15 @@ void rank_all_tokens_exbits(
             float max_token_score = -std::numeric_limits<float>::infinity();
             for (size_t i = 0; i < index.doc_len(doc_id); ++i) {
                 const size_t tid = static_cast<size_t>(index.doc_ptrs_[doc_id]) + i;
-                const float one_bit_dist =
-                    one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j];
-                const float ip_ex_dist = ip_ex_bits(
+                const float dist = distance_ex_bits(
                     queries + j,
                     &index.ex_code_[tid * index.padded_dim_ * index.ex_bits / 8],
+                    index.ex_bits,
                     index.ip_func_,
-                    index.padded_dim_);
-                const float dist = combine_dists(
-                    queries + j,
-                    one_bit_dist,
-                    ip_ex_dist,
+                    one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j],
                     index.one_bit_factor_[tid],
                     index.ex_factor_[tid],
-                    index.ex_bits);
+                    index.padded_dim_);
                 max_token_score = std::max(max_token_score, dist);
             }
             doc_score += max_token_score;

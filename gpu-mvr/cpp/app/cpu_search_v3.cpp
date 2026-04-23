@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
         << std::endl;
     std::cout
         << "[RUN] cpu_search_v3 uses prepacked clustered fastscan Stage 1 from cluster_1bit.bin; "
-        << "Stage 2 and Stage 3 reuse the packed v2 CPU kernels."
+        << "Stage 2 and Stage 3 use dedicated v3 CPU kernels."
         << std::endl;
     std::cout
         << "[RUN] stage3_quantized_payload=" << index.quantized_payload_mode_name()

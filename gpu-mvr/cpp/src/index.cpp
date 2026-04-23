@@ -396,20 +396,15 @@ void cpu_mvr_index::rank_all_tokens_exbits(
             float max_token_score = -std::numeric_limits<float>::infinity();
             for (size_t i = 0; i < doc_len(doc_id); ++i) {
                 size_t tid = doc_ptrs_[doc_id] + i;
-                const float one_bit_dist =
-                    one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j];
-                const float ip_ex_dist = ip_ex_bits(
+                const float dist = distance_ex_bits(
                     queries + j,
                     &ex_code_[tid * padded_dim_ * ex_bits / 8],
+                    ex_bits,
                     ip_func_,
-                    padded_dim_);
-                const float dist = combine_dists(
-                    queries + j,
-                    one_bit_dist,
-                    ip_ex_dist,
+                    one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j],
                     one_bit_factor_[tid],
                     ex_factor_[tid],
-                    ex_bits);
+                    padded_dim_);
                 max_token_score = std::max(max_token_score, dist);
             }
             doc_score += max_token_score;
