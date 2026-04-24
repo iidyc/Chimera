@@ -15,27 +15,35 @@ namespace cpu_kernel_v3 {
 using search_profile = cpu_kernel_v1::search_profile;
 
 enum class stage1_doc_accum_mode {
-    sparse_flat_hash,
-    sorted_doc_merge_fast,
-};
-
-enum class stage1_cluster_scan_mode {
-    per_posting_hash,
-    doc_run_hash,
+    doc_run_hash = 0,
+    sorted_doc_merge_fast = 1,
+    sorted_doc_merge_parallel = 2,
+    sorted_doc_merge_hybrid = 3,
 };
 
 inline constexpr bool kStage1PrepackEnabled = true;
-inline constexpr bool kStage1DenseDocBufferEnabled = false;
+#ifndef GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE
+#define GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE 1
+#endif
+#ifndef GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE
+#define GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE 0
+#endif
 inline constexpr stage1_doc_accum_mode kStage1DocAccumMode =
-    stage1_doc_accum_mode::sorted_doc_merge_fast;
+    static_cast<stage1_doc_accum_mode>(GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE);
+inline constexpr bool kStage3DynamicSchedule =
+    static_cast<bool>(GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE);
 
 constexpr const char* stage1_doc_accum_mode_name(stage1_doc_accum_mode mode)
 {
     switch (mode) {
-        case stage1_doc_accum_mode::sparse_flat_hash:
-            return "sparse_flat_hash";
+        case stage1_doc_accum_mode::doc_run_hash:
+            return "doc_run_hash";
         case stage1_doc_accum_mode::sorted_doc_merge_fast:
             return "sorted_doc_merge_fast";
+        case stage1_doc_accum_mode::sorted_doc_merge_parallel:
+            return "sorted_doc_merge_parallel";
+        case stage1_doc_accum_mode::sorted_doc_merge_hybrid:
+            return "sorted_doc_merge_hybrid";
     }
     return "unknown";
 }
@@ -43,22 +51,8 @@ constexpr const char* stage1_doc_accum_mode_name(stage1_doc_accum_mode mode)
 inline constexpr const char* kStage1DocAccumModeName =
     stage1_doc_accum_mode_name(kStage1DocAccumMode);
 
-inline constexpr stage1_cluster_scan_mode kStage1ClusterScanMode =
-    stage1_cluster_scan_mode::per_posting_hash;
-
-constexpr const char* stage1_cluster_scan_mode_name(stage1_cluster_scan_mode mode)
-{
-    switch (mode) {
-        case stage1_cluster_scan_mode::per_posting_hash:
-            return "per_posting_hash";
-        case stage1_cluster_scan_mode::doc_run_hash:
-            return "doc_run_hash";
-    }
-    return "unknown";
-}
-
-inline constexpr const char* kStage1ClusterScanModeName =
-    stage1_cluster_scan_mode_name(kStage1ClusterScanMode);
+inline constexpr const char* kStage3ScheduleName =
+    kStage3DynamicSchedule ? "dynamic_1" : "balanced_static_buckets";
 
 struct repacked_cluster {
     aligned_vector_64<uint8_t> packed_codes;

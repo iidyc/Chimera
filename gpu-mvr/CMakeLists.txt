@@ -131,7 +131,54 @@ add_executable(cpu_search_v3
     cpp/src/cpu_kernel_v3.cpp
     cpp/src/cpu_kernel_v1.cpp
 )
+target_compile_definitions(cpu_search_v3 PRIVATE
+    GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE=1
+)
 target_link_libraries(cpu_search_v3 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
+add_executable(cpu_search_v3_parallel
+    cpp/app/cpu_search_v3.cpp
+    cpp/src/cpu_kernel_v3.cpp
+    cpp/src/cpu_kernel_v1.cpp
+)
+target_compile_definitions(cpu_search_v3_parallel PRIVATE
+    GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE=2
+    GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE=0
+)
+target_link_libraries(cpu_search_v3_parallel PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
+add_executable(cpu_search_v3_parallel_dynamic
+    cpp/app/cpu_search_v3.cpp
+    cpp/src/cpu_kernel_v3.cpp
+    cpp/src/cpu_kernel_v1.cpp
+)
+target_compile_definitions(cpu_search_v3_parallel_dynamic PRIVATE
+    GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE=2
+    GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE=1
+)
+target_link_libraries(cpu_search_v3_parallel_dynamic PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
+add_executable(cpu_search_v3_hybrid
+    cpp/app/cpu_search_v3.cpp
+    cpp/src/cpu_kernel_v3.cpp
+    cpp/src/cpu_kernel_v1.cpp
+)
+target_compile_definitions(cpu_search_v3_hybrid PRIVATE
+    GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE=3
+    GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE=0
+)
+target_link_libraries(cpu_search_v3_hybrid PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
+add_executable(cpu_search_v3_hybrid_dynamic
+    cpp/app/cpu_search_v3.cpp
+    cpp/src/cpu_kernel_v3.cpp
+    cpp/src/cpu_kernel_v1.cpp
+)
+target_compile_definitions(cpu_search_v3_hybrid_dynamic PRIVATE
+    GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE=3
+    GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE=1
+)
+target_link_libraries(cpu_search_v3_hybrid_dynamic PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
 if(ENABLE_TEST)
     add_executable(test_gather cpp/test/test_gather.cpp)
