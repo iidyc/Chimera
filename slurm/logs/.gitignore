@@ -1,2 +1,7 @@
+<<<<<<< HEAD
 *
+=======
+*.out
+*.err
+>>>>>>> 8af4e0b (add gitignore for logs)
 !.gitignore
