@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <immintrin.h>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -447,6 +448,105 @@ class fixed_score_run_merge32 {
     std::array<float, kFixedQueryDoclen> head_scores_ {};
     size_t active_ = 0;
 };
+
+struct token_balanced_doc_buckets {
+    std::vector<std::vector<size_t>> buckets;
+    std::vector<size_t> thread_loads;
+};
+
+token_balanced_doc_buckets build_token_balanced_doc_buckets(
+    const cpu_mvr_index& index,
+    const std::vector<size_t>& input_ids)
+{
+    const int thread_count = std::min<int>(
+        omp_get_max_threads(),
+        std::max<size_t>(1, input_ids.size()));
+
+    std::vector<size_t> order(input_ids.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&index, &input_ids](size_t a, size_t b) {
+        return index.doc_len(input_ids[a]) > index.doc_len(input_ids[b]);
+    });
+
+    std::vector<std::vector<size_t>> buckets(static_cast<size_t>(thread_count));
+    std::vector<size_t> thread_loads(static_cast<size_t>(thread_count), 0);
+    for (size_t idx : order) {
+        int target_thread = 0;
+        for (int tid = 1; tid < thread_count; ++tid) {
+            if (thread_loads[static_cast<size_t>(tid)] <
+                thread_loads[static_cast<size_t>(target_thread)]) {
+                target_thread = tid;
+            }
+        }
+        buckets[static_cast<size_t>(target_thread)].push_back(idx);
+        thread_loads[static_cast<size_t>(target_thread)] += index.doc_len(input_ids[idx]);
+    }
+
+    return {std::move(buckets), std::move(thread_loads)};
+}
+
+#if defined(__AVX512F__)
+float score_doc4ex_avx512(
+    const cpu_mvr_index& index,
+    query_object* queries,
+    const float* query_bias,
+    const std::vector<float>& one_bit_dists,
+    const std::vector<size_t>& candidate_doc_ptrs,
+    size_t q_doclen,
+    size_t input_idx,
+    size_t doc_id)
+{
+    if (q_doclen != kFixedQueryDoclen) {
+        throw std::runtime_error("score_doc4ex_avx512 requires q_doclen == 32");
+    }
+
+    const float scale = static_cast<float>(1 << index.ex_bits);
+    const size_t doc_start = static_cast<size_t>(index.doc_ptrs_[doc_id]);
+    alignas(64) float max_ts[kFixedQueryDoclen];
+    alignas(64) float ip_ex_buf[kFixedQueryDoclen];
+    const __m512 neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    for (size_t j = 0; j < kFixedQueryDoclen; j += 16) {
+        _mm512_store_ps(&max_ts[j], neg_inf);
+    }
+
+    for (size_t t = 0; t < index.doc_len(doc_id); ++t) {
+        const size_t tid = doc_start + t;
+        const char* ex_code =
+            &index.ex_code_[tid * index.padded_dim_ * index.ex_bits / 8];
+        for (size_t j = 0; j < kFixedQueryDoclen; ++j) {
+            ip_ex_buf[j] = ip_ex_bits(
+                queries + j,
+                ex_code,
+                index.ip_func_,
+                index.padded_dim_);
+        }
+
+        const __m512 v_tok_scale =
+            _mm512_set1_ps(scale / index.one_bit_factor_[tid]);
+        const __m512 v_tok_exf = _mm512_set1_ps(index.ex_factor_[tid]);
+        const float* ob_base =
+            &one_bit_dists[(candidate_doc_ptrs[input_idx] + t) * q_doclen];
+
+        for (size_t j = 0; j < kFixedQueryDoclen; j += 16) {
+            const __m512 ob = _mm512_loadu_ps(&ob_base[j]);
+            const __m512 exd = _mm512_load_ps(&ip_ex_buf[j]);
+            const __m512 qb = _mm512_load_ps(&query_bias[j]);
+            const __m512 combined = _mm512_mul_ps(
+                _mm512_add_ps(_mm512_fmadd_ps(v_tok_scale, ob, qb), exd),
+                v_tok_exf);
+            _mm512_store_ps(
+                &max_ts[j],
+                _mm512_max_ps(_mm512_load_ps(&max_ts[j]), combined));
+        }
+    }
+
+    __m512 sum = _mm512_load_ps(&max_ts[0]);
+    for (size_t j = 16; j < kFixedQueryDoclen; j += 16) {
+        sum = _mm512_add_ps(sum, _mm512_load_ps(&max_ts[j]));
+    }
+    return _mm512_reduce_add_ps(sum);
+}
+#endif
 
 doc_score_span append_merged_doc_score_pairs_max(
     const std::vector<doc_score_pair>& arena,
@@ -1024,42 +1124,90 @@ void rank_all_tokens_doc4ex(
     }
     const auto t_prepare_done = std::chrono::high_resolution_clock::now();
 
-    std::priority_queue<std::pair<float, size_t>> max_heap;
+    std::vector<std::pair<float, size_t>> refined_scores(
+        input_ids.size(),
+        {-std::numeric_limits<float>::infinity(), 0});
 
-#pragma omp parallel for
-    for (size_t idx = 0; idx < input_ids.size(); ++idx) {
-        const size_t doc_id = input_ids[idx];
-        float doc_score = 0.0F;
-        for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
-            float max_token_score = -std::numeric_limits<float>::infinity();
-            for (size_t i = 0; i < index.doc_len(doc_id); ++i) {
-                const size_t tid = static_cast<size_t>(index.doc_ptrs_[doc_id]) + i;
-                const float one_bit_dist =
-                    one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j];
-                const float ip_ex_dist = ip_ex_bits(
-                    queries + j,
-                    &index.ex_code_[tid * index.padded_dim_ * index.ex_bits / 8],
-                    index.ip_func_,
-                    index.padded_dim_);
-                const float dist = combine_dists(
-                    queries + j,
-                    one_bit_dist,
-                    ip_ex_dist,
-                    index.one_bit_factor_[tid],
-                    index.ex_factor_[tid],
-                    index.ex_bits);
-                max_token_score = std::max(max_token_score, dist);
-            }
-            doc_score += max_token_score;
+    const auto assignment = build_token_balanced_doc_buckets(index, input_ids);
+    const int thread_count = static_cast<int>(assignment.buckets.size());
+#if defined(__AVX512F__)
+    alignas(64) float query_bias[kFixedQueryDoclen];
+    if (q_doclen == kFixedQueryDoclen) {
+        const float scale = static_cast<float>(1 << index.ex_bits);
+        for (size_t j = 0; j < kFixedQueryDoclen; ++j) {
+            query_bias[j] = scale * queries[j].cb1_sumq - queries[j].cbex_sumq;
         }
-#pragma omp critical
-        max_heap.emplace(doc_score, doc_id);
+    }
+#endif
+
+#pragma omp parallel num_threads(thread_count)
+    {
+        const int omp_tid = omp_get_thread_num();
+        const auto& bucket = assignment.buckets[static_cast<size_t>(omp_tid)];
+        for (size_t bucket_pos = 0; bucket_pos < bucket.size(); ++bucket_pos) {
+            const size_t idx = bucket[bucket_pos];
+            const size_t doc_id = input_ids[idx];
+            float doc_score = 0.0F;
+#if defined(__AVX512F__)
+            if (q_doclen == kFixedQueryDoclen) {
+                doc_score = score_doc4ex_avx512(
+                    index,
+                    queries,
+                    query_bias,
+                    one_bit_dists,
+                    candidate_doc_ptrs,
+                    q_doclen,
+                    idx,
+                    doc_id);
+                refined_scores[idx] = {doc_score, doc_id};
+                continue;
+            }
+#endif
+            for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
+                float max_token_score = -std::numeric_limits<float>::infinity();
+                for (size_t i = 0; i < index.doc_len(doc_id); ++i) {
+                    const size_t tid = static_cast<size_t>(index.doc_ptrs_[doc_id]) + i;
+                    const float one_bit_dist =
+                        one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j];
+                    const float ip_ex_dist = ip_ex_bits(
+                        queries + j,
+                        &index.ex_code_[tid * index.padded_dim_ * index.ex_bits / 8],
+                        index.ip_func_,
+                        index.padded_dim_);
+                    const float dist = combine_dists(
+                        queries + j,
+                        one_bit_dist,
+                        ip_ex_dist,
+                        index.one_bit_factor_[tid],
+                        index.ex_factor_[tid],
+                        index.ex_bits);
+                    max_token_score = std::max(max_token_score, dist);
+                }
+                doc_score += max_token_score;
+            }
+            refined_scores[idx] = {doc_score, doc_id};
+        }
     }
     const auto t_score_done = std::chrono::high_resolution_clock::now();
 
-    for (size_t i = 0; i < k && !max_heap.empty(); ++i) {
-        output_ids.push_back(max_heap.top().second);
-        max_heap.pop();
+    const size_t topk_count = std::min(k, refined_scores.size());
+    auto refined_order = [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+    };
+    if (topk_count < refined_scores.size()) {
+        std::partial_sort(
+            refined_scores.begin(),
+            refined_scores.begin() + static_cast<std::ptrdiff_t>(topk_count),
+            refined_scores.end(),
+            refined_order);
+    } else {
+        std::sort(refined_scores.begin(), refined_scores.end(), refined_order);
+    }
+
+    output_ids.reserve(topk_count);
+    for (size_t i = 0; i < topk_count; ++i) {
+        output_ids.push_back(refined_scores[i].second);
     }
     const auto t_select_done = std::chrono::high_resolution_clock::now();
 

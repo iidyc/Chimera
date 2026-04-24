@@ -27,7 +27,7 @@ enum class stage1_cluster_scan_mode {
 inline constexpr bool kStage1PrepackEnabled = true;
 inline constexpr bool kStage1DenseDocBufferEnabled = false;
 inline constexpr stage1_doc_accum_mode kStage1DocAccumMode =
-    stage1_doc_accum_mode::sparse_flat_hash;
+    stage1_doc_accum_mode::sorted_doc_merge_fast;
 
 constexpr const char* stage1_doc_accum_mode_name(stage1_doc_accum_mode mode)
 {
