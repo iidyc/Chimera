@@ -50,6 +50,8 @@ void maybe_print_phase_progress(
 }  // namespace
 
 int main(int argc, char** argv) {
+    const std::string binary_name = std::filesystem::path(argv[0]).filename().string();
+
     gpu_search_cli_args args;
     args.runtime.k_rank_cluster = 1800;
     args.runtime.k_rank_all_tokens = 300;
@@ -99,8 +101,12 @@ int main(int argc, char** argv) {
         << " k=" << args.k
         << std::endl;
     std::cout
-        << "[RUN] cpu_search_v3 uses prepacked clustered fastscan Stage 1 from cluster_1bit.bin; "
+        << "[RUN] " << binary_name
+        << " uses prepacked clustered fastscan Stage 1 from cluster_1bit.bin; "
         << "Stage 2 and Stage 3 use dedicated v3 CPU kernels."
+        << std::endl;
+    std::cout
+        << "[RUN] stage1_doc_accum_mode=" << cpu_kernel_v3::kStage1DocAccumModeName
         << std::endl;
     std::cout
         << "[RUN] stage3_quantized_payload=" << index.quantized_payload_mode_name()

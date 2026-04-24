@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -17,7 +18,6 @@
 #include <numeric>
 #include <stdexcept>
 #include <system_error>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -60,6 +60,15 @@ size_t padded_cluster_tokens(size_t cluster_size)
     return ((cluster_size + batch_size - 1) / batch_size) * batch_size;
 }
 
+size_t next_power_of_two(size_t value)
+{
+    size_t out = 1;
+    while (out < value) {
+        out <<= 1;
+    }
+    return out;
+}
+
 std::vector<uint8_t>& repack_source_codes_scratch(size_t code_bytes_per_vector)
 {
     thread_local std::vector<uint8_t> scratch;
@@ -69,6 +78,119 @@ std::vector<uint8_t>& repack_source_codes_scratch(size_t code_bytes_per_vector)
     }
     return scratch;
 }
+
+class token_doc_max_table {
+   public:
+    void reset(size_t expected_entries)
+    {
+        const size_t reserve_entries = std::max<size_t>(expected_entries, 1024);
+        const size_t capacity = next_power_of_two(reserve_entries * 2);
+        keys_.assign(capacity, kEmptyKey);
+        values_.resize(capacity);
+        touched_doc_ids_.clear();
+        touched_doc_ids_.reserve(reserve_entries);
+        size_ = 0;
+    }
+
+    void max_update(int doc_id, float score)
+    {
+        if ((size_ + 1) * 10 >= keys_.size() * 7) {
+            rehash(keys_.size() * 2);
+        }
+
+        const size_t slot = find_slot(doc_id);
+        if (keys_[slot] == kEmptyKey) {
+            keys_[slot] = doc_id;
+            values_[slot] = score;
+            touched_doc_ids_.push_back(doc_id);
+            ++size_;
+            return;
+        }
+
+        if (score > values_[slot]) {
+            values_[slot] = score;
+        }
+    }
+
+    [[nodiscard]] float score_for(int doc_id) const
+    {
+        return values_[find_slot(doc_id)];
+    }
+
+    [[nodiscard]] size_t size() const { return size_; }
+
+    [[nodiscard]] const std::vector<int>& touched_doc_ids() const
+    {
+        return touched_doc_ids_;
+    }
+
+   private:
+    static constexpr int kEmptyKey = -1;
+
+    [[nodiscard]] size_t find_slot(int doc_id) const
+    {
+        const size_t mask = keys_.size() - 1;
+        size_t slot = static_cast<size_t>(static_cast<uint32_t>(doc_id)) & mask;
+        while (true) {
+            const int key = keys_[slot];
+            if (key == kEmptyKey || key == doc_id) {
+                return slot;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    void insert_for_rehash(int doc_id, float score)
+    {
+        const size_t slot = find_slot(doc_id);
+        keys_[slot] = doc_id;
+        values_[slot] = score;
+        touched_doc_ids_.push_back(doc_id);
+        ++size_;
+    }
+
+    void rehash(size_t new_capacity)
+    {
+        new_capacity = next_power_of_two(std::max<size_t>(new_capacity, 1024));
+        auto old_keys = std::move(keys_);
+        auto old_values = std::move(values_);
+        auto old_touched = std::move(touched_doc_ids_);
+
+        keys_.assign(new_capacity, kEmptyKey);
+        values_.resize(new_capacity);
+        touched_doc_ids_.clear();
+        touched_doc_ids_.reserve(std::max<size_t>(old_touched.size(), 1024));
+        size_ = 0;
+
+        const size_t old_mask = old_keys.size() - 1;
+        for (int doc_id : old_touched) {
+            size_t old_slot = static_cast<size_t>(static_cast<uint32_t>(doc_id)) & old_mask;
+            while (old_keys[old_slot] != doc_id) {
+                old_slot = (old_slot + 1) & old_mask;
+            }
+            insert_for_rehash(doc_id, old_values[old_slot]);
+        }
+    }
+
+    std::vector<int> keys_;
+    std::vector<float> values_;
+    std::vector<int> touched_doc_ids_;
+    size_t size_ = 0;
+};
+
+struct dense_thread_doc_buffer {
+    std::vector<float> max_scores;
+    std::vector<uint8_t> seen;
+    std::vector<int> touched_doc_ids;
+
+    void reset(size_t num_docs)
+    {
+        max_scores.resize(num_docs);
+        seen.assign(num_docs, 0);
+        touched_doc_ids.clear();
+        touched_doc_ids.reserve(4096);
+    }
+};
 
 void repack_cluster_into(
     const clustered_stage1_cache& stage1_cache,
@@ -744,9 +866,19 @@ void rank_cluster_dists(
         }
         t_probe_done = steady_clock::now();
 
+        std::vector<float> doc_score_sum(index.num_docs, 0.0f);
+        std::vector<int> touched_doc_ids;
+
+#if defined(GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER) && GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER
+        const int thread_count = omp_get_max_threads();
+        std::vector<dense_thread_doc_buffer> thread_buffers(static_cast<size_t>(thread_count));
+        for (auto& buffer : thread_buffers) {
+            buffer.reset(index.num_docs);
+        }
+        std::vector<std::vector<int>> token_doc_ids(q_doclen);
+        std::vector<std::vector<float>> token_doc_scores(q_doclen);
         t_prepare_done = steady_clock::now();
 
-        std::vector<std::unordered_map<int, float>> query_doc_max(q_doclen);
 #pragma omp parallel for
         for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
             const rabitqlib::Lut<float> lut(
@@ -754,8 +886,8 @@ void rank_cluster_dists(
                 index.padded_dim_,
                 true);
 
-            auto& doc_max = query_doc_max[static_cast<size_t>(j)];
-            doc_max.reserve(clusters_per_query[static_cast<size_t>(j)].size() * 64);
+            auto& buffer = thread_buffers[static_cast<size_t>(omp_get_thread_num())];
+            buffer.touched_doc_ids.clear();
 
             std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
 
@@ -788,10 +920,98 @@ void rank_cluster_dists(
                             lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
                         const float dist =
                             (ip - queries[j].cb1_sumq) * packed_factors[lane_base + lane];
-                        auto [it, inserted] = doc_max.try_emplace(doc_id, dist);
-                        if (!inserted && dist > it->second) {
-                            it->second = dist;
+                        if (!buffer.seen[doc_id]) {
+                            buffer.seen[doc_id] = 1;
+                            buffer.max_scores[doc_id] = dist;
+                            buffer.touched_doc_ids.push_back(doc_id);
+                        } else if (dist > buffer.max_scores[doc_id]) {
+                            buffer.max_scores[doc_id] = dist;
                         }
+                    }
+                }
+            }
+
+            auto& token_ids = token_doc_ids[static_cast<size_t>(j)];
+            auto& token_scores = token_doc_scores[static_cast<size_t>(j)];
+            token_ids = buffer.touched_doc_ids;
+            token_scores.resize(token_ids.size());
+            for (size_t idx = 0; idx < token_ids.size(); ++idx) {
+                const int doc_id = token_ids[idx];
+                token_scores[idx] = buffer.max_scores[doc_id];
+                buffer.seen[doc_id] = 0;
+            }
+        }
+        t_scan_done = steady_clock::now();
+
+        size_t total_touched_docs = 0;
+        for (const auto& token_ids : token_doc_ids) {
+            total_touched_docs += token_ids.size();
+        }
+        std::vector<uint8_t> doc_seen(index.num_docs, 0);
+        touched_doc_ids.reserve(std::min(total_touched_docs, index.num_docs));
+        for (size_t j = 0; j < q_doclen; ++j) {
+            const auto& token_ids = token_doc_ids[j];
+            const auto& token_scores = token_doc_scores[j];
+            for (size_t idx = 0; idx < token_ids.size(); ++idx) {
+                const int doc_id = token_ids[idx];
+                if (!doc_seen[doc_id]) {
+                    doc_seen[doc_id] = 1;
+                    touched_doc_ids.push_back(doc_id);
+                }
+                doc_score_sum[doc_id] += token_scores[idx];
+            }
+        }
+#else
+        std::vector<token_doc_max_table> query_doc_max(q_doclen);
+        for (size_t j = 0; j < q_doclen; ++j) {
+            const size_t expected_entries = std::min<size_t>(
+                index.num_docs,
+                std::max<size_t>(clusters_per_query[j].size() * 64, 1024));
+            query_doc_max[j].reset(expected_entries);
+        }
+        t_prepare_done = steady_clock::now();
+
+#pragma omp parallel for
+        for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
+            const rabitqlib::Lut<float> lut(
+                queries[j].rotated_query,
+                index.padded_dim_,
+                true);
+
+            auto& doc_max = query_doc_max[static_cast<size_t>(j)];
+
+            std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
+
+            for (size_t cid : clusters_per_query[j]) {
+                const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cid);
+                const float* packed_factors = stage1_cache.packed_cluster_factors(cid);
+                const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cid);
+                const size_t cluster_size = stage1_cache.packed_cluster_token_count(cid);
+                const size_t num_batches =
+                    (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
+                    rabitqlib::fastscan::kBatchSize;
+
+                for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+                    const uint8_t* batch_ptr =
+                        packed_codes +
+                        batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
+                    rabitqlib::fastscan::accumulate_hacc(
+                        batch_ptr,
+                        lut.lut(),
+                        accum.data(),
+                        index.padded_dim_);
+
+                    const size_t valid =
+                        std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
+                    const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
+
+                    for (size_t lane = 0; lane < valid; ++lane) {
+                        const int doc_id = packed_doc_ids[lane_base + lane];
+                        const float ip =
+                            lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
+                        const float dist =
+                            (ip - queries[j].cb1_sumq) * packed_factors[lane_base + lane];
+                        doc_max.max_update(doc_id, dist);
                     }
                 }
             }
@@ -803,50 +1023,37 @@ void rank_cluster_dists(
             total_touched_docs += doc_max.size();
         }
 
-        std::vector<std::pair<int, float>> all_doc_scores;
-        all_doc_scores.reserve(total_touched_docs);
+        std::vector<uint8_t> doc_seen(index.num_docs, 0);
+        touched_doc_ids.reserve(std::min(total_touched_docs, index.num_docs));
         for (const auto& doc_max : query_doc_max) {
-            for (const auto& [doc_id, score] : doc_max) {
-                all_doc_scores.emplace_back(doc_id, score);
+            for (int doc_id : doc_max.touched_doc_ids()) {
+                if (!doc_seen[doc_id]) {
+                    doc_seen[doc_id] = 1;
+                    touched_doc_ids.push_back(doc_id);
+                }
+                doc_score_sum[doc_id] += doc_max.score_for(doc_id);
             }
         }
+#endif
 
-        std::sort(
-            all_doc_scores.begin(),
-            all_doc_scores.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-
-        std::vector<std::pair<float, int>> reduced_scores;
-        reduced_scores.reserve(all_doc_scores.size());
-        for (size_t i = 0; i < all_doc_scores.size();) {
-            const int doc_id = all_doc_scores[i].first;
-            float score_sum = 0.0f;
-            do {
-                score_sum += all_doc_scores[i].second;
-                ++i;
-            } while (i < all_doc_scores.size() && all_doc_scores[i].first == doc_id);
-            reduced_scores.emplace_back(score_sum, doc_id);
-        }
-
-        const size_t topk_count = std::min(k, reduced_scores.size());
-        auto topk_order = [](const auto& a, const auto& b) {
-            if (a.first != b.first) return a.first > b.first;
-            return a.second < b.second;
+        const size_t topk_count = std::min(k, touched_doc_ids.size());
+        auto topk_order = [&doc_score_sum](int a, int b) {
+            if (doc_score_sum[a] != doc_score_sum[b]) return doc_score_sum[a] > doc_score_sum[b];
+            return a < b;
         };
-        if (topk_count < reduced_scores.size()) {
+        if (topk_count < touched_doc_ids.size()) {
             std::partial_sort(
-                reduced_scores.begin(),
-                reduced_scores.begin() + topk_count,
-                reduced_scores.end(),
+                touched_doc_ids.begin(),
+                touched_doc_ids.begin() + topk_count,
+                touched_doc_ids.end(),
                 topk_order);
-            reduced_scores.resize(topk_count);
+            touched_doc_ids.resize(topk_count);
         } else {
-            std::sort(reduced_scores.begin(), reduced_scores.end(), topk_order);
+            std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
         }
 
         output_ids.reserve(topk_count);
-        for (const auto& [score, doc_id] : reduced_scores) {
-            (void)score;
+        for (int doc_id : touched_doc_ids) {
             output_ids.push_back(static_cast<size_t>(doc_id));
         }
         t_reduce_done = steady_clock::now();

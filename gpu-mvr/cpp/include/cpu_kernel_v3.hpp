@@ -16,6 +16,14 @@ using search_profile = cpu_kernel_v1::search_profile;
 
 inline constexpr bool kStage1PrepackEnabled = true;
 
+#if defined(GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER) && GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER
+inline constexpr bool kStage1DenseDocBufferEnabled = true;
+inline constexpr const char* kStage1DocAccumModeName = "dense_thread_local_doc_buffer";
+#else
+inline constexpr bool kStage1DenseDocBufferEnabled = false;
+inline constexpr const char* kStage1DocAccumModeName = "sparse_flat_hash";
+#endif
+
 struct repacked_cluster {
     aligned_vector_64<uint8_t> packed_codes;
     aligned_vector_64<float> packed_factors;
