@@ -1,0 +1,7 @@
+build/
+/cmake-build-debug/
+*.so
+__pycache__/
+.idea/
+.claude/
+multi-vector-retrieval-data/
