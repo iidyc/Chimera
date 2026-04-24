@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <queue>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -178,19 +179,618 @@ class token_doc_max_table {
     size_t size_ = 0;
 };
 
-struct dense_thread_doc_buffer {
-    std::vector<float> max_scores;
-    std::vector<uint8_t> seen;
-    std::vector<int> touched_doc_ids;
-
-    void reset(size_t num_docs)
-    {
-        max_scores.resize(num_docs);
-        seen.assign(num_docs, 0);
-        touched_doc_ids.clear();
-        touched_doc_ids.reserve(4096);
-    }
+struct doc_score_pair {
+    int doc_id = -1;
+    float score = 0.0f;
 };
+
+struct doc_score_span {
+    size_t begin = 0;
+    size_t end = 0;
+};
+
+inline constexpr size_t kFixedQueryDoclen = 32;
+inline constexpr size_t kMaxStage1ClusterRuns = 1024;
+
+[[nodiscard]] bool empty(doc_score_span span)
+{
+    return span.begin >= span.end;
+}
+
+bool better_doc_score_pair(const doc_score_pair& a, const doc_score_pair& b)
+{
+    if (a.score != b.score) return a.score > b.score;
+    return a.doc_id < b.doc_id;
+}
+
+void merge_doc_score_pairs_max(
+    const std::vector<doc_score_pair>& lhs,
+    const std::vector<doc_score_pair>& rhs,
+    std::vector<doc_score_pair>& out)
+{
+    out.clear();
+    out.reserve(lhs.size() + rhs.size());
+
+    size_t i = 0;
+    size_t j = 0;
+    while (i < lhs.size() && j < rhs.size()) {
+        if (lhs[i].doc_id < rhs[j].doc_id) {
+            out.push_back(lhs[i++]);
+        } else if (rhs[j].doc_id < lhs[i].doc_id) {
+            out.push_back(rhs[j++]);
+        } else {
+            out.push_back({lhs[i].doc_id, std::max(lhs[i].score, rhs[j].score)});
+            ++i;
+            ++j;
+        }
+    }
+
+    while (i < lhs.size()) {
+        out.push_back(lhs[i++]);
+    }
+    while (j < rhs.size()) {
+        out.push_back(rhs[j++]);
+    }
+}
+
+class fixed_query_run_merge32 {
+   public:
+    void reset()
+    {
+        active_ = 0;
+        total_size_ = 0;
+    }
+
+    void add_run(const std::vector<doc_score_pair>& arena, doc_score_span span)
+    {
+        add_run(arena.data() + span.begin, arena.data() + span.end);
+    }
+
+    void add_run(const doc_score_pair* begin, const doc_score_pair* end)
+    {
+        total_size_ += static_cast<size_t>(end - begin);
+        if (begin == end) {
+            return;
+        }
+        if (active_ >= kFixedQueryDoclen) {
+            throw std::runtime_error("fixed_query_run_merge32 exceeded fixed run capacity");
+        }
+
+        cur_[active_] = begin;
+        end_[active_] = end;
+        head_doc_ids_[active_] = cur_[active_]->doc_id;
+        head_scores_[active_] = cur_[active_]->score;
+        ++active_;
+    }
+
+    void merge(std::vector<doc_score_pair>& out)
+    {
+        out.resize(total_size_);
+        size_t out_size = 0;
+
+        while (active_ > 0) {
+            int min_doc_id = head_doc_ids_[0];
+            for (size_t i = 1; i < active_; ++i) {
+                min_doc_id = std::min(min_doc_id, head_doc_ids_[i]);
+            }
+
+            float score_sum = 0.0f;
+            size_t i = 0;
+            while (i < active_) {
+                if (head_doc_ids_[i] != min_doc_id) {
+                    ++i;
+                    continue;
+                }
+
+                score_sum += head_scores_[i];
+                advance_slot(i);
+            }
+
+            out[out_size++] = {min_doc_id, score_sum};
+        }
+
+        out.resize(out_size);
+    }
+
+    void merge_topk(std::vector<doc_score_pair>& out, size_t k)
+    {
+        auto min_heap_cmp = [](const doc_score_pair& a, const doc_score_pair& b) {
+            if (a.score != b.score) return a.score > b.score;
+            return a.doc_id < b.doc_id;
+        };
+
+        std::priority_queue<
+            doc_score_pair,
+            std::vector<doc_score_pair>,
+            decltype(min_heap_cmp)>
+            min_heap(min_heap_cmp);
+
+        while (active_ > 0) {
+            int min_doc_id = head_doc_ids_[0];
+            for (size_t i = 1; i < active_; ++i) {
+                min_doc_id = std::min(min_doc_id, head_doc_ids_[i]);
+            }
+
+            float score_sum = 0.0f;
+            size_t i = 0;
+            while (i < active_) {
+                if (head_doc_ids_[i] != min_doc_id) {
+                    ++i;
+                    continue;
+                }
+
+                score_sum += head_scores_[i];
+                advance_slot(i);
+            }
+
+            const doc_score_pair candidate {min_doc_id, score_sum};
+            if (k == 0) {
+                continue;
+            }
+            if (min_heap.size() < k) {
+                min_heap.push(candidate);
+            } else if (better_doc_score_pair(candidate, min_heap.top())) {
+                min_heap.pop();
+                min_heap.push(candidate);
+            }
+        }
+
+        out.clear();
+        out.reserve(min_heap.size());
+        while (!min_heap.empty()) {
+            out.push_back(min_heap.top());
+            min_heap.pop();
+        }
+        std::sort(out.begin(), out.end(), better_doc_score_pair);
+    }
+
+   private:
+    void advance_slot(size_t idx)
+    {
+        ++cur_[idx];
+        if (cur_[idx] == end_[idx]) {
+            const size_t last = active_ - 1;
+            if (idx != last) {
+                cur_[idx] = cur_[last];
+                end_[idx] = end_[last];
+                head_doc_ids_[idx] = head_doc_ids_[last];
+                head_scores_[idx] = head_scores_[last];
+            }
+            --active_;
+            return;
+        }
+
+        head_doc_ids_[idx] = cur_[idx]->doc_id;
+        head_scores_[idx] = cur_[idx]->score;
+    }
+
+    std::array<const doc_score_pair*, kFixedQueryDoclen> cur_ {};
+    std::array<const doc_score_pair*, kFixedQueryDoclen> end_ {};
+    std::array<int, kFixedQueryDoclen> head_doc_ids_ {};
+    std::array<float, kFixedQueryDoclen> head_scores_ {};
+    size_t active_ = 0;
+    size_t total_size_ = 0;
+};
+
+class fixed_score_run_merge32 {
+   public:
+    void reset()
+    {
+        active_ = 0;
+    }
+
+    void add_run(const std::vector<doc_score_pair>& run)
+    {
+        add_run(run.data(), run.data() + run.size());
+    }
+
+    void add_run(const doc_score_pair* begin, const doc_score_pair* end)
+    {
+        if (begin == end) {
+            return;
+        }
+        if (active_ >= kFixedQueryDoclen) {
+            throw std::runtime_error("fixed_score_run_merge32 exceeded fixed run capacity");
+        }
+
+        cur_[active_] = begin;
+        end_[active_] = end;
+        head_doc_ids_[active_] = begin->doc_id;
+        head_scores_[active_] = begin->score;
+        ++active_;
+    }
+
+    void merge_topk(std::vector<doc_score_pair>& out, size_t k)
+    {
+        out.clear();
+        out.reserve(k);
+
+        while (active_ > 0 && out.size() < k) {
+            size_t best_idx = 0;
+            doc_score_pair best {head_doc_ids_[0], head_scores_[0]};
+            for (size_t i = 1; i < active_; ++i) {
+                const doc_score_pair candidate {head_doc_ids_[i], head_scores_[i]};
+                if (better_doc_score_pair(candidate, best)) {
+                    best = candidate;
+                    best_idx = i;
+                }
+            }
+
+            out.push_back(best);
+            advance_slot(best_idx);
+        }
+    }
+
+   private:
+    void advance_slot(size_t idx)
+    {
+        ++cur_[idx];
+        if (cur_[idx] == end_[idx]) {
+            const size_t last = active_ - 1;
+            if (idx != last) {
+                cur_[idx] = cur_[last];
+                end_[idx] = end_[last];
+                head_doc_ids_[idx] = head_doc_ids_[last];
+                head_scores_[idx] = head_scores_[last];
+            }
+            --active_;
+            return;
+        }
+
+        head_doc_ids_[idx] = cur_[idx]->doc_id;
+        head_scores_[idx] = cur_[idx]->score;
+    }
+
+    std::array<const doc_score_pair*, kFixedQueryDoclen> cur_ {};
+    std::array<const doc_score_pair*, kFixedQueryDoclen> end_ {};
+    std::array<int, kFixedQueryDoclen> head_doc_ids_ {};
+    std::array<float, kFixedQueryDoclen> head_scores_ {};
+    size_t active_ = 0;
+};
+
+doc_score_span append_merged_doc_score_pairs_max(
+    const std::vector<doc_score_pair>& arena,
+    doc_score_span lhs,
+    doc_score_span rhs,
+    std::vector<doc_score_pair>& out)
+{
+    const size_t begin = out.size();
+    size_t i = lhs.begin;
+    size_t j = rhs.begin;
+    while (i < lhs.end && j < rhs.end) {
+        if (arena[i].doc_id < arena[j].doc_id) {
+            out.push_back(arena[i++]);
+        } else if (arena[j].doc_id < arena[i].doc_id) {
+            out.push_back(arena[j++]);
+        } else {
+            out.push_back({arena[i].doc_id, std::max(arena[i].score, arena[j].score)});
+            ++i;
+            ++j;
+        }
+    }
+    while (i < lhs.end) {
+        out.push_back(arena[i++]);
+    }
+    while (j < rhs.end) {
+        out.push_back(arena[j++]);
+    }
+    return {begin, out.size()};
+}
+
+doc_score_span append_merged_doc_score_pairs_sum(
+    const std::vector<doc_score_pair>& arena,
+    doc_score_span lhs,
+    doc_score_span rhs,
+    std::vector<doc_score_pair>& out)
+{
+    const size_t begin = out.size();
+    size_t i = lhs.begin;
+    size_t j = rhs.begin;
+    while (i < lhs.end && j < rhs.end) {
+        if (arena[i].doc_id < arena[j].doc_id) {
+            out.push_back(arena[i++]);
+        } else if (arena[j].doc_id < arena[i].doc_id) {
+            out.push_back(arena[j++]);
+        } else {
+            out.push_back({arena[i].doc_id, arena[i].score + arena[j].score});
+            ++i;
+            ++j;
+        }
+    }
+    while (i < lhs.end) {
+        out.push_back(arena[i++]);
+    }
+    while (j < rhs.end) {
+        out.push_back(arena[j++]);
+    }
+    return {begin, out.size()};
+}
+
+doc_score_span append_copy_doc_score_pairs(
+    const std::vector<doc_score_pair>& arena,
+    doc_score_span span,
+    std::vector<doc_score_pair>& out)
+{
+    const size_t begin = out.size();
+    out.insert(out.end(), arena.begin() + static_cast<std::ptrdiff_t>(span.begin),
+               arena.begin() + static_cast<std::ptrdiff_t>(span.end));
+    return {begin, out.size()};
+}
+
+class token_doc_max_table_fast {
+   public:
+    void reset(size_t expected_entries)
+    {
+        const size_t reserve_entries = std::max<size_t>(expected_entries, 1024);
+        arena_a_.clear();
+        spans_a_.clear();
+        active_cluster_begin_ = 0;
+        arena_a_.reserve(reserve_entries);
+        spans_a_.reserve(64);
+    }
+
+    void begin_cluster(size_t cluster_size)
+    {
+        active_cluster_begin_ = arena_a_.size();
+        arena_a_.reserve(arena_a_.size() + std::min<size_t>(cluster_size, 4096));
+    }
+
+    void push_positive(int doc_id, float score)
+    {
+        if (score <= 0.0f) {
+            return;
+        }
+
+        if (arena_a_.size() == active_cluster_begin_ || arena_a_.back().doc_id != doc_id) {
+            arena_a_.push_back({doc_id, score});
+        } else if (score > arena_a_.back().score) {
+            arena_a_.back().score = score;
+        }
+    }
+
+    void end_cluster()
+    {
+        if (arena_a_.size() == active_cluster_begin_) {
+            return;
+        }
+        spans_a_.push_back({active_cluster_begin_, arena_a_.size()});
+    }
+
+    [[nodiscard]] size_t reserve_output_capacity() const
+    {
+        return arena_a_.size();
+    }
+
+    doc_score_span finalize_into(std::vector<doc_score_pair>& out) const
+    {
+        if (spans_a_.empty()) {
+            return {out.size(), out.size()};
+        }
+
+        if (spans_a_.size() > kMaxStage1ClusterRuns) {
+            throw std::runtime_error("stage1 cluster merge exceeded fixed run capacity");
+        }
+
+        struct run_cursor {
+            size_t pos = 0;
+            size_t end = 0;
+        };
+
+        auto heap_less = [this](const run_cursor& a, const run_cursor& b) {
+            return arena_a_[a.pos].doc_id > arena_a_[b.pos].doc_id;
+        };
+
+        std::vector<run_cursor> heap;
+        heap.reserve(spans_a_.size());
+        for (const auto& span : spans_a_) {
+            if (!empty(span)) {
+                heap.push_back({span.begin, span.end});
+                std::push_heap(heap.begin(), heap.end(), heap_less);
+            }
+        }
+
+        const size_t begin = out.size();
+        out.resize(begin + arena_a_.size());
+        size_t out_size = 0;
+
+        auto pop_min_cursor = [&]() {
+            std::pop_heap(heap.begin(), heap.end(), heap_less);
+            run_cursor cur = heap.back();
+            heap.pop_back();
+            return cur;
+        };
+
+        auto push_cursor = [&](run_cursor cur) {
+            if (cur.pos < cur.end) {
+                heap.push_back(cur);
+                std::push_heap(heap.begin(), heap.end(), heap_less);
+            }
+        };
+
+        while (!heap.empty()) {
+            run_cursor cur = pop_min_cursor();
+            const int doc_id = arena_a_[cur.pos].doc_id;
+            float best_score = arena_a_[cur.pos].score;
+            ++cur.pos;
+            push_cursor(cur);
+
+            while (!heap.empty() && arena_a_[heap.front().pos].doc_id == doc_id) {
+                run_cursor same = pop_min_cursor();
+                best_score = std::max(best_score, arena_a_[same.pos].score);
+                ++same.pos;
+                push_cursor(same);
+            }
+
+            out[begin + out_size++] = {doc_id, best_score};
+        }
+
+        out.resize(begin + out_size);
+        return {begin, begin + out_size};
+    }
+
+   private:
+    std::vector<doc_score_pair> arena_a_;
+    std::vector<doc_score_span> spans_a_;
+    size_t active_cluster_begin_ = 0;
+};
+
+void scan_cluster_per_posting_hash(
+    const clustered_stage1_cache& stage1_cache,
+    size_t cluster_id,
+    const query_object& query,
+    const rabitqlib::Lut<float>& lut,
+    std::array<int32_t, rabitqlib::fastscan::kBatchSize>& accum,
+    token_doc_max_table& doc_max,
+    size_t padded_dim)
+{
+    const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cluster_id);
+    const float* packed_factors = stage1_cache.packed_cluster_factors(cluster_id);
+    const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cluster_id);
+    const size_t cluster_size = stage1_cache.packed_cluster_token_count(cluster_id);
+    const size_t num_batches =
+        (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
+        rabitqlib::fastscan::kBatchSize;
+
+    for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+        const uint8_t* batch_ptr =
+            packed_codes +
+            batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
+        rabitqlib::fastscan::accumulate_hacc(
+            batch_ptr,
+            lut.lut(),
+            accum.data(),
+            padded_dim);
+
+        const size_t valid =
+            std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
+        const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
+
+        for (size_t lane = 0; lane < valid; ++lane) {
+            const int doc_id = packed_doc_ids[lane_base + lane];
+            const float ip =
+                lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
+            const float dist =
+                (ip - query.cb1_sumq) * packed_factors[lane_base + lane];
+            doc_max.max_update(doc_id, dist);
+        }
+    }
+}
+
+void scan_cluster_doc_run_hash(
+    const clustered_stage1_cache& stage1_cache,
+    size_t cluster_id,
+    const query_object& query,
+    const rabitqlib::Lut<float>& lut,
+    std::array<int32_t, rabitqlib::fastscan::kBatchSize>& accum,
+    token_doc_max_table& doc_max,
+    size_t padded_dim)
+{
+    const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cluster_id);
+    const float* packed_factors = stage1_cache.packed_cluster_factors(cluster_id);
+    const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cluster_id);
+    const size_t cluster_size = stage1_cache.packed_cluster_token_count(cluster_id);
+    const size_t num_batches =
+        (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
+        rabitqlib::fastscan::kBatchSize;
+
+    int current_doc_id = -1;
+    float current_doc_max = 0.0f;
+
+    // auto flush_current_doc = [&doc_max, &current_doc_id, &current_doc_max]() {
+    //     if (current_doc_id >= 0) {
+    //         doc_max.max_update(current_doc_id, current_doc_max);
+    //     }
+    // };
+
+    for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+        const uint8_t* batch_ptr =
+            packed_codes +
+            batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
+        rabitqlib::fastscan::accumulate_hacc(
+            batch_ptr,
+            lut.lut(),
+            accum.data(),
+            padded_dim);
+
+        const size_t valid =
+            std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
+        const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
+
+        for (size_t lane = 0; lane < valid; ++lane) {
+            const int doc_id = packed_doc_ids[lane_base + lane];
+            const float ip =
+                lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
+            const float dist =
+                (ip - query.cb1_sumq) * packed_factors[lane_base + lane];
+            if (dist <= 0.0f) {
+                continue;
+            } else if (doc_id == current_doc_id && dist > current_doc_max) {
+                current_doc_max = dist;
+                doc_max.max_update(current_doc_id, current_doc_max);
+            } else if (doc_id != current_doc_id) {
+                current_doc_id = doc_id;
+                current_doc_max = dist;
+                doc_max.max_update(current_doc_id, current_doc_max);
+            }
+
+            // if (doc_id != current_doc_id) {
+            //     flush_current_doc();
+            //     current_doc_id = doc_id;
+            //     current_doc_max = dist;
+            // } else if (dist > current_doc_max) {
+            //     current_doc_max = dist;
+            // }
+        }
+    }
+
+    // flush_current_doc();
+}
+
+void scan_cluster_sorted_merge_fast(
+    const clustered_stage1_cache& stage1_cache,
+    size_t cluster_id,
+    const query_object& query,
+    const rabitqlib::Lut<float>& lut,
+    std::array<int32_t, rabitqlib::fastscan::kBatchSize>& accum,
+    token_doc_max_table_fast& doc_max,
+    size_t padded_dim)
+{
+    const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cluster_id);
+    const float* packed_factors = stage1_cache.packed_cluster_factors(cluster_id);
+    const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cluster_id);
+    const size_t cluster_size = stage1_cache.packed_cluster_token_count(cluster_id);
+    const size_t num_batches =
+        (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
+        rabitqlib::fastscan::kBatchSize;
+
+    doc_max.begin_cluster(cluster_size);
+
+    for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+        const uint8_t* batch_ptr =
+            packed_codes +
+            batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
+        rabitqlib::fastscan::accumulate_hacc(
+            batch_ptr,
+            lut.lut(),
+            accum.data(),
+            padded_dim);
+
+        const size_t valid =
+            std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
+        const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
+
+        for (size_t lane = 0; lane < valid; ++lane) {
+            const int doc_id = packed_doc_ids[lane_base + lane];
+            const float ip =
+                lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
+            const float dist =
+                (ip - query.cb1_sumq) * packed_factors[lane_base + lane];
+            doc_max.push_positive(doc_id, dist);
+        }
+    }
+
+    doc_max.end_cluster();
+}
 
 void repack_cluster_into(
     const clustered_stage1_cache& stage1_cache,
@@ -346,7 +946,7 @@ void rank_all_tokens_1bit_fastscan(
     const auto t_lut_done = std::chrono::high_resolution_clock::now();
 
     std::vector<float> doc_scores(input_ids.size(), 0.0f);
-#pragma omp parallel for
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t idx = 0; idx < input_ids.size(); ++idx) {
         doc_scores[idx] = stage2_score_doc_fastscan(
             index,
@@ -866,195 +1466,347 @@ void rank_cluster_dists(
         }
         t_probe_done = steady_clock::now();
 
-        std::vector<float> doc_score_sum(index.num_docs, 0.0f);
-        std::vector<int> touched_doc_ids;
-
-#if defined(GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER) && GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER
-        const int thread_count = omp_get_max_threads();
-        std::vector<dense_thread_doc_buffer> thread_buffers(static_cast<size_t>(thread_count));
-        for (auto& buffer : thread_buffers) {
-            buffer.reset(index.num_docs);
-        }
-        std::vector<std::vector<int>> token_doc_ids(q_doclen);
-        std::vector<std::vector<float>> token_doc_scores(q_doclen);
-        t_prepare_done = steady_clock::now();
+        if constexpr (kStage1DocAccumMode == stage1_doc_accum_mode::sorted_doc_merge_fast) {
+            std::vector<token_doc_max_table_fast> query_doc_max(q_doclen);
+            std::vector<std::vector<doc_score_pair>> query_final_runs(q_doclen);
+            for (size_t j = 0; j < q_doclen; ++j) {
+                const size_t expected_entries = std::min<size_t>(
+                    index.num_docs,
+                    std::max<size_t>(clusters_per_query[j].size() * 64, 1024));
+                query_doc_max[j].reset(expected_entries);
+            }
+            t_prepare_done = steady_clock::now();
 
 #pragma omp parallel for
-        for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
-            const rabitqlib::Lut<float> lut(
-                queries[j].rotated_query,
-                index.padded_dim_,
-                true);
+            for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
+                const rabitqlib::Lut<float> lut(
+                    queries[j].rotated_query,
+                    index.padded_dim_,
+                    true);
 
-            auto& buffer = thread_buffers[static_cast<size_t>(omp_get_thread_num())];
-            buffer.touched_doc_ids.clear();
+                auto& doc_max = query_doc_max[static_cast<size_t>(j)];
+                std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
 
-            std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
-
-            for (size_t cid : clusters_per_query[j]) {
-                const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cid);
-                const float* packed_factors = stage1_cache.packed_cluster_factors(cid);
-                const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cid);
-                const size_t cluster_size = stage1_cache.packed_cluster_token_count(cid);
-                const size_t num_batches =
-                    (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
-                    rabitqlib::fastscan::kBatchSize;
-
-                for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-                    const uint8_t* batch_ptr =
-                        packed_codes +
-                        batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
-                    rabitqlib::fastscan::accumulate_hacc(
-                        batch_ptr,
-                        lut.lut(),
-                        accum.data(),
+                for (size_t cid : clusters_per_query[j]) {
+                    scan_cluster_sorted_merge_fast(
+                        stage1_cache,
+                        cid,
+                        queries[static_cast<size_t>(j)],
+                        lut,
+                        accum,
+                        doc_max,
                         index.padded_dim_);
+                }
 
-                    const size_t valid =
-                        std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
-                    const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
+                auto& final_run = query_final_runs[static_cast<size_t>(j)];
+                final_run.clear();
+                final_run.reserve(doc_max.reserve_output_capacity());
+                doc_max.finalize_into(final_run);
+            }
+            t_scan_done = steady_clock::now();
 
-                    for (size_t lane = 0; lane < valid; ++lane) {
-                        const int doc_id = packed_doc_ids[lane_base + lane];
-                        const float ip =
-                            lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
-                        const float dist =
-                            (ip - queries[j].cb1_sumq) * packed_factors[lane_base + lane];
-                        if (!buffer.seen[doc_id]) {
-                            buffer.seen[doc_id] = 1;
-                            buffer.max_scores[doc_id] = dist;
-                            buffer.touched_doc_ids.push_back(doc_id);
-                        } else if (dist > buffer.max_scores[doc_id]) {
-                            buffer.max_scores[doc_id] = dist;
+            const auto t_reduce_merge_start = steady_clock::now();
+            std::vector<doc_score_pair> final_scores;
+            bool final_scores_already_sorted_topk = false;
+            if (!query_final_runs.empty()) {
+                size_t total_finalized_pairs = 0;
+                for (const auto& run : query_final_runs) {
+                    total_finalized_pairs += run.size();
+                }
+
+                if (q_doclen == kFixedQueryDoclen) {
+                    int min_doc_id = std::numeric_limits<int>::max();
+                    int max_doc_id = std::numeric_limits<int>::min();
+                    for (const auto& run : query_final_runs) {
+                        if (run.empty()) {
+                            continue;
                         }
+                        min_doc_id = std::min(min_doc_id, run.front().doc_id);
+                        max_doc_id = std::max(max_doc_id, run.back().doc_id);
+                    }
+
+                    if (min_doc_id <= max_doc_id) {
+                        const int max_threads = std::max(1, omp_get_max_threads());
+                        const int64_t doc_id_range =
+                            static_cast<int64_t>(max_doc_id) - static_cast<int64_t>(min_doc_id) + 1;
+                        const int partition_count = static_cast<int>(std::max<int64_t>(
+                            1,
+                            std::min<int64_t>(
+                                static_cast<int64_t>(kFixedQueryDoclen),
+                                std::min<int64_t>(static_cast<int64_t>(max_threads), doc_id_range))));
+
+                        std::vector<float> shared_doc_scores(
+                            static_cast<size_t>(doc_id_range), 0.0f);
+                        std::vector<uint8_t> shared_doc_seen(
+                            static_cast<size_t>(doc_id_range), 0);
+                        std::vector<std::vector<doc_score_pair>> partition_topk(
+                            static_cast<size_t>(partition_count));
+
+#pragma omp parallel for schedule(static)
+                        for (int partition_idx = 0; partition_idx < partition_count; ++partition_idx) {
+                            const int partition_begin = static_cast<int>(
+                                static_cast<int64_t>(min_doc_id) +
+                                (doc_id_range * partition_idx) / partition_count);
+                            const int partition_end = static_cast<int>(
+                                static_cast<int64_t>(min_doc_id) +
+                                (doc_id_range * (partition_idx + 1)) / partition_count);
+
+                            std::vector<int> touched_doc_ids;
+                            touched_doc_ids.reserve(
+                                std::max<size_t>(1024, total_finalized_pairs / static_cast<size_t>(partition_count)));
+
+                            for (const auto& run : query_final_runs) {
+                                if (run.empty()) {
+                                    continue;
+                                }
+
+                                const auto lower = std::lower_bound(
+                                    run.begin(),
+                                    run.end(),
+                                    partition_begin,
+                                    [](const doc_score_pair& entry, int target_doc_id) {
+                                        return entry.doc_id < target_doc_id;
+                                    });
+                                if (lower == run.end()) {
+                                    continue;
+                                }
+
+                                const auto upper = std::lower_bound(
+                                    lower,
+                                    run.end(),
+                                    partition_end,
+                                    [](const doc_score_pair& entry, int target_doc_id) {
+                                        return entry.doc_id < target_doc_id;
+                                    });
+                                if (lower == upper) {
+                                    continue;
+                                }
+
+                                for (auto it = lower; it != upper; ++it) {
+                                    const size_t score_idx =
+                                        static_cast<size_t>(static_cast<int64_t>(it->doc_id) - min_doc_id);
+                                    if (!shared_doc_seen[score_idx]) {
+                                        shared_doc_seen[score_idx] = 1;
+                                        touched_doc_ids.push_back(it->doc_id);
+                                    }
+                                    shared_doc_scores[score_idx] += it->score;
+                                }
+                            }
+
+                            const size_t local_topk_count = std::min(k, touched_doc_ids.size());
+                            auto topk_order = [&shared_doc_scores, min_doc_id](int a, int b) {
+                                const float score_a =
+                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(a) - min_doc_id)];
+                                const float score_b =
+                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(b) - min_doc_id)];
+                                if (score_a != score_b) return score_a > score_b;
+                                return a < b;
+                            };
+                            if (local_topk_count < touched_doc_ids.size()) {
+                                std::partial_sort(
+                                    touched_doc_ids.begin(),
+                                    touched_doc_ids.begin() + static_cast<std::ptrdiff_t>(local_topk_count),
+                                    touched_doc_ids.end(),
+                                    topk_order);
+                            } else {
+                                std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
+                            }
+
+                            auto& local_topk = partition_topk[static_cast<size_t>(partition_idx)];
+                            local_topk.reserve(local_topk_count);
+                            for (size_t local_idx = 0; local_idx < local_topk_count; ++local_idx) {
+                                const int doc_id = touched_doc_ids[local_idx];
+                                local_topk.push_back({
+                                    doc_id,
+                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(doc_id) - min_doc_id)]
+                                });
+                            }
+                        }
+
+                        fixed_score_run_merge32 score_merge32;
+                        score_merge32.reset();
+                        for (const auto& local_topk : partition_topk) {
+                            score_merge32.add_run(local_topk);
+                        }
+                        score_merge32.merge_topk(final_scores, k);
+                        final_scores_already_sorted_topk = true;
+                    }
+                } else {
+                    std::vector<doc_score_pair> work_arena_a;
+                    work_arena_a.reserve(total_finalized_pairs);
+                    std::vector<doc_score_span> spans_a;
+                    spans_a.reserve(q_doclen);
+                    for (const auto& run : query_final_runs) {
+                        const size_t begin = work_arena_a.size();
+                        work_arena_a.insert(work_arena_a.end(), run.begin(), run.end());
+                        spans_a.push_back({begin, work_arena_a.size()});
+                    }
+
+                    std::vector<doc_score_pair> work_arena_b;
+                    work_arena_b.reserve(total_finalized_pairs);
+                    std::vector<doc_score_span> spans_b;
+                    spans_b.reserve((q_doclen + 1) / 2);
+
+                    auto* src_arena = &work_arena_a;
+                    auto* dst_arena = &work_arena_b;
+                    auto* src_spans = &spans_a;
+                    auto* dst_spans = &spans_b;
+
+                    while (src_spans->size() > 1) {
+                        dst_arena->clear();
+                        dst_spans->clear();
+                        dst_spans->reserve((src_spans->size() + 1) / 2);
+
+                        const size_t pair_count = src_spans->size() / 2;
+                        for (size_t pair_idx = 0; pair_idx < pair_count; ++pair_idx) {
+                            dst_spans->push_back(append_merged_doc_score_pairs_sum(
+                                *src_arena,
+                                (*src_spans)[pair_idx * 2],
+                                (*src_spans)[pair_idx * 2 + 1],
+                                *dst_arena));
+                        }
+
+                        if (src_spans->size() % 2 != 0) {
+                            dst_spans->push_back(
+                                append_copy_doc_score_pairs(*src_arena, src_spans->back(), *dst_arena));
+                        }
+
+                        std::swap(src_arena, dst_arena);
+                        std::swap(src_spans, dst_spans);
+                    }
+
+                    if (!src_spans->empty()) {
+                        const doc_score_span final_span = src_spans->front();
+                        final_scores.assign(
+                            src_arena->begin() + static_cast<std::ptrdiff_t>(final_span.begin),
+                            src_arena->begin() + static_cast<std::ptrdiff_t>(final_span.end));
                     }
                 }
             }
+            const auto t_reduce_merge_done = steady_clock::now();
 
-            auto& token_ids = token_doc_ids[static_cast<size_t>(j)];
-            auto& token_scores = token_doc_scores[static_cast<size_t>(j)];
-            token_ids = buffer.touched_doc_ids;
-            token_scores.resize(token_ids.size());
-            for (size_t idx = 0; idx < token_ids.size(); ++idx) {
-                const int doc_id = token_ids[idx];
-                token_scores[idx] = buffer.max_scores[doc_id];
-                buffer.seen[doc_id] = 0;
-            }
-        }
-        t_scan_done = steady_clock::now();
-
-        size_t total_touched_docs = 0;
-        for (const auto& token_ids : token_doc_ids) {
-            total_touched_docs += token_ids.size();
-        }
-        std::vector<uint8_t> doc_seen(index.num_docs, 0);
-        touched_doc_ids.reserve(std::min(total_touched_docs, index.num_docs));
-        for (size_t j = 0; j < q_doclen; ++j) {
-            const auto& token_ids = token_doc_ids[j];
-            const auto& token_scores = token_doc_scores[j];
-            for (size_t idx = 0; idx < token_ids.size(); ++idx) {
-                const int doc_id = token_ids[idx];
-                if (!doc_seen[doc_id]) {
-                    doc_seen[doc_id] = 1;
-                    touched_doc_ids.push_back(doc_id);
+            const size_t topk_count = std::min(k, final_scores.size());
+            if (!final_scores_already_sorted_topk) {
+                auto topk_order = [](const doc_score_pair& a, const doc_score_pair& b) {
+                    if (a.score != b.score) return a.score > b.score;
+                    return a.doc_id < b.doc_id;
+                };
+                if (topk_count < final_scores.size()) {
+                    std::partial_sort(
+                        final_scores.begin(),
+                        final_scores.begin() + topk_count,
+                        final_scores.end(),
+                        topk_order);
+                    final_scores.resize(topk_count);
+                } else {
+                    std::sort(final_scores.begin(), final_scores.end(), topk_order);
                 }
-                doc_score_sum[doc_id] += token_scores[idx];
             }
-        }
-#else
-        std::vector<token_doc_max_table> query_doc_max(q_doclen);
-        for (size_t j = 0; j < q_doclen; ++j) {
-            const size_t expected_entries = std::min<size_t>(
-                index.num_docs,
-                std::max<size_t>(clusters_per_query[j].size() * 64, 1024));
-            query_doc_max[j].reset(expected_entries);
-        }
-        t_prepare_done = steady_clock::now();
+
+            output_ids.reserve(topk_count);
+            for (size_t i = 0; i < topk_count; ++i) {
+                const auto& entry = final_scores[i];
+                output_ids.push_back(static_cast<size_t>(entry.doc_id));
+            }
+            const auto t_reduce_sort_done = steady_clock::now();
+            if (profile != nullptr) {
+                profile->stage1_reduce_merge_ms = ms_between(t_reduce_merge_start, t_reduce_merge_done);
+                profile->stage1_reduce_within_query_merge_ms = 0.0;
+                profile->stage1_reduce_cross_query_merge_ms =
+                    profile->stage1_reduce_merge_ms;
+                profile->stage1_reduce_sort_ms = ms_between(t_reduce_merge_done, t_reduce_sort_done);
+            }
+        } else {
+            std::vector<float> doc_score_sum(index.num_docs, 0.0f);
+            std::vector<int> touched_doc_ids;
+
+            std::vector<token_doc_max_table> query_doc_max(q_doclen);
+            for (size_t j = 0; j < q_doclen; ++j) {
+                const size_t expected_entries = std::min<size_t>(
+                    index.num_docs,
+                    std::max<size_t>(clusters_per_query[j].size() * 64, 1024));
+                query_doc_max[j].reset(expected_entries);
+            }
+            t_prepare_done = steady_clock::now();
 
 #pragma omp parallel for
-        for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
-            const rabitqlib::Lut<float> lut(
-                queries[j].rotated_query,
-                index.padded_dim_,
-                true);
+            for (int j = 0; j < static_cast<int>(q_doclen); ++j) {
+                const rabitqlib::Lut<float> lut(
+                    queries[j].rotated_query,
+                    index.padded_dim_,
+                    true);
 
-            auto& doc_max = query_doc_max[static_cast<size_t>(j)];
+                auto& doc_max = query_doc_max[static_cast<size_t>(j)];
+                std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
 
-            std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
-
-            for (size_t cid : clusters_per_query[j]) {
-                const uint8_t* packed_codes = stage1_cache.packed_cluster_codes(cid);
-                const float* packed_factors = stage1_cache.packed_cluster_factors(cid);
-                const int* packed_doc_ids = stage1_cache.packed_cluster_doc_ids(cid);
-                const size_t cluster_size = stage1_cache.packed_cluster_token_count(cid);
-                const size_t num_batches =
-                    (cluster_size + rabitqlib::fastscan::kBatchSize - 1) /
-                    rabitqlib::fastscan::kBatchSize;
-
-                for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-                    const uint8_t* batch_ptr =
-                        packed_codes +
-                        batch_idx * cluster_batch_code_bytes(stage1_cache.code_bytes_per_vector());
-                    rabitqlib::fastscan::accumulate_hacc(
-                        batch_ptr,
-                        lut.lut(),
-                        accum.data(),
-                        index.padded_dim_);
-
-                    const size_t valid =
-                        std::min<size_t>(rabitqlib::fastscan::kBatchSize, cluster_size - batch_idx * rabitqlib::fastscan::kBatchSize);
-                    const size_t lane_base = batch_idx * rabitqlib::fastscan::kBatchSize;
-
-                    for (size_t lane = 0; lane < valid; ++lane) {
-                        const int doc_id = packed_doc_ids[lane_base + lane];
-                        const float ip =
-                            lut.delta() * static_cast<float>(accum[lane]) + lut.sum_vl();
-                        const float dist =
-                            (ip - queries[j].cb1_sumq) * packed_factors[lane_base + lane];
-                        doc_max.max_update(doc_id, dist);
+                for (size_t cid : clusters_per_query[j]) {
+                    if constexpr (kStage1ClusterScanMode == stage1_cluster_scan_mode::per_posting_hash) {
+                        scan_cluster_per_posting_hash(
+                            stage1_cache,
+                            cid,
+                            queries[static_cast<size_t>(j)],
+                            lut,
+                            accum,
+                            doc_max,
+                            index.padded_dim_);
+                    } else if constexpr (kStage1ClusterScanMode == stage1_cluster_scan_mode::doc_run_hash) {
+                        scan_cluster_doc_run_hash(
+                            stage1_cache,
+                            cid,
+                            queries[static_cast<size_t>(j)],
+                            lut,
+                            accum,
+                            doc_max,
+                            index.padded_dim_);
                     }
                 }
             }
-        }
-        t_scan_done = steady_clock::now();
+            t_scan_done = steady_clock::now();
 
-        size_t total_touched_docs = 0;
-        for (const auto& doc_max : query_doc_max) {
-            total_touched_docs += doc_max.size();
-        }
-
-        std::vector<uint8_t> doc_seen(index.num_docs, 0);
-        touched_doc_ids.reserve(std::min(total_touched_docs, index.num_docs));
-        for (const auto& doc_max : query_doc_max) {
-            for (int doc_id : doc_max.touched_doc_ids()) {
-                if (!doc_seen[doc_id]) {
-                    doc_seen[doc_id] = 1;
-                    touched_doc_ids.push_back(doc_id);
-                }
-                doc_score_sum[doc_id] += doc_max.score_for(doc_id);
+            size_t total_touched_docs = 0;
+            for (const auto& doc_max : query_doc_max) {
+                total_touched_docs += doc_max.size();
             }
-        }
-#endif
 
-        const size_t topk_count = std::min(k, touched_doc_ids.size());
-        auto topk_order = [&doc_score_sum](int a, int b) {
-            if (doc_score_sum[a] != doc_score_sum[b]) return doc_score_sum[a] > doc_score_sum[b];
-            return a < b;
-        };
-        if (topk_count < touched_doc_ids.size()) {
-            std::partial_sort(
-                touched_doc_ids.begin(),
-                touched_doc_ids.begin() + topk_count,
-                touched_doc_ids.end(),
-                topk_order);
-            touched_doc_ids.resize(topk_count);
-        } else {
-            std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
-        }
+            const auto t_reduce_merge_start = steady_clock::now();
+            std::vector<uint8_t> doc_seen(index.num_docs, 0);
+            touched_doc_ids.reserve(std::min(total_touched_docs, index.num_docs));
+            for (const auto& doc_max : query_doc_max) {
+                for (int doc_id : doc_max.touched_doc_ids()) {
+                    if (!doc_seen[doc_id]) {
+                        doc_seen[doc_id] = 1;
+                        touched_doc_ids.push_back(doc_id);
+                    }
+                    doc_score_sum[doc_id] += doc_max.score_for(doc_id);
+                }
+            }
+            const auto t_reduce_merge_done = steady_clock::now();
 
-        output_ids.reserve(topk_count);
-        for (int doc_id : touched_doc_ids) {
-            output_ids.push_back(static_cast<size_t>(doc_id));
+            const size_t topk_count = std::min(k, touched_doc_ids.size());
+            auto topk_order = [&doc_score_sum](int a, int b) {
+                if (doc_score_sum[a] != doc_score_sum[b]) return doc_score_sum[a] > doc_score_sum[b];
+                return a < b;
+            };
+            if (topk_count < touched_doc_ids.size()) {
+                std::partial_sort(
+                    touched_doc_ids.begin(),
+                    touched_doc_ids.begin() + topk_count,
+                    touched_doc_ids.end(),
+                    topk_order);
+                touched_doc_ids.resize(topk_count);
+            } else {
+                std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
+            }
+
+            output_ids.reserve(topk_count);
+            for (int doc_id : touched_doc_ids) {
+                output_ids.push_back(static_cast<size_t>(doc_id));
+            }
+            const auto t_reduce_sort_done = steady_clock::now();
+            if (profile != nullptr) {
+                profile->stage1_reduce_merge_ms = ms_between(t_reduce_merge_start, t_reduce_merge_done);
+                profile->stage1_reduce_sort_ms = ms_between(t_reduce_merge_done, t_reduce_sort_done);
+            }
         }
         t_reduce_done = steady_clock::now();
     }

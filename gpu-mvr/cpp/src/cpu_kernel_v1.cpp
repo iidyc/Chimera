@@ -304,6 +304,10 @@ void accumulate_search_profile(search_profile& accum, const search_profile& samp
     accum.stage1_prepare_ms += sample.stage1_prepare_ms;
     accum.stage1_scan_ms += sample.stage1_scan_ms;
     accum.stage1_reduce_ms += sample.stage1_reduce_ms;
+    accum.stage1_reduce_merge_ms += sample.stage1_reduce_merge_ms;
+    accum.stage1_reduce_within_query_merge_ms += sample.stage1_reduce_within_query_merge_ms;
+    accum.stage1_reduce_cross_query_merge_ms += sample.stage1_reduce_cross_query_merge_ms;
+    accum.stage1_reduce_sort_ms += sample.stage1_reduce_sort_ms;
     accum.stage1_cleanup_ms += sample.stage1_cleanup_ms;
     accum.stage2_1bit_ms += sample.stage2_1bit_ms;
     accum.stage2_lut_ms += sample.stage2_lut_ms;
@@ -332,6 +336,10 @@ search_profile average_search_profile(const search_profile& total, size_t count)
     average.stage1_prepare_ms /= denom;
     average.stage1_scan_ms /= denom;
     average.stage1_reduce_ms /= denom;
+    average.stage1_reduce_merge_ms /= denom;
+    average.stage1_reduce_within_query_merge_ms /= denom;
+    average.stage1_reduce_cross_query_merge_ms /= denom;
+    average.stage1_reduce_sort_ms /= denom;
     average.stage1_cleanup_ms /= denom;
     average.stage2_1bit_ms /= denom;
     average.stage2_lut_ms /= denom;
@@ -394,7 +402,11 @@ void print_search_profile_summary(const search_profile& total, size_t count)
         << " probe_ms=" << avg.stage1_probe_ms
         << " prepare_ms=" << avg.stage1_prepare_ms
         << " scan_ms=" << avg.stage1_scan_ms
-        << " reduce_ms=" << avg.stage1_reduce_ms
+        << " reduce_total_ms=" << avg.stage1_reduce_ms
+        << " reduce_merge_component_ms=" << avg.stage1_reduce_merge_ms
+        << " reduce_within_query_merge_component_ms=" << avg.stage1_reduce_within_query_merge_ms
+        << " reduce_cross_query_merge_component_ms=" << avg.stage1_reduce_cross_query_merge_ms
+        << " reduce_sort_component_ms=" << avg.stage1_reduce_sort_ms
         << " cleanup_ms=" << avg.stage1_cleanup_ms
         << std::endl;
     std::cout

@@ -15,6 +15,10 @@ struct search_profile {
     double stage1_prepare_ms = 0.0;
     double stage1_scan_ms = 0.0;
     double stage1_reduce_ms = 0.0;
+    double stage1_reduce_merge_ms = 0.0;
+    double stage1_reduce_within_query_merge_ms = 0.0;
+    double stage1_reduce_cross_query_merge_ms = 0.0;
+    double stage1_reduce_sort_ms = 0.0;
     double stage1_cleanup_ms = 0.0;
     double stage2_1bit_ms = 0.0;
     double stage2_lut_ms = 0.0;

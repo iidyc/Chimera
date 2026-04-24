@@ -108,6 +108,16 @@ int main(int argc, char** argv) {
     std::cout
         << "[RUN] stage1_doc_accum_mode=" << cpu_kernel_v3::kStage1DocAccumModeName
         << std::endl;
+    if constexpr (cpu_kernel_v3::kStage1DocAccumMode ==
+                  cpu_kernel_v3::stage1_doc_accum_mode::sparse_flat_hash) {
+        std::cout
+            << "[RUN] stage1_cluster_scan_mode=" << cpu_kernel_v3::kStage1ClusterScanModeName
+            << std::endl;
+    } else {
+        std::cout
+            << "[RUN] stage1_cluster_scan_mode=sorted_positive_cluster_merge"
+            << std::endl;
+    }
     std::cout
         << "[RUN] stage3_quantized_payload=" << index.quantized_payload_mode_name()
         << " ex_bits=" << index.ex_bits

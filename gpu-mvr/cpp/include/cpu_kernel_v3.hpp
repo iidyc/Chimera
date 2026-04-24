@@ -14,15 +14,51 @@ namespace cpu_kernel_v3 {
 
 using search_profile = cpu_kernel_v1::search_profile;
 
-inline constexpr bool kStage1PrepackEnabled = true;
+enum class stage1_doc_accum_mode {
+    sparse_flat_hash,
+    sorted_doc_merge_fast,
+};
 
-#if defined(GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER) && GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER
-inline constexpr bool kStage1DenseDocBufferEnabled = true;
-inline constexpr const char* kStage1DocAccumModeName = "dense_thread_local_doc_buffer";
-#else
+enum class stage1_cluster_scan_mode {
+    per_posting_hash,
+    doc_run_hash,
+};
+
+inline constexpr bool kStage1PrepackEnabled = true;
 inline constexpr bool kStage1DenseDocBufferEnabled = false;
-inline constexpr const char* kStage1DocAccumModeName = "sparse_flat_hash";
-#endif
+inline constexpr stage1_doc_accum_mode kStage1DocAccumMode =
+    stage1_doc_accum_mode::sparse_flat_hash;
+
+constexpr const char* stage1_doc_accum_mode_name(stage1_doc_accum_mode mode)
+{
+    switch (mode) {
+        case stage1_doc_accum_mode::sparse_flat_hash:
+            return "sparse_flat_hash";
+        case stage1_doc_accum_mode::sorted_doc_merge_fast:
+            return "sorted_doc_merge_fast";
+    }
+    return "unknown";
+}
+
+inline constexpr const char* kStage1DocAccumModeName =
+    stage1_doc_accum_mode_name(kStage1DocAccumMode);
+
+inline constexpr stage1_cluster_scan_mode kStage1ClusterScanMode =
+    stage1_cluster_scan_mode::per_posting_hash;
+
+constexpr const char* stage1_cluster_scan_mode_name(stage1_cluster_scan_mode mode)
+{
+    switch (mode) {
+        case stage1_cluster_scan_mode::per_posting_hash:
+            return "per_posting_hash";
+        case stage1_cluster_scan_mode::doc_run_hash:
+            return "doc_run_hash";
+    }
+    return "unknown";
+}
+
+inline constexpr const char* kStage1ClusterScanModeName =
+    stage1_cluster_scan_mode_name(kStage1ClusterScanMode);
 
 struct repacked_cluster {
     aligned_vector_64<uint8_t> packed_codes;

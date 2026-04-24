@@ -131,20 +131,7 @@ add_executable(cpu_search_v3
     cpp/src/cpu_kernel_v3.cpp
     cpp/src/cpu_kernel_v1.cpp
 )
-target_compile_definitions(cpu_search_v3 PRIVATE
-    GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER=0
-)
 target_link_libraries(cpu_search_v3 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
-
-add_executable(cpu_search_v3_dense
-    cpp/app/cpu_search_v3.cpp
-    cpp/src/cpu_kernel_v3.cpp
-    cpp/src/cpu_kernel_v1.cpp
-)
-target_compile_definitions(cpu_search_v3_dense PRIVATE
-    GPU_MVR_CPU_V3_STAGE1_DENSE_DOC_BUFFER=1
-)
-target_link_libraries(cpu_search_v3_dense PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
 if(ENABLE_TEST)
     add_executable(test_gather cpp/test/test_gather.cpp)
