@@ -449,6 +449,31 @@ class fixed_score_run_merge32 {
     size_t active_ = 0;
 };
 
+struct partitioned_cross_query_reduce_scratch {
+    std::vector<float> shared_doc_scores;
+    std::vector<uint8_t> shared_doc_seen;
+    std::vector<std::vector<int>> partition_touched_doc_ids;
+    std::vector<std::vector<doc_score_pair>> partition_topk;
+    fixed_score_run_merge32 score_merge32;
+
+    void ensure(size_t num_docs, size_t partition_count, size_t run_count)
+    {
+        if (shared_doc_scores.size() < num_docs) {
+            shared_doc_scores.resize(num_docs);
+        }
+        if (shared_doc_seen.size() < num_docs) {
+            shared_doc_seen.resize(num_docs);
+        }
+        if (partition_touched_doc_ids.size() < partition_count) {
+            partition_touched_doc_ids.resize(partition_count);
+        }
+        if (partition_topk.size() < partition_count) {
+            partition_topk.resize(partition_count);
+        }
+        (void)run_count;
+    }
+};
+
 struct token_balanced_doc_buckets {
     std::vector<std::vector<size_t>> buckets;
     std::vector<size_t> thread_loads;
@@ -711,6 +736,151 @@ void plan_pairwise_merge_round(
         offset += cap;
     }
     dst_arena.resize(offset);
+}
+
+void reduce_query_runs_fast_partitioned(
+    const std::vector<std::vector<doc_score_pair>>& query_final_runs,
+    size_t total_finalized_pairs,
+    size_t num_docs,
+    size_t k,
+    partitioned_cross_query_reduce_scratch& scratch,
+    std::vector<doc_score_pair>& final_scores,
+    bool& final_scores_already_sorted_topk)
+{
+    int min_doc_id = std::numeric_limits<int>::max();
+    int max_doc_id = std::numeric_limits<int>::min();
+    for (const auto& run : query_final_runs) {
+        if (run.empty()) {
+            continue;
+        }
+        min_doc_id = std::min(min_doc_id, run.front().doc_id);
+        max_doc_id = std::max(max_doc_id, run.back().doc_id);
+    }
+
+    if (min_doc_id > max_doc_id) {
+        final_scores.clear();
+        final_scores_already_sorted_topk = true;
+        return;
+    }
+
+    if (max_doc_id < 0 || static_cast<size_t>(max_doc_id) >= num_docs) {
+        throw std::runtime_error("partitioned cross-query reduce doc_id out of range");
+    }
+
+    const int max_threads = std::max(1, omp_get_max_threads());
+    const int64_t doc_id_range =
+        static_cast<int64_t>(max_doc_id) - static_cast<int64_t>(min_doc_id) + 1;
+    const int partition_count = static_cast<int>(std::max<int64_t>(
+        1,
+        std::min<int64_t>(
+            static_cast<int64_t>(kFixedQueryDoclen),
+            std::min<int64_t>(static_cast<int64_t>(max_threads), doc_id_range))));
+    const size_t local_touch_reserve =
+        std::max<size_t>(1024, total_finalized_pairs / static_cast<size_t>(partition_count));
+
+    scratch.ensure(num_docs, static_cast<size_t>(partition_count), query_final_runs.size());
+
+    std::memset(
+        scratch.shared_doc_scores.data() + min_doc_id,
+        0,
+        static_cast<size_t>(doc_id_range) * sizeof(float));
+    std::memset(
+        scratch.shared_doc_seen.data() + min_doc_id,
+        0,
+        static_cast<size_t>(doc_id_range) * sizeof(uint8_t));
+
+#pragma omp parallel for schedule(static)
+    for (int partition_idx = 0; partition_idx < partition_count; ++partition_idx) {
+        const int partition_begin = static_cast<int>(
+            static_cast<int64_t>(min_doc_id) +
+            (doc_id_range * partition_idx) / partition_count);
+        const int partition_end = static_cast<int>(
+            static_cast<int64_t>(min_doc_id) +
+            (doc_id_range * (partition_idx + 1)) / partition_count);
+
+        auto& touched_doc_ids =
+            scratch.partition_touched_doc_ids[static_cast<size_t>(partition_idx)];
+        touched_doc_ids.clear();
+        if (touched_doc_ids.capacity() < local_touch_reserve) {
+            touched_doc_ids.reserve(local_touch_reserve);
+        }
+
+        for (const auto& run : query_final_runs) {
+            if (run.empty()) {
+                continue;
+            }
+
+            const auto lower = std::lower_bound(
+                run.begin(),
+                run.end(),
+                partition_begin,
+                [](const doc_score_pair& entry, int target_doc_id) {
+                    return entry.doc_id < target_doc_id;
+                });
+            if (lower == run.end()) {
+                continue;
+            }
+
+            const auto upper = std::lower_bound(
+                lower,
+                run.end(),
+                partition_end,
+                [](const doc_score_pair& entry, int target_doc_id) {
+                    return entry.doc_id < target_doc_id;
+                });
+            if (lower == upper) {
+                continue;
+            }
+
+            for (auto it = lower; it != upper; ++it) {
+                const size_t score_idx = static_cast<size_t>(it->doc_id);
+                if (!scratch.shared_doc_seen[score_idx]) {
+                    scratch.shared_doc_seen[score_idx] = 1;
+                    touched_doc_ids.push_back(it->doc_id);
+                }
+                scratch.shared_doc_scores[score_idx] += it->score;
+            }
+        }
+
+        const size_t local_topk_count = std::min(k, touched_doc_ids.size());
+        const float* shared_doc_scores = scratch.shared_doc_scores.data();
+        auto topk_order = [shared_doc_scores](int a, int b) {
+            const float score_a = shared_doc_scores[static_cast<size_t>(a)];
+            const float score_b = shared_doc_scores[static_cast<size_t>(b)];
+            if (score_a != score_b) return score_a > score_b;
+            return a < b;
+        };
+        if (local_topk_count < touched_doc_ids.size()) {
+            std::partial_sort(
+                touched_doc_ids.begin(),
+                touched_doc_ids.begin() + static_cast<std::ptrdiff_t>(local_topk_count),
+                touched_doc_ids.end(),
+                topk_order);
+        } else {
+            std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
+        }
+
+        auto& local_topk = scratch.partition_topk[static_cast<size_t>(partition_idx)];
+        local_topk.clear();
+        if (local_topk.capacity() < local_topk_count) {
+            local_topk.reserve(local_topk_count);
+        }
+        for (size_t local_idx = 0; local_idx < local_topk_count; ++local_idx) {
+            const int doc_id = touched_doc_ids[local_idx];
+            local_topk.push_back({
+                doc_id,
+                scratch.shared_doc_scores[static_cast<size_t>(doc_id)]
+            });
+        }
+    }
+
+    scratch.score_merge32.reset();
+    for (int partition_idx = 0; partition_idx < partition_count; ++partition_idx) {
+        scratch.score_merge32.add_run(
+            scratch.partition_topk[static_cast<size_t>(partition_idx)]);
+    }
+    scratch.score_merge32.merge_topk(final_scores, k);
+    final_scores_already_sorted_topk = true;
 }
 
 class token_doc_max_table_fast {
@@ -1852,6 +2022,7 @@ void rank_cluster_dists(
     search_profile* profile)
 {
     output_ids.clear();
+    thread_local partitioned_cross_query_reduce_scratch fast_reduce_scratch;
 
     const auto t_stage1_start = steady_clock::now();
     steady_clock::time_point t_probe_done;
@@ -1879,7 +2050,7 @@ void rank_cluster_dists(
         t_probe_done = steady_clock::now();
 
         if constexpr (kStage1DocAccumMode == stage1_doc_accum_mode::sorted_doc_merge_fast) {
-            std::vector<token_doc_max_table_fast> query_doc_max(q_doclen);
+            std::vector<token_doc_max_table_parallel> query_doc_max(q_doclen);
             std::vector<std::vector<doc_score_pair>> query_final_runs(q_doclen);
             for (size_t j = 0; j < q_doclen; ++j) {
                 const size_t expected_entries = std::min<size_t>(
@@ -1900,7 +2071,7 @@ void rank_cluster_dists(
                 std::array<int32_t, rabitqlib::fastscan::kBatchSize> accum {};
 
                 for (size_t cid : clusters_per_query[j]) {
-                    scan_cluster_sorted_merge_fast(
+                    scan_cluster_sorted_merge_parallel(
                         stage1_cache,
                         cid,
                         queries[static_cast<size_t>(j)],
@@ -1927,122 +2098,14 @@ void rank_cluster_dists(
                 }
 
                 if (q_doclen == kFixedQueryDoclen) {
-                    int min_doc_id = std::numeric_limits<int>::max();
-                    int max_doc_id = std::numeric_limits<int>::min();
-                    for (const auto& run : query_final_runs) {
-                        if (run.empty()) {
-                            continue;
-                        }
-                        min_doc_id = std::min(min_doc_id, run.front().doc_id);
-                        max_doc_id = std::max(max_doc_id, run.back().doc_id);
-                    }
-
-                    if (min_doc_id <= max_doc_id) {
-                        const int max_threads = std::max(1, omp_get_max_threads());
-                        const int64_t doc_id_range =
-                            static_cast<int64_t>(max_doc_id) - static_cast<int64_t>(min_doc_id) + 1;
-                        const int partition_count = static_cast<int>(std::max<int64_t>(
-                            1,
-                            std::min<int64_t>(
-                                static_cast<int64_t>(kFixedQueryDoclen),
-                                std::min<int64_t>(static_cast<int64_t>(max_threads), doc_id_range))));
-
-                        std::vector<float> shared_doc_scores(
-                            static_cast<size_t>(doc_id_range), 0.0f);
-                        std::vector<uint8_t> shared_doc_seen(
-                            static_cast<size_t>(doc_id_range), 0);
-                        std::vector<std::vector<doc_score_pair>> partition_topk(
-                            static_cast<size_t>(partition_count));
-
-#pragma omp parallel for schedule(static)
-                        for (int partition_idx = 0; partition_idx < partition_count; ++partition_idx) {
-                            const int partition_begin = static_cast<int>(
-                                static_cast<int64_t>(min_doc_id) +
-                                (doc_id_range * partition_idx) / partition_count);
-                            const int partition_end = static_cast<int>(
-                                static_cast<int64_t>(min_doc_id) +
-                                (doc_id_range * (partition_idx + 1)) / partition_count);
-
-                            std::vector<int> touched_doc_ids;
-                            touched_doc_ids.reserve(
-                                std::max<size_t>(1024, total_finalized_pairs / static_cast<size_t>(partition_count)));
-
-                            for (const auto& run : query_final_runs) {
-                                if (run.empty()) {
-                                    continue;
-                                }
-
-                                const auto lower = std::lower_bound(
-                                    run.begin(),
-                                    run.end(),
-                                    partition_begin,
-                                    [](const doc_score_pair& entry, int target_doc_id) {
-                                        return entry.doc_id < target_doc_id;
-                                    });
-                                if (lower == run.end()) {
-                                    continue;
-                                }
-
-                                const auto upper = std::lower_bound(
-                                    lower,
-                                    run.end(),
-                                    partition_end,
-                                    [](const doc_score_pair& entry, int target_doc_id) {
-                                        return entry.doc_id < target_doc_id;
-                                    });
-                                if (lower == upper) {
-                                    continue;
-                                }
-
-                                for (auto it = lower; it != upper; ++it) {
-                                    const size_t score_idx =
-                                        static_cast<size_t>(static_cast<int64_t>(it->doc_id) - min_doc_id);
-                                    if (!shared_doc_seen[score_idx]) {
-                                        shared_doc_seen[score_idx] = 1;
-                                        touched_doc_ids.push_back(it->doc_id);
-                                    }
-                                    shared_doc_scores[score_idx] += it->score;
-                                }
-                            }
-
-                            const size_t local_topk_count = std::min(k, touched_doc_ids.size());
-                            auto topk_order = [&shared_doc_scores, min_doc_id](int a, int b) {
-                                const float score_a =
-                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(a) - min_doc_id)];
-                                const float score_b =
-                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(b) - min_doc_id)];
-                                if (score_a != score_b) return score_a > score_b;
-                                return a < b;
-                            };
-                            if (local_topk_count < touched_doc_ids.size()) {
-                                std::partial_sort(
-                                    touched_doc_ids.begin(),
-                                    touched_doc_ids.begin() + static_cast<std::ptrdiff_t>(local_topk_count),
-                                    touched_doc_ids.end(),
-                                    topk_order);
-                            } else {
-                                std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
-                            }
-
-                            auto& local_topk = partition_topk[static_cast<size_t>(partition_idx)];
-                            local_topk.reserve(local_topk_count);
-                            for (size_t local_idx = 0; local_idx < local_topk_count; ++local_idx) {
-                                const int doc_id = touched_doc_ids[local_idx];
-                                local_topk.push_back({
-                                    doc_id,
-                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(doc_id) - min_doc_id)]
-                                });
-                            }
-                        }
-
-                        fixed_score_run_merge32 score_merge32;
-                        score_merge32.reset();
-                        for (const auto& local_topk : partition_topk) {
-                            score_merge32.add_run(local_topk);
-                        }
-                        score_merge32.merge_topk(final_scores, k);
-                        final_scores_already_sorted_topk = true;
-                    }
+                    reduce_query_runs_fast_partitioned(
+                        query_final_runs,
+                        total_finalized_pairs,
+                        index.num_docs,
+                        k,
+                        fast_reduce_scratch,
+                        final_scores,
+                        final_scores_already_sorted_topk);
                 } else {
                     std::vector<doc_score_pair> work_arena_a;
                     work_arena_a.reserve(total_finalized_pairs);
@@ -2170,129 +2233,74 @@ void rank_cluster_dists(
             const auto t_reduce_merge_start = steady_clock::now();
             std::vector<doc_score_pair> final_scores;
             bool final_scores_already_sorted_topk = false;
+            const size_t hybrid_parallel_threshold =
+                static_cast<size_t>(std::max(1, omp_get_max_threads())) * 4;
+            const bool use_parallel_reduce = nprobe < hybrid_parallel_threshold;
             if (!query_final_runs.empty()) {
                 size_t total_finalized_pairs = 0;
                 for (const auto& run : query_final_runs) {
                     total_finalized_pairs += run.size();
                 }
 
-                if (q_doclen == kFixedQueryDoclen) {
-                    int min_doc_id = std::numeric_limits<int>::max();
-                    int max_doc_id = std::numeric_limits<int>::min();
+                if (use_parallel_reduce) {
+                    std::vector<doc_score_pair> work_arena_a;
+                    work_arena_a.reserve(total_finalized_pairs);
+                    std::vector<doc_score_span> spans_a;
+                    spans_a.reserve(q_doclen);
                     for (const auto& run : query_final_runs) {
-                        if (run.empty()) {
-                            continue;
-                        }
-                        min_doc_id = std::min(min_doc_id, run.front().doc_id);
-                        max_doc_id = std::max(max_doc_id, run.back().doc_id);
+                        const size_t begin = work_arena_a.size();
+                        work_arena_a.insert(work_arena_a.end(), run.begin(), run.end());
+                        spans_a.push_back({begin, work_arena_a.size()});
                     }
 
-                    if (min_doc_id <= max_doc_id) {
-                        const int max_threads = std::max(1, omp_get_max_threads());
-                        const int64_t doc_id_range =
-                            static_cast<int64_t>(max_doc_id) - static_cast<int64_t>(min_doc_id) + 1;
-                        const int partition_count = static_cast<int>(std::max<int64_t>(
-                            1,
-                            std::min<int64_t>(
-                                static_cast<int64_t>(kFixedQueryDoclen),
-                                std::min<int64_t>(static_cast<int64_t>(max_threads), doc_id_range))));
+                    std::vector<doc_score_pair> work_arena_b;
+                    work_arena_b.reserve(total_finalized_pairs);
+                    std::vector<doc_score_span> spans_b;
+                    spans_b.reserve((q_doclen + 1) / 2);
 
-                        std::vector<float> shared_doc_scores(
-                            static_cast<size_t>(doc_id_range), 0.0f);
-                        std::vector<uint8_t> shared_doc_seen(
-                            static_cast<size_t>(doc_id_range), 0);
-                        std::vector<std::vector<doc_score_pair>> partition_topk(
-                            static_cast<size_t>(partition_count));
+                    auto* src_arena = &work_arena_a;
+                    auto* dst_arena = &work_arena_b;
+                    auto* src_spans = &spans_a;
+                    auto* dst_spans = &spans_b;
 
-#pragma omp parallel for schedule(static)
-                        for (int partition_idx = 0; partition_idx < partition_count; ++partition_idx) {
-                            const int partition_begin = static_cast<int>(
-                                static_cast<int64_t>(min_doc_id) +
-                                (doc_id_range * partition_idx) / partition_count);
-                            const int partition_end = static_cast<int>(
-                                static_cast<int64_t>(min_doc_id) +
-                                (doc_id_range * (partition_idx + 1)) / partition_count);
+                    while (src_spans->size() > 1) {
+                        dst_arena->clear();
+                        dst_spans->clear();
+                        dst_spans->reserve((src_spans->size() + 1) / 2);
 
-                            std::vector<int> touched_doc_ids;
-                            touched_doc_ids.reserve(
-                                std::max<size_t>(1024, total_finalized_pairs / static_cast<size_t>(partition_count)));
-
-                            for (const auto& run : query_final_runs) {
-                                if (run.empty()) {
-                                    continue;
-                                }
-
-                                const auto lower = std::lower_bound(
-                                    run.begin(),
-                                    run.end(),
-                                    partition_begin,
-                                    [](const doc_score_pair& entry, int target_doc_id) {
-                                        return entry.doc_id < target_doc_id;
-                                    });
-                                if (lower == run.end()) {
-                                    continue;
-                                }
-
-                                const auto upper = std::lower_bound(
-                                    lower,
-                                    run.end(),
-                                    partition_end,
-                                    [](const doc_score_pair& entry, int target_doc_id) {
-                                        return entry.doc_id < target_doc_id;
-                                    });
-                                if (lower == upper) {
-                                    continue;
-                                }
-
-                                for (auto it = lower; it != upper; ++it) {
-                                    const size_t score_idx =
-                                        static_cast<size_t>(static_cast<int64_t>(it->doc_id) - min_doc_id);
-                                    if (!shared_doc_seen[score_idx]) {
-                                        shared_doc_seen[score_idx] = 1;
-                                        touched_doc_ids.push_back(it->doc_id);
-                                    }
-                                    shared_doc_scores[score_idx] += it->score;
-                                }
-                            }
-
-                            const size_t local_topk_count = std::min(k, touched_doc_ids.size());
-                            auto topk_order = [&shared_doc_scores, min_doc_id](int a, int b) {
-                                const float score_a =
-                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(a) - min_doc_id)];
-                                const float score_b =
-                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(b) - min_doc_id)];
-                                if (score_a != score_b) return score_a > score_b;
-                                return a < b;
-                            };
-                            if (local_topk_count < touched_doc_ids.size()) {
-                                std::partial_sort(
-                                    touched_doc_ids.begin(),
-                                    touched_doc_ids.begin() + static_cast<std::ptrdiff_t>(local_topk_count),
-                                    touched_doc_ids.end(),
-                                    topk_order);
-                            } else {
-                                std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
-                            }
-
-                            auto& local_topk = partition_topk[static_cast<size_t>(partition_idx)];
-                            local_topk.reserve(local_topk_count);
-                            for (size_t local_idx = 0; local_idx < local_topk_count; ++local_idx) {
-                                const int doc_id = touched_doc_ids[local_idx];
-                                local_topk.push_back({
-                                    doc_id,
-                                    shared_doc_scores[static_cast<size_t>(static_cast<int64_t>(doc_id) - min_doc_id)]
-                                });
-                            }
+                        const size_t pair_count = src_spans->size() / 2;
+                        for (size_t pair_idx = 0; pair_idx < pair_count; ++pair_idx) {
+                            dst_spans->push_back(append_merged_doc_score_pairs_sum(
+                                *src_arena,
+                                (*src_spans)[pair_idx * 2],
+                                (*src_spans)[pair_idx * 2 + 1],
+                                *dst_arena));
                         }
 
-                        fixed_score_run_merge32 score_merge32;
-                        score_merge32.reset();
-                        for (const auto& local_topk : partition_topk) {
-                            score_merge32.add_run(local_topk);
+                        if (src_spans->size() % 2 != 0) {
+                            dst_spans->push_back(
+                                append_copy_doc_score_pairs(*src_arena, src_spans->back(), *dst_arena));
                         }
-                        score_merge32.merge_topk(final_scores, k);
-                        final_scores_already_sorted_topk = true;
+
+                        std::swap(src_arena, dst_arena);
+                        std::swap(src_spans, dst_spans);
                     }
+
+                    if (!src_spans->empty()) {
+                        const doc_score_span final_span = src_spans->front();
+                        final_scores.assign(
+                            src_arena->begin() + static_cast<std::ptrdiff_t>(final_span.begin),
+                            src_arena->begin() + static_cast<std::ptrdiff_t>(final_span.end));
+                    }
+                } else if (q_doclen == kFixedQueryDoclen) {
+                    reduce_query_runs_fast_partitioned(
+                        query_final_runs,
+                        total_finalized_pairs,
+                        index.num_docs,
+                        k,
+                        fast_reduce_scratch,
+                        final_scores,
+                        final_scores_already_sorted_topk);
                 } else {
                     std::vector<doc_score_pair> work_arena_a;
                     work_arena_a.reserve(total_finalized_pairs);
