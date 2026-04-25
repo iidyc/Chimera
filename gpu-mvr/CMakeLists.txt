@@ -133,6 +133,7 @@ add_executable(cpu_search_v3
 )
 target_compile_definitions(cpu_search_v3 PRIVATE
     GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE=1
+    GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE=1
 )
 target_link_libraries(cpu_search_v3 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 

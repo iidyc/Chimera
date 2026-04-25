@@ -26,7 +26,7 @@ inline constexpr bool kStage1PrepackEnabled = true;
 #define GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE 1
 #endif
 #ifndef GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE
-#define GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE 0
+#define GPU_MVR_CPU_V3_STAGE3_DYNAMIC_SCHEDULE 1
 #endif
 inline constexpr stage1_doc_accum_mode kStage1DocAccumMode =
     static_cast<stage1_doc_accum_mode>(GPU_MVR_CPU_V3_STAGE1_DOC_ACCUM_MODE);
