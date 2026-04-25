@@ -254,10 +254,15 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.s1_cagra_end, stream));
         CUDA_CHECK(cudaEventRecord(ws_.s1_expansion_start, stream));
-        CUDA_CHECK(cudaEventRecord(ws_.s1_expansion_end, stream));
     }
 #endif
 
+#ifdef GPU_MVR_USE_LUT
+#ifdef GPU_MVR_PROFILE
+    if constexpr (kProfile) {
+        CUDA_CHECK(cudaEventRecord(ws_.s1_expansion_end, stream));
+    }
+#endif
     int threads_per_block = 256;
     CUDA_CHECK(cudaStreamWaitEvent(stream, ws_.event_h2d_done));
 
@@ -266,7 +271,6 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_start, stream));
     }
 #endif
-#ifdef GPU_MVR_USE_LUT
     if (use_clustered_) {
         int blocks_x = std::max(
             (max_cluster_size + threads_per_block - 1) / threads_per_block,
@@ -289,8 +293,107 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         throw std::runtime_error("v8 requires clustered cluster_1bit.bin layout");
     }
 #else
-    throw std::runtime_error("v8 requires GPU_MVR_USE_LUT");
+    compute_query_expansion_sizes_kernel<<<(Q_DOCLEN + 255) / 256, 256, 0, stream>>>(
+        ws_.d_cagra_labels,
+        d_cluster_pos_,
+        ws_.d_pair_offsets + 1,
+        nprobe,
+        ivf->n_clusters,
+        Q_DOCLEN
+    );
+
+    CUDA_CHECK(cudaMemsetAsync(ws_.d_pair_offsets, 0, sizeof(int), stream));
+
+    {
+        size_t scan_temp = ws_.cub_temp_storage_bytes;
+        cub::DeviceScan::InclusiveScan(
+            ws_.d_cub_temp_storage, scan_temp,
+            ws_.d_pair_offsets + 1, ws_.d_pair_offsets + 1,
+            thrust::plus<int>(), (int)Q_DOCLEN, stream);
+    }
+
+    int total_pairs = 0;
+    if constexpr (kProfile) {
+        XFER_RECORD_BEGIN(stream);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(&total_pairs, ws_.d_pair_offsets + Q_DOCLEN,
+                               sizeof(int), cudaMemcpyDeviceToHost, stream));
+    if constexpr (kProfile) {
+        XFER_RECORD_END(stream, sizeof(int), false);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (total_pairs == 0) {
+        actual_k_out = 0;
+        return;
+    }
+
+    expand_cluster_ids_kernel<<<Q_DOCLEN, 256, 0, stream>>>(
+        ws_.d_cagra_labels,
+        d_inv_list_,
+        d_cluster_pos_,
+        ws_.d_pair_offsets,
+        ws_.d_emb_ids,
+        nprobe,
+        ivf->n_clusters,
+        Q_DOCLEN,
+        true
+    );
+
+#ifdef GPU_MVR_PROFILE
+    if constexpr (kProfile) {
+        CUDA_CHECK(cudaEventRecord(ws_.s1_expansion_end, stream));
+    }
 #endif
+
+    int threads_per_block = 256;
+    CUDA_CHECK(cudaStreamWaitEvent(stream, ws_.event_h2d_done));
+
+#ifdef GPU_MVR_PROFILE
+    if constexpr (kProfile) {
+        CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_start, stream));
+    }
+#endif
+    {
+        int max_embs_per_query = ws_.max_embs_per_query_bound;
+        int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_queries, d_clustered_code_, d_clustered_factor_, ws_.d_cb1_sumq,
+            ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
+            max_embs_per_query
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+#ifdef GPU_MVR_PROFILE
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
+        }
+#endif
+        aggregate_stage1_tracked_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_emb_ids,
+            ws_.d_emb_dists,
+            ws_.d_pair_offsets,
+            d_clustered_doc_ids_,
+            ws_.d_doc_query_max,
+            ws_.d_doc_touched,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+            num_docs,
+            ws_.max_stage1_pairs,
+            max_embs_per_query
+        );
+        CUDA_CHECK(cudaGetLastError());
+#ifdef GPU_MVR_PROFILE
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
+        }
+#endif
+    }
+#endif
+#ifdef GPU_MVR_USE_LUT
     CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -303,6 +406,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
         CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
     }
+#endif
 #endif
 
     int h_num_touched = 0;

@@ -11,7 +11,6 @@
 #define STAGE2_LUT_NUM_TILES (Q_DOCLEN / STAGE2_LUT_TILE_Q)
 #define STAGE2_LUT_SMEM_FLOATS (STAGE2_LUT_TILE_Q * LUT_ENTRIES_PER_QUERY)
 
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
 using doc_bitmap_bucket_t = uint32_t;
 using doc_bitmap_offset_t = uint32_t;
 
@@ -29,7 +28,6 @@ inline constexpr size_t doc_bitmap_num_buckets(size_t num_docs) {
 inline constexpr size_t doc_bitmap_num_offsets(size_t num_buckets) {
     return (num_buckets / kDocBitmapCompRatio) + 1;
 }
-#endif
 
 #ifdef GPU_MVR_V6_GPU_INDICES_U32
 using stage2_token_id_t = uint32_t;

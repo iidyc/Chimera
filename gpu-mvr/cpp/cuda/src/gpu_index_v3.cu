@@ -954,6 +954,10 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         return;
     }
 
+    if (!use_clustered_) {
+        throw std::runtime_error("v3 no-LUT path requires clustered layout");
+    }
+
     expand_cluster_ids_kernel<<<Q_DOCLEN, 256, 0, stream>>>(
         ws_.d_cagra_labels,
         d_inv_list_,
@@ -963,7 +967,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         nprobe,
         ivf->n_clusters,
         Q_DOCLEN,
-        false
+        true
     );
 
 #ifdef GPU_MVR_PROFILE
@@ -1011,7 +1015,17 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         throw std::runtime_error("v3 requires clustered cluster_1bit.bin layout");
     }
 #else
-    throw std::runtime_error("v3 requires GPU_MVR_USE_LUT");
+    {
+        int max_embs_per_query = ws_.max_embs_per_query_bound;
+        int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
+        dim3 grid(blocks_x, Q_DOCLEN);
+
+        stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_queries, d_clustered_code_, d_clustered_factor_, ws_.d_cb1_sumq,
+            ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
+            max_embs_per_query
+        );
+    }
 #endif
     CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
@@ -1026,7 +1040,25 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     }
 #endif
 #ifndef GPU_MVR_USE_LUT
-    throw std::runtime_error("v3 requires GPU_MVR_USE_LUT");
+    {
+        int max_embs_per_query = ws_.max_embs_per_query_bound;
+        int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
+        dim3 grid(blocks_x, Q_DOCLEN);
+        aggregate_stage1_tracked_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_emb_ids,
+            ws_.d_emb_dists,
+            ws_.d_pair_offsets,
+            d_clustered_doc_ids_,
+            ws_.d_doc_query_max,
+            ws_.d_doc_touched,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+            num_docs,
+            ws_.max_stage1_pairs,
+            max_embs_per_query
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
 #endif
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -1337,7 +1369,15 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
                 );
             }
 #else
-            throw std::runtime_error("v3 requires GPU_MVR_USE_LUT");
+            {
+                stage2_binary_ip_kernel_v2<<<bip_blocks, 256, 0, stream>>>(
+                    ws_.d_queries, d_clustered_code_, d_clustered_factor_,
+                    ws_.d_cb1_sumq,
+                    ws_.d_pst_clustered_pos + tok_start,
+                    ws_.d_token_dists + tok_start,
+                    total_tokens, tok_count
+                );
+            }
 #endif
 #ifdef GPU_MVR_PROFILE
             if constexpr (kProfile) {

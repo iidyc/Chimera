@@ -239,6 +239,27 @@ target_compile_definitions(gpu_search_v8 PRIVATE
 )
 target_link_libraries(gpu_search_v8 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
+add_executable(gpu_search_v8_nolut
+    cpp/app/gpu_search_v8.cu
+    cpp/cuda/src/gpu_index_v8.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v8.cu
+)
+target_include_directories(gpu_search_v8_nolut PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v8_nolut PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v8_nolut PRIVATE
+    GPU_MVR_IMPL_NAME=\"v8_nolut\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+)
+target_compile_options(gpu_search_v8_nolut PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-UGPU_MVR_USE_LUT>
+    $<$<COMPILE_LANGUAGE:CUDA>:-UGPU_MVR_USE_LUT>
+)
+target_link_libraries(gpu_search_v8_nolut PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
 function(add_gpu_search_v4_nonclustered_target target_name impl_name)
     add_executable(${target_name}
         cpp/app/gpu_search_v4.cu
@@ -299,6 +320,31 @@ if(GPU_MVR_V6_GPU_INDICES_U32)
     )
 endif()
 target_link_libraries(gpu_search_v6 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
+add_executable(gpu_search_v6_nolut
+    cpp/app/gpu_search_v6.cu
+    cpp/cuda/src/gpu_index_v6.cu
+    cpp/cuda/src/gpu_kernels_v6.cu
+)
+target_include_directories(gpu_search_v6_nolut PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v6_nolut PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v6_nolut PRIVATE
+    GPU_MVR_IMPL_NAME=\"v6_nolut\"
+    GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
+)
+if(GPU_MVR_V6_GPU_INDICES_U32)
+    target_compile_definitions(gpu_search_v6_nolut PRIVATE
+        GPU_MVR_V6_GPU_INDICES_U32=1
+    )
+endif()
+target_compile_options(gpu_search_v6_nolut PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-UGPU_MVR_USE_LUT -UGPU_MVR_COMPACT_DOC_BUFFER>
+    $<$<COMPILE_LANGUAGE:CUDA>:-UGPU_MVR_USE_LUT -UGPU_MVR_COMPACT_DOC_BUFFER>
+)
+target_link_libraries(gpu_search_v6_nolut PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
 add_executable(gpu_search_v2
     cpp/app/gpu_search_v2.cu

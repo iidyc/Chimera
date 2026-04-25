@@ -1917,7 +1917,6 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
     }
 #endif
 #else
-#error "gpu_search_v6 requires GPU_MVR_USE_LUT"
     {
         int max_embs_per_query = ws_.max_embs_per_query_bound;
         int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
@@ -1928,6 +1927,48 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
             max_embs_per_query
         );
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
+        }
+
+        aggregate_stage1_tracked_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_emb_ids,
+            ws_.d_emb_dists,
+            ws_.d_pair_offsets,
+            d_doc_ids_,
+            ws_.d_doc_query_max,
+            ws_.d_doc_touched,
+            ws_.d_unique_doc_ids,
+            ws_.d_num_unique_docs,
+            num_docs,
+            ws_.max_stage1_pairs,
+            max_embs_per_query
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
+        }
+
+        if constexpr (kProfile) {
+            XFER_RECORD_BEGIN(stream);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(&h_num_touched, ws_.d_num_unique_docs,
+                                   sizeof(int), cudaMemcpyDeviceToHost, stream));
+        if constexpr (kProfile) {
+            XFER_RECORD_END(stream, sizeof(int), false);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        if (h_num_touched == 0) {
+            actual_k_out = 0;
+            return;
+        }
+
+        actual_k_out = std::min((int)k, h_num_touched);
     }
 #endif
     CUDA_CHECK(cudaGetLastError());

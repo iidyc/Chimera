@@ -3,7 +3,6 @@
 #include <cfloat>
 #include <cub/cub.cuh>
 
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
 // ---- Open-addressing hash table: doc_id → compact_slot ----
 // Keys array is initialised to -1 (empty). Vals array to -1 (not yet assigned).
 // Returns the compact_id assigned to doc_id (newly allocated or existing).
@@ -127,8 +126,6 @@ __device__ __forceinline__ int bitmap_compact_id(
     compact_id += __popc(prior_bits);
     return compact_id;
 }
-#endif
-
 // Atomic max for floats using compare-and-swap
 __device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
     int* address_as_int = (int*)address;
