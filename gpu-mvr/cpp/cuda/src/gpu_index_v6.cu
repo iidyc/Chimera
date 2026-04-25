@@ -818,6 +818,7 @@ void gpu_mvr_index::allocate_workspace() {
               << std::endl;
 #else
     const size_t doc_buf_rows = std::max<size_t>(ws_.max_stage1_touched_docs, 1);
+    const size_t doc_query_rows = std::max<size_t>(ws_.estimated_num_docs, 1);
     std::cout << "max cluster size: " << max_cluster_size << std::endl;
     std::cout << "workspace_probe_cluster_bound: "
               << workspace_probe_cluster_bound_ << std::endl;
@@ -857,7 +858,7 @@ void gpu_mvr_index::allocate_workspace() {
                             doc_buf_rows * sizeof(int) +  // d_sorted_doc_ids
                             doc_buf_rows * sizeof(int) +  // d_unique_doc_ids
                             doc_buf_rows * sizeof(float) +  // d_stage1_doc_scores
-                            doc_buf_rows * Q_DOCLEN * sizeof(float) +  // d_doc_query_max
+                            doc_query_rows * Q_DOCLEN * sizeof(float) +  // d_doc_query_max
                             sizeof(int) +  // d_num_unique_docs
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
                             ws_.doc_bitmap_bucket_count * sizeof(doc_bitmap_bucket_t) +
@@ -970,7 +971,7 @@ void gpu_mvr_index::allocate_workspace() {
     CUDA_CHECK(cudaMalloc(&ws_.d_sorted_doc_ids, doc_buf_rows * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws_.d_unique_doc_ids, doc_buf_rows * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws_.d_stage1_doc_scores, doc_buf_rows * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, doc_buf_rows * Q_DOCLEN * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, doc_query_rows * Q_DOCLEN * sizeof(float)));
     size_t topk_buf_size = std::max(doc_buf_rows, ws_.max_stage2_candidates);
     ws_.topk_buf_capacity = topk_buf_size;
     CUDA_CHECK(cudaMalloc(&ws_.d_topk_scores, topk_buf_size * sizeof(float)));
@@ -1483,6 +1484,11 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
                                ws_.doc_bitmap_offset_count * sizeof(doc_bitmap_offset_t),
                                ws_.stream_d2h));
 #else
+    CUDA_CHECK(cudaMemsetAsync(
+        ws_.d_doc_query_max,
+        0,
+        doc_matrix_size * sizeof(float),
+        ws_.stream_d2h));
     CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_touched, 0, ws_.estimated_num_docs * sizeof(int), ws_.stream_d2h));
 #endif
     CUDA_CHECK(cudaMemsetAsync(ws_.d_num_unique_docs, 0, sizeof(int), ws_.stream_d2h));
