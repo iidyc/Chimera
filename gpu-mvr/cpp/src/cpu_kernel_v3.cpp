@@ -450,28 +450,35 @@ class fixed_score_run_merge32 {
 };
 
 struct partitioned_cross_query_reduce_scratch {
-    std::vector<float> shared_doc_scores;
-    std::vector<uint8_t> shared_doc_seen;
+    std::vector<std::vector<float>> partition_doc_scores;
+    std::vector<std::vector<uint8_t>> partition_doc_seen;
     std::vector<std::vector<int>> partition_touched_doc_ids;
     std::vector<std::vector<doc_score_pair>> partition_topk;
     fixed_score_run_merge32 score_merge32;
 
     void ensure(size_t num_docs, size_t partition_count, size_t run_count)
     {
-        if (shared_doc_scores.size() < num_docs) {
-            shared_doc_scores.resize(num_docs);
-        }
-        if (shared_doc_seen.size() < num_docs) {
-            shared_doc_seen.resize(num_docs);
-        }
+        (void)num_docs;
         if (partition_touched_doc_ids.size() < partition_count) {
             partition_touched_doc_ids.resize(partition_count);
         }
         if (partition_topk.size() < partition_count) {
             partition_topk.resize(partition_count);
         }
+        if (partition_doc_scores.size() < partition_count) {
+            partition_doc_scores.resize(partition_count);
+        }
+        if (partition_doc_seen.size() < partition_count) {
+            partition_doc_seen.resize(partition_count);
+        }
         (void)run_count;
     }
+};
+
+struct fast_cross_query_reduce_breakdown {
+    double serial_setup_ms = 0.0;
+    double partition_accumulate_work_ms = 0.0;
+    double partition_sort_work_ms = 0.0;
 };
 
 struct token_balanced_doc_buckets {
@@ -745,8 +752,15 @@ void reduce_query_runs_fast_partitioned(
     size_t k,
     partitioned_cross_query_reduce_scratch& scratch,
     std::vector<doc_score_pair>& final_scores,
-    bool& final_scores_already_sorted_topk)
+    bool& final_scores_already_sorted_topk,
+    fast_cross_query_reduce_breakdown* breakdown = nullptr)
 {
+    using fast_reduce_clock = std::chrono::steady_clock;
+    auto fast_reduce_ms_between = [](fast_reduce_clock::time_point begin, fast_reduce_clock::time_point end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+
+    const auto t_serial_setup_start = fast_reduce_clock::now();
     int min_doc_id = std::numeric_limits<int>::max();
     int max_doc_id = std::numeric_limits<int>::min();
     for (const auto& run : query_final_runs) {
@@ -780,23 +794,21 @@ void reduce_query_runs_fast_partitioned(
 
     scratch.ensure(num_docs, static_cast<size_t>(partition_count), query_final_runs.size());
 
-    std::memset(
-        scratch.shared_doc_scores.data() + min_doc_id,
-        0,
-        static_cast<size_t>(doc_id_range) * sizeof(float));
-    std::memset(
-        scratch.shared_doc_seen.data() + min_doc_id,
-        0,
-        static_cast<size_t>(doc_id_range) * sizeof(uint8_t));
+    const auto t_serial_setup_done = fast_reduce_clock::now();
+    double partition_accumulate_work_ms = 0.0;
+    double partition_sort_work_ms = 0.0;
 
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) reduction(+ : partition_accumulate_work_ms, partition_sort_work_ms)
     for (int partition_idx = 0; partition_idx < partition_count; ++partition_idx) {
+        const auto t_partition_accumulate_start = fast_reduce_clock::now();
         const int partition_begin = static_cast<int>(
             static_cast<int64_t>(min_doc_id) +
             (doc_id_range * partition_idx) / partition_count);
         const int partition_end = static_cast<int>(
             static_cast<int64_t>(min_doc_id) +
             (doc_id_range * (partition_idx + 1)) / partition_count);
+        const size_t partition_width =
+            static_cast<size_t>(partition_end - partition_begin);
 
         auto& touched_doc_ids =
             scratch.partition_touched_doc_ids[static_cast<size_t>(partition_idx)];
@@ -804,6 +816,16 @@ void reduce_query_runs_fast_partitioned(
         if (touched_doc_ids.capacity() < local_touch_reserve) {
             touched_doc_ids.reserve(local_touch_reserve);
         }
+        auto& local_scores = scratch.partition_doc_scores[static_cast<size_t>(partition_idx)];
+        auto& local_seen = scratch.partition_doc_seen[static_cast<size_t>(partition_idx)];
+        if (local_scores.size() < partition_width) {
+            local_scores.resize(partition_width);
+        }
+        if (local_seen.size() < partition_width) {
+            local_seen.resize(partition_width);
+        }
+        std::memset(local_scores.data(), 0, partition_width * sizeof(float));
+        std::memset(local_seen.data(), 0, partition_width * sizeof(uint8_t));
 
         for (const auto& run : query_final_runs) {
             if (run.empty()) {
@@ -833,23 +855,27 @@ void reduce_query_runs_fast_partitioned(
             }
 
             for (auto it = lower; it != upper; ++it) {
-                const size_t score_idx = static_cast<size_t>(it->doc_id);
-                if (!scratch.shared_doc_seen[score_idx]) {
-                    scratch.shared_doc_seen[score_idx] = 1;
+                const size_t local_idx = static_cast<size_t>(it->doc_id - partition_begin);
+                if (!local_seen[local_idx]) {
+                    local_seen[local_idx] = 1;
                     touched_doc_ids.push_back(it->doc_id);
                 }
-                scratch.shared_doc_scores[score_idx] += it->score;
+                local_scores[local_idx] += it->score;
             }
         }
+        const auto t_partition_accumulate_done = fast_reduce_clock::now();
 
         const size_t local_topk_count = std::min(k, touched_doc_ids.size());
-        const float* shared_doc_scores = scratch.shared_doc_scores.data();
-        auto topk_order = [shared_doc_scores](int a, int b) {
-            const float score_a = shared_doc_scores[static_cast<size_t>(a)];
-            const float score_b = shared_doc_scores[static_cast<size_t>(b)];
+        const float* local_scores_ptr = local_scores.data();
+        auto topk_order = [local_scores_ptr, partition_begin](int a, int b) {
+            const float score_a =
+                local_scores_ptr[static_cast<size_t>(a - partition_begin)];
+            const float score_b =
+                local_scores_ptr[static_cast<size_t>(b - partition_begin)];
             if (score_a != score_b) return score_a > score_b;
             return a < b;
         };
+        const auto t_partition_sort_start = fast_reduce_clock::now();
         if (local_topk_count < touched_doc_ids.size()) {
             std::partial_sort(
                 touched_doc_ids.begin(),
@@ -859,6 +885,10 @@ void reduce_query_runs_fast_partitioned(
         } else {
             std::sort(touched_doc_ids.begin(), touched_doc_ids.end(), topk_order);
         }
+        const auto t_partition_sort_done = fast_reduce_clock::now();
+        partition_accumulate_work_ms +=
+            fast_reduce_ms_between(t_partition_accumulate_start, t_partition_accumulate_done);
+        partition_sort_work_ms += fast_reduce_ms_between(t_partition_sort_start, t_partition_sort_done);
 
         auto& local_topk = scratch.partition_topk[static_cast<size_t>(partition_idx)];
         local_topk.clear();
@@ -869,7 +899,7 @@ void reduce_query_runs_fast_partitioned(
             const int doc_id = touched_doc_ids[local_idx];
             local_topk.push_back({
                 doc_id,
-                scratch.shared_doc_scores[static_cast<size_t>(doc_id)]
+                local_scores[static_cast<size_t>(doc_id - partition_begin)]
             });
         }
     }
@@ -881,6 +911,12 @@ void reduce_query_runs_fast_partitioned(
     }
     scratch.score_merge32.merge_topk(final_scores, k);
     final_scores_already_sorted_topk = true;
+
+    if (breakdown != nullptr) {
+        breakdown->serial_setup_ms = fast_reduce_ms_between(t_serial_setup_start, t_serial_setup_done);
+        breakdown->partition_accumulate_work_ms = partition_accumulate_work_ms;
+        breakdown->partition_sort_work_ms = partition_sort_work_ms;
+    }
 }
 
 class token_doc_max_table_fast {
@@ -2091,6 +2127,7 @@ void rank_cluster_dists(
             const auto t_reduce_merge_start = steady_clock::now();
             std::vector<doc_score_pair> final_scores;
             bool final_scores_already_sorted_topk = false;
+            fast_cross_query_reduce_breakdown fast_reduce_breakdown {};
             if (!query_final_runs.empty()) {
                 size_t total_finalized_pairs = 0;
                 for (const auto& run : query_final_runs) {
@@ -2105,7 +2142,8 @@ void rank_cluster_dists(
                         k,
                         fast_reduce_scratch,
                         final_scores,
-                        final_scores_already_sorted_topk);
+                        final_scores_already_sorted_topk,
+                        &fast_reduce_breakdown);
                 } else {
                     std::vector<doc_score_pair> work_arena_a;
                     work_arena_a.reserve(total_finalized_pairs);
@@ -2190,6 +2228,11 @@ void rank_cluster_dists(
                 profile->stage1_reduce_cross_query_merge_ms =
                     profile->stage1_reduce_merge_ms;
                 profile->stage1_reduce_sort_ms = ms_between(t_reduce_merge_done, t_reduce_sort_done);
+                profile->stage1_reduce_serial_setup_ms = fast_reduce_breakdown.serial_setup_ms;
+                profile->stage1_reduce_partition_accumulate_work_ms =
+                    fast_reduce_breakdown.partition_accumulate_work_ms;
+                profile->stage1_reduce_partition_sort_work_ms =
+                    fast_reduce_breakdown.partition_sort_work_ms;
             }
         } else if constexpr (kStage1DocAccumMode == stage1_doc_accum_mode::sorted_doc_merge_hybrid) {
             std::vector<token_doc_max_table_parallel> query_doc_max(q_doclen);
@@ -2233,6 +2276,7 @@ void rank_cluster_dists(
             const auto t_reduce_merge_start = steady_clock::now();
             std::vector<doc_score_pair> final_scores;
             bool final_scores_already_sorted_topk = false;
+            fast_cross_query_reduce_breakdown fast_reduce_breakdown {};
             const size_t hybrid_parallel_threshold =
                 static_cast<size_t>(std::max(1, omp_get_max_threads())) * 4;
             const bool use_parallel_reduce = nprobe < hybrid_parallel_threshold;
@@ -2300,7 +2344,8 @@ void rank_cluster_dists(
                         k,
                         fast_reduce_scratch,
                         final_scores,
-                        final_scores_already_sorted_topk);
+                        final_scores_already_sorted_topk,
+                        &fast_reduce_breakdown);
                 } else {
                     std::vector<doc_score_pair> work_arena_a;
                     work_arena_a.reserve(total_finalized_pairs);
@@ -2385,6 +2430,11 @@ void rank_cluster_dists(
                 profile->stage1_reduce_cross_query_merge_ms =
                     profile->stage1_reduce_merge_ms;
                 profile->stage1_reduce_sort_ms = ms_between(t_reduce_merge_done, t_reduce_sort_done);
+                profile->stage1_reduce_serial_setup_ms = fast_reduce_breakdown.serial_setup_ms;
+                profile->stage1_reduce_partition_accumulate_work_ms =
+                    fast_reduce_breakdown.partition_accumulate_work_ms;
+                profile->stage1_reduce_partition_sort_work_ms =
+                    fast_reduce_breakdown.partition_sort_work_ms;
             }
         } else if constexpr (kStage1DocAccumMode == stage1_doc_accum_mode::sorted_doc_merge_parallel) {
             std::vector<token_doc_max_table_parallel> query_doc_max(q_doclen);

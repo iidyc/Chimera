@@ -308,6 +308,11 @@ void accumulate_search_profile(search_profile& accum, const search_profile& samp
     accum.stage1_reduce_within_query_merge_ms += sample.stage1_reduce_within_query_merge_ms;
     accum.stage1_reduce_cross_query_merge_ms += sample.stage1_reduce_cross_query_merge_ms;
     accum.stage1_reduce_sort_ms += sample.stage1_reduce_sort_ms;
+    accum.stage1_reduce_serial_setup_ms += sample.stage1_reduce_serial_setup_ms;
+    accum.stage1_reduce_partition_accumulate_work_ms +=
+        sample.stage1_reduce_partition_accumulate_work_ms;
+    accum.stage1_reduce_partition_sort_work_ms +=
+        sample.stage1_reduce_partition_sort_work_ms;
     accum.stage1_cleanup_ms += sample.stage1_cleanup_ms;
     accum.stage2_1bit_ms += sample.stage2_1bit_ms;
     accum.stage2_lut_ms += sample.stage2_lut_ms;
@@ -340,6 +345,9 @@ search_profile average_search_profile(const search_profile& total, size_t count)
     average.stage1_reduce_within_query_merge_ms /= denom;
     average.stage1_reduce_cross_query_merge_ms /= denom;
     average.stage1_reduce_sort_ms /= denom;
+    average.stage1_reduce_serial_setup_ms /= denom;
+    average.stage1_reduce_partition_accumulate_work_ms /= denom;
+    average.stage1_reduce_partition_sort_work_ms /= denom;
     average.stage1_cleanup_ms /= denom;
     average.stage2_1bit_ms /= denom;
     average.stage2_lut_ms /= denom;
@@ -407,6 +415,9 @@ void print_search_profile_summary(const search_profile& total, size_t count)
         << " reduce_within_query_merge_component_ms=" << avg.stage1_reduce_within_query_merge_ms
         << " reduce_cross_query_merge_component_ms=" << avg.stage1_reduce_cross_query_merge_ms
         << " reduce_sort_component_ms=" << avg.stage1_reduce_sort_ms
+        << " reduce_serial_setup_component_ms=" << avg.stage1_reduce_serial_setup_ms
+        << " reduce_partition_accumulate_work_ms=" << avg.stage1_reduce_partition_accumulate_work_ms
+        << " reduce_partition_sort_work_ms=" << avg.stage1_reduce_partition_sort_work_ms
         << " cleanup_ms=" << avg.stage1_cleanup_ms
         << std::endl;
     std::cout
