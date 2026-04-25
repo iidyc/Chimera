@@ -816,6 +816,7 @@ void gpu_mvr_index::allocate_workspace() {
     std::cout << "bitmap buckets: " << ws_.doc_bitmap_bucket_count
               << " bitmap offsets: " << ws_.doc_bitmap_offset_count
               << std::endl;
+    const size_t doc_query_rows = doc_buf_rows;
 #else
     const size_t doc_buf_rows = std::max<size_t>(ws_.max_stage1_touched_docs, 1);
     const size_t doc_query_rows = std::max<size_t>(ws_.estimated_num_docs, 1);
