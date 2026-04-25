@@ -1183,14 +1183,36 @@ std::vector<size_t> gpu_mvr_index::search(const float* queries, size_t k) {
 }
 
 std::vector<size_t> gpu_mvr_index::search_profiled(const float* queries, size_t k) {
-    return search_impl<true>(queries, k);
+    return search_impl<true>(queries, k, nullptr, true);
+}
+
+std::vector<size_t> gpu_mvr_index::search_profiled(
+    const float* queries,
+    size_t k,
+    gpu_search_profile_v6* profile,
+    bool print_profile) {
+    return search_impl<true>(queries, k, profile, print_profile);
 }
 
 template <bool kProfile>
-std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
+std::vector<size_t> gpu_mvr_index::search_impl(
+    const float* queries,
+    size_t k,
+    gpu_search_profile_v6* profile,
+    bool print_profile) {
     auto search_start = std::chrono::high_resolution_clock::now();
+    gpu_search_profile_v6 local_profile;
+    gpu_search_profile_v6* profile_ptr = profile;
+    if constexpr (kProfile) {
+        if (profile_ptr == nullptr && print_profile) {
+            profile_ptr = &local_profile;
+        }
+    }
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
+        if (profile_ptr != nullptr) {
+            *profile_ptr = gpu_search_profile_v6{};
+        }
         ws_.xfer_count = 0;
         CUDA_CHECK(cudaEventRecord(ws_.event_start, ws_.stream_compute));
     }
@@ -1248,7 +1270,14 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
     std::vector<size_t> result;
 
 #ifdef GPU_MVR_OVERLAP_STAGE23
-    rank_stage23_persistent_impl<kProfile>(actual_k_stage1, k, k_rank_all_tokens, query_objs.data(), result);
+    rank_stage23_persistent_impl<kProfile>(
+        actual_k_stage1,
+        k,
+        k_rank_all_tokens,
+        query_objs.data(),
+        result,
+        profile_ptr,
+        false);
 
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -1268,23 +1297,7 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
         CUDA_CHECK(cudaEventElapsedTime(&s1_sum_scores, ws_.s1_sum_scores_start, ws_.s1_sum_scores_end));
         CUDA_CHECK(cudaEventElapsedTime(&s1_topk_sort, ws_.s1_topk_sort_start, ws_.s1_topk_sort_end));
         CUDA_CHECK(cudaEventElapsedTime(&s1_d2d, ws_.s1_d2d_start, ws_.s1_d2d_end));
-
-        std::cout << "[PROFILE] Mode: Persistent Stage 2+3 (streaming top-k + system fence)\n";
-        std::cout << "[PROFILE] Stage 1 time: " << stage1_time << " ms\n";
-        std::cout << "[PROFILE]   1. CAGRA search            : " << s1_cagra << " ms\n";
-        std::cout << "[PROFILE]   2. GPU IVF expansion       : " << s1_expansion << " ms\n";
-        std::cout << "[PROFILE]   3. Binary IP kernel        : " << s1_binary_ip << " ms\n";
-        std::cout << "[PROFILE]   4. Aggregation + tracking  : " << s1_atomic_agg << " ms\n";
-        std::cout << "[PROFILE]   5. Sum doc scores (sparse) : " << s1_sum_scores << " ms\n";
-        std::cout << "[PROFILE]   6. Top-k sort (sparse)     : " << s1_topk_sort << " ms\n";
-        std::cout << "[PROFILE]   7. D2D copy top-k doc IDs  : " << s1_d2d << " ms\n";
-        std::cout << "[PROFILE]   8. Memset (overlapped 1-3) : " << s1_memset << " ms (not in critical path)\n";
         float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
-        std::cout << "[PROFILE]   Sum accounted              : " << s1_sum << " ms\n";
-        std::cout << "[PROFILE] Phase B binary_ip total     : " << ws_.s23_pst_bip_ms << " ms\n";
-        std::cout << "[PROFILE] Phase B doc_score total     : " << ws_.s23_pst_docscore_ms << " ms\n";
-        std::cout << "[PROFILE] Phase B total kernel time   : " << ws_.s23_pst_kernel_ms << " ms\n";
-        std::cout << "[PROFILE] Total search time           : " << total_time << " ms\n";
 
         float total_h2d_ms = 0, total_d2h_ms = 0;
         size_t total_h2d_bytes = 0, total_d2h_bytes = 0;
@@ -1299,14 +1312,31 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
                 total_d2h_bytes += ws_.xfer_records[i].bytes;
             }
         }
-        std::cout << "[PROFILE] Data transfer summary (" << ws_.xfer_count << " transfers):\n";
-        std::cout << "[PROFILE]   H2D: " << total_h2d_ms << " ms, "
-                  << total_h2d_bytes << " bytes (" << (total_h2d_bytes / 1024.0) << " KB)\n";
-        std::cout << "[PROFILE]   D2H: " << total_d2h_ms << " ms, "
-                  << total_d2h_bytes << " bytes (" << (total_d2h_bytes / 1024.0) << " KB)\n";
-        std::cout << "[PROFILE]   Total transfer: " << (total_h2d_ms + total_d2h_ms) << " ms, "
-                  << (total_h2d_bytes + total_d2h_bytes) << " bytes ("
-                  << ((total_h2d_bytes + total_d2h_bytes) / 1024.0) << " KB)\n";
+
+        if (profile_ptr != nullptr) {
+            profile_ptr->persistent_stage23 = true;
+            profile_ptr->total_search_time_ms = total_time;
+            profile_ptr->stage1_time_ms = stage1_time;
+            profile_ptr->s1_cagra_ms = s1_cagra;
+            profile_ptr->s1_expansion_ms = s1_expansion;
+            profile_ptr->s1_binary_ip_ms = s1_binary_ip;
+            profile_ptr->s1_atomic_agg_ms = s1_atomic_agg;
+            profile_ptr->s1_sum_scores_ms = s1_sum_scores;
+            profile_ptr->s1_topk_sort_ms = s1_topk_sort;
+            profile_ptr->s1_d2d_ms = s1_d2d;
+            profile_ptr->s1_memset_ms = s1_memset;
+            profile_ptr->s1_sum_accounted_ms = s1_sum;
+            profile_ptr->phase_b_binary_ip_total_ms = ws_.s23_pst_bip_ms;
+            profile_ptr->phase_b_doc_score_total_ms = ws_.s23_pst_docscore_ms;
+            profile_ptr->phase_b_total_kernel_ms = ws_.s23_pst_kernel_ms;
+            profile_ptr->total_h2d_ms = total_h2d_ms;
+            profile_ptr->total_d2h_ms = total_d2h_ms;
+            profile_ptr->total_transfer_ms = total_h2d_ms + total_d2h_ms;
+            profile_ptr->total_h2d_bytes = static_cast<double>(total_h2d_bytes);
+            profile_ptr->total_d2h_bytes = static_cast<double>(total_d2h_bytes);
+            profile_ptr->total_transfer_bytes =
+                static_cast<double>(total_h2d_bytes + total_d2h_bytes);
+        }
     }
 #endif
 
@@ -1355,23 +1385,7 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
         CUDA_CHECK(cudaEventElapsedTime(&s1_sum_scores, ws_.s1_sum_scores_start, ws_.s1_sum_scores_end));
         CUDA_CHECK(cudaEventElapsedTime(&s1_topk_sort, ws_.s1_topk_sort_start, ws_.s1_topk_sort_end));
         CUDA_CHECK(cudaEventElapsedTime(&s1_d2d, ws_.s1_d2d_start, ws_.s1_d2d_end));
-
-        std::cout << "[PROFILE] Mode: Non-overlapping Stage 2 then 3\n";
-        std::cout << "[PROFILE] Total GPU time: " << total_time << " ms\n";
-        std::cout << "[PROFILE] Stage 1 time: " << stage1_time << " ms\n";
-        std::cout << "[PROFILE]   1. CAGRA search            : " << s1_cagra << " ms\n";
-        std::cout << "[PROFILE]   2. GPU IVF expansion       : " << s1_expansion << " ms\n";
-        std::cout << "[PROFILE]   3. Binary IP kernel        : " << s1_binary_ip << " ms\n";
-        std::cout << "[PROFILE]   4. Aggregation + tracking  : " << s1_atomic_agg << " ms\n";
-        std::cout << "[PROFILE]   5. Sum doc scores (sparse) : " << s1_sum_scores << " ms\n";
-        std::cout << "[PROFILE]   6. Top-k sort (sparse)     : " << s1_topk_sort << " ms\n";
-        std::cout << "[PROFILE]   7. D2D copy top-k doc IDs  : " << s1_d2d << " ms\n";
-        std::cout << "[PROFILE]   8. Memset (overlapped 1-3) : " << s1_memset << " ms (not in critical path)\n";
         float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
-        std::cout << "[PROFILE]   Sum accounted              : " << s1_sum << " ms\n";
-        std::cout << "[PROFILE] Stage 2 time: " << stage2_time << " ms\n";
-        std::cout << "[PROFILE] Stage 3 time: " << stage3_time_ms << " ms"
-                  << " (" << stage2_doc_ids.size() << " docs)\n";
 
         float total_h2d_ms = 0, total_d2h_ms = 0;
         size_t total_h2d_bytes = 0, total_d2h_bytes = 0;
@@ -1386,14 +1400,31 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
                 total_d2h_bytes += ws_.xfer_records[i].bytes;
             }
         }
-        std::cout << "[PROFILE] Data transfer summary (" << ws_.xfer_count << " transfers):\n";
-        std::cout << "[PROFILE]   H2D: " << total_h2d_ms << " ms, "
-                  << total_h2d_bytes << " bytes (" << (total_h2d_bytes / 1024.0) << " KB)\n";
-        std::cout << "[PROFILE]   D2H: " << total_d2h_ms << " ms, "
-                  << total_d2h_bytes << " bytes (" << (total_d2h_bytes / 1024.0) << " KB)\n";
-        std::cout << "[PROFILE]   Total transfer: " << (total_h2d_ms + total_d2h_ms) << " ms, "
-                  << (total_h2d_bytes + total_d2h_bytes) << " bytes ("
-                  << ((total_h2d_bytes + total_d2h_bytes) / 1024.0) << " KB)\n";
+
+        if (profile_ptr != nullptr) {
+            profile_ptr->persistent_stage23 = false;
+            profile_ptr->total_search_time_ms = total_time;
+            profile_ptr->stage1_time_ms = stage1_time;
+            profile_ptr->s1_cagra_ms = s1_cagra;
+            profile_ptr->s1_expansion_ms = s1_expansion;
+            profile_ptr->s1_binary_ip_ms = s1_binary_ip;
+            profile_ptr->s1_atomic_agg_ms = s1_atomic_agg;
+            profile_ptr->s1_sum_scores_ms = s1_sum_scores;
+            profile_ptr->s1_topk_sort_ms = s1_topk_sort;
+            profile_ptr->s1_d2d_ms = s1_d2d;
+            profile_ptr->s1_memset_ms = s1_memset;
+            profile_ptr->s1_sum_accounted_ms = s1_sum;
+            profile_ptr->stage2_time_ms = stage2_time;
+            profile_ptr->stage3_time_ms = stage3_time_ms;
+            profile_ptr->stage3_docs = static_cast<double>(stage2_doc_ids.size());
+            profile_ptr->total_h2d_ms = total_h2d_ms;
+            profile_ptr->total_d2h_ms = total_d2h_ms;
+            profile_ptr->total_transfer_ms = total_h2d_ms + total_d2h_ms;
+            profile_ptr->total_h2d_bytes = static_cast<double>(total_h2d_bytes);
+            profile_ptr->total_d2h_bytes = static_cast<double>(total_d2h_bytes);
+            profile_ptr->total_transfer_bytes =
+                static_cast<double>(total_h2d_bytes + total_d2h_bytes);
+        }
     }
 #endif
 
@@ -1402,7 +1433,15 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
     auto search_end = std::chrono::high_resolution_clock::now();
     if constexpr (kProfile) {
         float search_wall_ms = std::chrono::duration<float, std::milli>(search_end - search_start).count();
-        std::cout << "[SEARCH] Total wall-clock time: " << search_wall_ms << " ms\n";
+        if (profile_ptr != nullptr) {
+            profile_ptr->search_wall_ms = search_wall_ms;
+        }
+        if (print_profile) {
+            gpu_search_profile_v6 profile_to_print =
+                (profile_ptr != nullptr) ? *profile_ptr : gpu_search_profile_v6{};
+            profile_to_print.search_wall_ms = search_wall_ms;
+            print_gpu_search_profile_v6(profile_to_print, "[PROFILE]");
+        }
     }
 
     return result;
@@ -1955,7 +1994,8 @@ void gpu_mvr_index::rank_stage23_persistent(
     query_object* queries,
     std::vector<size_t>& result
 ) {
-    rank_stage23_persistent_impl<false>(num_candidates, k, k_stage2, queries, result);
+    rank_stage23_persistent_impl<false>(
+        num_candidates, k, k_stage2, queries, result, nullptr, true);
 }
 
 template <bool kProfile>
@@ -1964,8 +2004,11 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     size_t k,
     size_t k_stage2,
     query_object* queries,
-    std::vector<size_t>& result
+    std::vector<size_t>& result,
+    gpu_search_profile_v6* profile,
+    bool print_profile
 ) {
+    (void)print_profile;
     if (num_candidates == 0) return;
 
     auto cpu_ms = [](auto a, auto b) { return std::chrono::duration<float, std::milli>(b - a).count(); };
@@ -2400,6 +2443,37 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
             CUDA_CHECK(cudaEventElapsedTime(&chunk_docscore_ms, chunk_docscore_start[c], chunk_docscore_end[c]));
             ws_.s23_pst_docscore_ms += chunk_docscore_ms;
         }
+        if (profile != nullptr) {
+            profile->persistent_stage23 = true;
+            profile->phase_a_wall_ms = time_phase_a;
+            profile->phase_a_gpu_total_ms = time_phase_a_gpu;
+            profile->phase_a_gather_ms = time_phase_a_gather;
+            profile->phase_a_prefix_ms = time_phase_a_prefix;
+            profile->phase_a_token_ids_ms = time_phase_a_token_ids;
+            profile->phase_a_d2h_ms = time_phase_a_d2h;
+            profile->phase_a_cpu_launch_gather_ms = cpu_ms(t_cpu0, t_cpu1);
+            profile->phase_a_cpu_launch_prefix_ms = cpu_ms(t_cpu1, t_cpu2);
+            profile->phase_a_cpu_launch_token_ids_ms = cpu_ms(t_cpu2, t_cpu3);
+            profile->phase_a_cpu_launch_d2h_ms = cpu_ms(t_cpu3, t_cpu4);
+            profile->phase_a_cpu_sync_ms = cpu_ms(t_cpu4, t_cpu5);
+            profile->phase_a_cpu_event_elapsed_ms = cpu_ms(t_cpu5, t_cpu6);
+            profile->phase_a_gpu_sum_accounted_ms =
+                time_phase_a_gather + time_phase_a_prefix + time_phase_a_token_ids + time_phase_a_d2h;
+            profile->phase_b_wall_ms = time_phase_b;
+            profile->phase_c_wait_d2h_ms = time_wait_d2h;
+            profile->phase_c_topk_ms = time_running_topk;
+            profile->phase_c_identify_ms = time_identify_new;
+            profile->phase_c_gpu_extract_ms = time_gpu_extract;
+            profile->phase_c_cpu_ip_ex_ms = time_cpu_ip_ex;
+            profile->phase_c_wait_extract_ms = time_wait_extract;
+            profile->phase_c_combine_ms = time_combine;
+            profile->phase_c_total_ms = time_phase_c;
+            profile->phase_c_refined_docs = total_refined;
+            profile->phase_abc_total_wall_ms = total_wall_time;
+            profile->phase_b_binary_ip_total_ms = ws_.s23_pst_bip_ms;
+            profile->phase_b_doc_score_total_ms = ws_.s23_pst_docscore_ms;
+            profile->phase_b_total_kernel_ms = ws_.s23_pst_kernel_ms;
+        }
     }
 #endif
 
@@ -2511,24 +2585,6 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
-        std::cout << "[PROFILE] Phase A (Data Preparation) wall: " << time_phase_a << " ms, GPU total: " << time_phase_a_gpu << " ms\n";
-        std::cout << "[PROFILE]   1. Gather doc lengths      : " << time_phase_a_gather << " ms (CPU launch: " << cpu_ms(t_cpu0, t_cpu1) << " ms)\n";
-        std::cout << "[PROFILE]   2. Prefix sum offsets      : " << time_phase_a_prefix << " ms (CPU launch: " << cpu_ms(t_cpu1, t_cpu2) << " ms)\n";
-        std::cout << "[PROFILE]   3. Gather token IDs        : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
-        std::cout << "[PROFILE]   4. D2H metadata + sync     : " << time_phase_a_d2h << " ms (CPU launch: " << cpu_ms(t_cpu3, t_cpu4) << " ms)\n";
-        std::cout << "[PROFILE]   5. cudaStreamSynchronize   : " << cpu_ms(t_cpu4, t_cpu5) << " ms\n";
-        std::cout << "[PROFILE]   6. cudaEventElapsedTime x5 : " << cpu_ms(t_cpu5, t_cpu6) << " ms\n";
-        std::cout << "[PROFILE]   GPU sum accounted           : "
-                  << (time_phase_a_gather + time_phase_a_prefix + time_phase_a_token_ids + time_phase_a_d2h)
-                  << " ms\n";
-        std::cout << "[PROFILE] Phase B wall time: " << time_phase_b << " ms\n";
-        printf("[PROFILE] Phase C: wait_d2h=%.3f ms, topk=%.3f ms, identify=%.3f ms, "
-            "gpu_extract=%.3f ms, cpu_ip_ex=%.3f ms, wait_extract=%.3f ms, "
-            "combine=%.3f ms (total=%.3f ms, %d docs)\n",
-            time_wait_d2h, time_running_topk, time_identify_new,
-            time_gpu_extract, time_cpu_ip_ex, time_wait_extract,
-            time_combine, time_phase_c, total_refined);
-        std::cout << "[PROFILE] Total wall time for Phase A + B + C: " << total_wall_time << " ms\n";
         for (int c = 0; c < actual_chunks; c++) {
             CUDA_CHECK(cudaEventDestroy(chunk_bip_start[c]));
             CUDA_CHECK(cudaEventDestroy(chunk_bip_end[c]));

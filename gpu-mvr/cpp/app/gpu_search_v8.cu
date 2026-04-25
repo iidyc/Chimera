@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
 
         for (int i = 0; i < warmup_queries; ++i) {
             const float* query_ptr = &Q[i * Q_DOCLEN * d];
-            if (i + 1 == warmup_queries) {
+            if (!args.profile_eval_all_queries && i + 1 == warmup_queries) {
                 index.search_profiled(query_ptr, args.k);
             } else {
                 index.search(query_ptr, args.k);
@@ -82,9 +82,22 @@ int main(int argc, char** argv) {
         std::vector<std::vector<size_t>> results(run_queries);
         std::vector<double> query_latencies_ms;
         query_latencies_ms.reserve(run_queries);
+        gpu_search_profile_v8 total_profile{};
+        int profiled_queries = 0;
         for (int i = 0; i < run_queries; ++i) {
             const auto query_start = std::chrono::high_resolution_clock::now();
-            results[i] = index.search(&Q[i * Q_DOCLEN * d], args.k);
+            if (args.profile_eval_all_queries) {
+                gpu_search_profile_v8 query_profile{};
+                results[i] = index.search_profiled(
+                    &Q[i * Q_DOCLEN * d],
+                    args.k,
+                    &query_profile,
+                    false);
+                accumulate_gpu_search_profile_v8(total_profile, query_profile);
+                ++profiled_queries;
+            } else {
+                results[i] = index.search(&Q[i * Q_DOCLEN * d], args.k);
+            }
             const auto query_end = std::chrono::high_resolution_clock::now();
             query_latencies_ms.push_back(
                 std::chrono::duration<double, std::milli>(query_end - query_start).count());
@@ -98,6 +111,15 @@ int main(int argc, char** argv) {
             "label=" + runtime_config.label + " GPU search time for " +
             std::to_string(run_queries) + " queries.");
         print_query_latency_summary(query_latencies_ms, total_seconds);
+        if (args.profile_eval_all_queries && profiled_queries > 0) {
+            average_gpu_search_profile_v8(
+                total_profile,
+                static_cast<double>(profiled_queries));
+            std::cout
+                << "[PROFILE_AVG] Averaged over " << profiled_queries
+                << " eval queries for label=" << runtime_config.label << "\n";
+            print_gpu_search_profile_v8(total_profile, "[PROFILE_AVG]");
+        }
         compute_recall(eval_ground_truth, results, args.k);
     }
 

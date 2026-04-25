@@ -300,7 +300,8 @@ struct gpu_mvr_index {
         size_t k,
         size_t k_stage2,
         query_object* queries,
-        std::vector<size_t>& result);
+        std::vector<size_t>& result,
+        bool print_profile = true);
 
     void cpu_refine_scores(
         const int* h_candidate_doc_ids,

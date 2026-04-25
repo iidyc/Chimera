@@ -17,12 +17,36 @@ std::vector<size_t> gpu_mvr_index::search(const float* queries, size_t k) {
 }
 
 std::vector<size_t> gpu_mvr_index::search_profiled(const float* queries, size_t k) {
-    return search_impl<true>(queries, k);
+    return search_profiled(queries, k, nullptr, true);
+}
+
+std::vector<size_t> gpu_mvr_index::search_profiled(
+    const float* queries,
+    size_t k,
+    gpu_search_profile_v8* profile,
+    bool print_profile)
+{
+    return search_impl<true>(queries, k, profile, print_profile);
 }
 
 template <bool kProfile>
-std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
+std::vector<size_t> gpu_mvr_index::search_impl(
+    const float* queries,
+    size_t k,
+    gpu_search_profile_v8* profile,
+    bool print_profile)
+{
     auto search_start = std::chrono::high_resolution_clock::now();
+    gpu_search_profile_v8 local_profile;
+    gpu_search_profile_v8* profile_ptr = profile;
+    if constexpr (kProfile) {
+        if (profile_ptr == nullptr && print_profile) {
+            profile_ptr = &local_profile;
+        }
+        if (profile_ptr != nullptr) {
+            *profile_ptr = gpu_search_profile_v8{};
+        }
+    }
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
         ws_.xfer_count = 0;
@@ -92,14 +116,16 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
         k,
         k_rank_all_tokens,
         query_objs.data(),
-        result);
+        result,
+        print_profile);
 #else
     gpu_mvr_index_v8_base::rank_stage23_persistent_impl<kProfile>(
         actual_k_stage1,
         k,
         k_rank_all_tokens,
         query_objs.data(),
-        result);
+        result,
+        print_profile);
 #endif
 
 #ifdef GPU_MVR_PROFILE
@@ -107,6 +133,59 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
         CUDA_CHECK(cudaEventRecord(ws_.event_stage2_end, ws_.stream_compute));
         CUDA_CHECK(cudaEventRecord(ws_.event_end, ws_.stream_compute));
         CUDA_CHECK(cudaEventSynchronize(ws_.event_end));
+
+        float total_time, stage1_time;
+        float s1_cagra, s1_expansion, s1_binary_ip, s1_memset, s1_atomic_agg, s1_sum_scores, s1_topk_sort, s1_d2d;
+        CUDA_CHECK(cudaEventElapsedTime(&total_time, ws_.event_start, ws_.event_end));
+        CUDA_CHECK(cudaEventElapsedTime(&stage1_time, ws_.event_stage1_start, ws_.event_stage1_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_cagra, ws_.s1_cagra_start, ws_.s1_cagra_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_expansion, ws_.s1_expansion_start, ws_.s1_expansion_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_binary_ip, ws_.s1_binary_ip_start, ws_.s1_binary_ip_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_memset, ws_.s1_memset_start, ws_.s1_memset_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_atomic_agg, ws_.s1_atomic_agg_start, ws_.s1_atomic_agg_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_sum_scores, ws_.s1_sum_scores_start, ws_.s1_sum_scores_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_topk_sort, ws_.s1_topk_sort_start, ws_.s1_topk_sort_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_d2d, ws_.s1_d2d_start, ws_.s1_d2d_end));
+        float s1_sum = s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg + s1_sum_scores + s1_topk_sort + s1_d2d;
+
+        float total_h2d_ms = 0, total_d2h_ms = 0;
+        size_t total_h2d_bytes = 0, total_d2h_bytes = 0;
+        for (int i = 0; i < ws_.xfer_count; i++) {
+            float ms;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ws_.xfer_records[i].start, ws_.xfer_records[i].end));
+            if (ws_.xfer_records[i].is_h2d) {
+                total_h2d_ms += ms;
+                total_h2d_bytes += ws_.xfer_records[i].bytes;
+            } else {
+                total_d2h_ms += ms;
+                total_d2h_bytes += ws_.xfer_records[i].bytes;
+            }
+        }
+
+        if (profile_ptr != nullptr) {
+            profile_ptr->total_search_time_ms = total_time;
+            profile_ptr->stage1_time_ms = stage1_time;
+            profile_ptr->s1_cagra_ms = s1_cagra;
+            profile_ptr->s1_expansion_ms = s1_expansion;
+            profile_ptr->s1_binary_ip_ms = s1_binary_ip;
+            profile_ptr->s1_atomic_agg_ms = s1_atomic_agg;
+            profile_ptr->s1_sum_scores_ms = s1_sum_scores;
+            profile_ptr->s1_topk_sort_ms = s1_topk_sort;
+            profile_ptr->s1_d2d_ms = s1_d2d;
+            profile_ptr->s1_memset_ms = s1_memset;
+            profile_ptr->s1_sum_accounted_ms = s1_sum;
+            profile_ptr->stage23_time_ms = std::max(0.0f, total_time - stage1_time);
+            profile_ptr->phase_b_binary_ip_total_ms = ws_.s23_pst_bip_ms;
+            profile_ptr->phase_b_doc_score_total_ms = ws_.s23_pst_docscore_ms;
+            profile_ptr->phase_b_total_kernel_ms = ws_.s23_pst_kernel_ms;
+            profile_ptr->total_h2d_ms = total_h2d_ms;
+            profile_ptr->total_d2h_ms = total_d2h_ms;
+            profile_ptr->total_transfer_ms = total_h2d_ms + total_d2h_ms;
+            profile_ptr->total_h2d_bytes = static_cast<double>(total_h2d_bytes);
+            profile_ptr->total_d2h_bytes = static_cast<double>(total_d2h_bytes);
+            profile_ptr->total_transfer_bytes =
+                static_cast<double>(total_h2d_bytes + total_d2h_bytes);
+        }
     }
 #endif
 
@@ -114,7 +193,15 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
     if constexpr (kProfile) {
         const float search_wall_ms =
             std::chrono::duration<float, std::milli>(search_end - search_start).count();
-        std::cout << "[SEARCH] Total wall-clock time: " << search_wall_ms << " ms\n";
+        if (profile_ptr != nullptr) {
+            profile_ptr->search_wall_ms = search_wall_ms;
+        }
+        if (print_profile) {
+            gpu_search_profile_v8 profile_to_print =
+                (profile_ptr != nullptr) ? *profile_ptr : gpu_search_profile_v8{};
+            profile_to_print.search_wall_ms = search_wall_ms;
+            print_gpu_search_profile_v8(profile_to_print, "[PROFILE]");
+        }
     }
 
     return result;

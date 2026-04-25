@@ -1120,7 +1120,7 @@ void gpu_mvr_index::rank_stage23_persistent(
     query_object* queries,
     std::vector<size_t>& result
 ) {
-    rank_stage23_persistent_impl<false>(num_candidates, k, k_stage2, queries, result);
+    rank_stage23_persistent_impl<false>(num_candidates, k, k_stage2, queries, result, true);
 }
 
 template <bool kProfile>
@@ -1129,7 +1129,8 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     size_t k,
     size_t k_stage2,
     query_object* queries,
-    std::vector<size_t>& result
+    std::vector<size_t>& result,
+    bool print_profile
 ) {
     if (num_candidates == 0) return;
 
@@ -1649,24 +1650,26 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
-        std::cout << "[PROFILE] Phase A (Data Preparation) wall: " << time_phase_a << " ms, GPU total: " << time_phase_a_gpu << " ms\n";
-        std::cout << "[PROFILE]   1. Gather doc lengths      : " << time_phase_a_gather << " ms (CPU launch: " << cpu_ms(t_cpu0, t_cpu1) << " ms)\n";
-        std::cout << "[PROFILE]   2. Prefix sum offsets      : " << time_phase_a_prefix << " ms (CPU launch: " << cpu_ms(t_cpu1, t_cpu2) << " ms)\n";
-        std::cout << "[PROFILE]   3. Gather clustered pos    : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
-        std::cout << "[PROFILE]   4. D2H metadata + sync     : " << time_phase_a_d2h << " ms (CPU launch: " << cpu_ms(t_cpu3, t_cpu4) << " ms)\n";
-        std::cout << "[PROFILE]   5. cudaStreamSynchronize   : " << cpu_ms(t_cpu4, t_cpu5) << " ms\n";
-        std::cout << "[PROFILE]   6. cudaEventElapsedTime x5 : " << cpu_ms(t_cpu5, t_cpu6) << " ms\n";
-        std::cout << "[PROFILE]   GPU sum accounted           : "
-                  << (time_phase_a_gather + time_phase_a_prefix + time_phase_a_token_ids + time_phase_a_d2h)
-                  << " ms\n";
-        std::cout << "[PROFILE] Phase B wall time: " << time_phase_b << " ms\n";
-        printf("[PROFILE] Phase C: wait_d2h=%.3f ms, topk=%.3f ms, identify=%.3f ms, "
-            "prepare=%.3f ms, cpu_refine=%.3f ms, "
-            "combine=%.3f ms (total=%.3f ms, %d docs)\n",
-            time_wait_d2h, time_running_topk, time_identify_new,
-            time_prepare_refine, time_cpu_ip_ex,
-            time_combine, time_phase_c, total_refined);
-        std::cout << "[PROFILE] Total wall time for Phase A + B + C: " << total_wall_time << " ms\n";
+        if (print_profile) {
+            std::cout << "[PROFILE] Phase A (Data Preparation) wall: " << time_phase_a << " ms, GPU total: " << time_phase_a_gpu << " ms\n";
+            std::cout << "[PROFILE]   1. Gather doc lengths      : " << time_phase_a_gather << " ms (CPU launch: " << cpu_ms(t_cpu0, t_cpu1) << " ms)\n";
+            std::cout << "[PROFILE]   2. Prefix sum offsets      : " << time_phase_a_prefix << " ms (CPU launch: " << cpu_ms(t_cpu1, t_cpu2) << " ms)\n";
+            std::cout << "[PROFILE]   3. Gather clustered pos    : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
+            std::cout << "[PROFILE]   4. D2H metadata + sync     : " << time_phase_a_d2h << " ms (CPU launch: " << cpu_ms(t_cpu3, t_cpu4) << " ms)\n";
+            std::cout << "[PROFILE]   5. cudaStreamSynchronize   : " << cpu_ms(t_cpu4, t_cpu5) << " ms\n";
+            std::cout << "[PROFILE]   6. cudaEventElapsedTime x5 : " << cpu_ms(t_cpu5, t_cpu6) << " ms\n";
+            std::cout << "[PROFILE]   GPU sum accounted           : "
+                      << (time_phase_a_gather + time_phase_a_prefix + time_phase_a_token_ids + time_phase_a_d2h)
+                      << " ms\n";
+            std::cout << "[PROFILE] Phase B wall time: " << time_phase_b << " ms\n";
+            printf("[PROFILE] Phase C: wait_d2h=%.3f ms, topk=%.3f ms, identify=%.3f ms, "
+                "prepare=%.3f ms, cpu_refine=%.3f ms, "
+                "combine=%.3f ms (total=%.3f ms, %d docs)\n",
+                time_wait_d2h, time_running_topk, time_identify_new,
+                time_prepare_refine, time_cpu_ip_ex,
+                time_combine, time_phase_c, total_refined);
+            std::cout << "[PROFILE] Total wall time for Phase A + B + C: " << total_wall_time << " ms\n";
+        }
         for (int c = 0; c < actual_chunks; c++) {
             CUDA_CHECK(cudaEventDestroy(chunk_bip_start[c]));
             CUDA_CHECK(cudaEventDestroy(chunk_bip_end[c]));
