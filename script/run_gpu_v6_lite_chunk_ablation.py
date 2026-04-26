@@ -41,10 +41,10 @@ OPERATING_POINTS = {
             "itopk_size": 128,
         },
         "msmarco": {
-            "label": "b2",
-            "nprobe": 48,
-            "k_rank_cluster": 1500,
-            "k_rank_all_tokens": 150,
+            "label": "b4",
+            "nprobe": 64,
+            "k_rank_cluster": 1800,
+            "k_rank_all_tokens": 180,
             "itopk_size": 96,
         },
         "hotpot": {
@@ -64,11 +64,11 @@ OPERATING_POINTS = {
             "itopk_size": 224,
         },
         "msmarco": {
-            "label": "c3",
-            "nprobe": 96,
-            "k_rank_cluster": 2400,
-            "k_rank_all_tokens": 250,
-            "itopk_size": 128,
+            "label": "d1",
+            "nprobe": 128,
+            "k_rank_cluster": 3000,
+            "k_rank_all_tokens": 300,
+            "itopk_size": 150,
         },
         "hotpot": {
             "label": "k1",
@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=repo_root / "profiling" / "gpu_v6_lite_chunk_ablation")
     parser.add_argument("--k", type=int, default=100)
-    parser.add_argument("--nq", type=int, default=0, help="Queries to evaluate. 0 means all queries.")
+    parser.add_argument("--nq", type=int, default=-1, help="Queries to evaluate. -1 means all queries.")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--profile", action="store_true", help="Also run profile-eval-all-queries logs.")
     parser.add_argument("--reuse-existing", action="store_true")
@@ -232,9 +232,10 @@ def command_for(
         "--k-rank-all-tokens", str(point["k_rank_all_tokens"]),
         "--itopk-size", str(point["itopk_size"]),
         "--overlap-chunks", str(chunk),
-        "--nq", str(args.nq),
         "--warmup", str(args.warmup),
     ]
+    if args.nq >= 0:
+        cmd.extend(["--nq", str(args.nq)])
     if profile:
         cmd.append("--profile-eval-all-queries")
     return cmd

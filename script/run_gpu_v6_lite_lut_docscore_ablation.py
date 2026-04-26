@@ -46,10 +46,10 @@ OPERATING_POINTS = {
             "overlap_chunks": DEFAULT_OVERLAP_CHUNKS,
         },
         "msmarco": {
-            "label": "b2",
-            "nprobe": 48,
-            "k_rank_cluster": 1500,
-            "k_rank_all_tokens": 150,
+            "label": "b4",
+            "nprobe": 64,
+            "k_rank_cluster": 1800,
+            "k_rank_all_tokens": 180,
             "itopk_size": 96,
             "overlap_chunks": DEFAULT_OVERLAP_CHUNKS,
         },
@@ -72,11 +72,11 @@ OPERATING_POINTS = {
             "overlap_chunks": DEFAULT_OVERLAP_CHUNKS,
         },
         "msmarco": {
-            "label": "c3",
-            "nprobe": 96,
-            "k_rank_cluster": 2400,
-            "k_rank_all_tokens": 250,
-            "itopk_size": 128,
+            "label": "d1",
+            "nprobe": 128,
+            "k_rank_cluster": 3000,
+            "k_rank_all_tokens": 300,
+            "itopk_size": 150,
             "overlap_chunks": DEFAULT_OVERLAP_CHUNKS,
         },
         "hotpot": {
@@ -94,7 +94,7 @@ OPERATING_POINTS = {
 VARIANTS = {
     "v6_lite": {
         "binary": "gpu_search_v6_lite",
-        "label": "LUT + optimized doc score",
+        "label": "Chimera",
     },
     "v6_nolut": {
         "binary": "gpu_search_v6_nolut",
@@ -159,6 +159,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nq", type=int, default=-1, help="Queries to evaluate. -1 means all queries.")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--profile", action="store_true", help="Also run profile-eval-all-queries logs.")
+    parser.add_argument(
+        "--plot-only",
+        action="store_true",
+        help="Regenerate plots from an existing comparison CSV without running search.",
+    )
+    parser.add_argument(
+        "--plot-input",
+        type=Path,
+        default=None,
+        help="Comparison CSV to use with --plot-only. Default: output-dir/v6_lite_lut_docscore_comparison.csv",
+    )
     parser.add_argument("--reuse-existing", action="store_true")
     parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", ""))
     return parser.parse_args()
@@ -188,8 +199,14 @@ def quote_arg(text: str) -> str:
     return subprocess.list2cmdline([text])
 
 
-def run_logged(cmd: list[str], log_path: Path, env: dict[str, str], reuse: bool) -> None:
-    if reuse and log_complete(log_path):
+def run_logged(
+    cmd: list[str],
+    log_path: Path,
+    env: dict[str, str],
+    reuse: bool,
+    expected_point: dict[str, int | str] | None = None,
+) -> None:
+    if reuse and log_complete(log_path, expected_point):
         print(f"[reuse] {log_path}", flush=True)
         return
 
@@ -212,15 +229,32 @@ def read_text(path: Path) -> str:
     return path.read_text()
 
 
-def log_complete(path: Path) -> bool:
+def log_matches_point(text: str, point: dict[str, int | str]) -> bool:
+    expected = {
+        "nprobe": point["nprobe"],
+        "k_rank_cluster": point["k_rank_cluster"],
+        "k_rank_all_tokens": point["k_rank_all_tokens"],
+        "itopk_size": point["itopk_size"],
+        "overlap_chunks": point["overlap_chunks"],
+    }
+    return all(
+        re.search(rf"\b{name}={value}\b", text, re.MULTILINE) is not None
+        for name, value in expected.items()
+    )
+
+
+def log_complete(path: Path, expected_point: dict[str, int | str] | None = None) -> bool:
     if not path.exists():
         return False
     text = read_text(path)
-    return (
+    has_metrics = (
         re.search(r"Throughput:\s+([0-9.]+)\s+qps", text, re.MULTILINE) is not None
         and re.search(r"Average latency per query:\s+([0-9.]+)\s+ms", text, re.MULTILINE) is not None
         and re.search(r"Recall@\d+:\s+([0-9.]+)", text, re.MULTILINE) is not None
     )
+    if not has_metrics:
+        return False
+    return expected_point is None or log_matches_point(text, expected_point)
 
 
 def parse_float(pattern: str, text: str, label: str) -> float:
@@ -286,56 +320,195 @@ def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> 
         writer.writerows(rows)
 
 
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
 def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
-    if not rows:
+    datasets = [
+        dataset
+        for dataset in ["lotte", "hotpot", "msmarco"]
+        if any(row["dataset"] == dataset for row in rows)
+    ]
+    targets = [
+        target
+        for target in [0.90, 0.95]
+        if any(abs(float(row["recall_target"]) - target) < 1e-6 for row in rows)
+    ]
+    if not datasets or not targets:
         return
 
-    titles = {"lotte": "LoTTE", "msmarco": "MS MARCO", "hotpot": "HotpotQA"}
-    targets = sorted({float(row["recall_target"]) for row in rows})
-    datasets = [d for d in ["lotte", "msmarco", "hotpot"] if any(row["dataset"] == d for row in rows)]
+    titles = {"lotte": "LoTTE", "msmarco": "MSMARCO", "hotpot": "HotpotQA"}
     variants = ["v6_lite", "v6_nolut", "v6_nolut_nosum"]
     labels = {
-        "v6_lite": "LUT + opt score",
-        "v6_nolut": "No LUT + opt score",
-        "v6_nolut_nosum": "No LUT + naive score",
+        "v6_lite": "Chimera",
+        "v6_nolut": "w/o LUT",
+        "v6_nolut_nosum": "w/o LUT + naive sum",
     }
     colors = {
-        "v6_lite": "#2f6f6d",
-        "v6_nolut": "#d65f2e",
-        "v6_nolut_nosum": "#6b5b95",
+        "v6_lite": "#d62728",
+        "v6_nolut": "#1f77b4",
+        "v6_nolut_nosum": "#7f7f7f",
     }
+    hatches = {"v6_lite": "", "v6_nolut": "//", "v6_nolut_nosum": "\\\\"}
 
-    plt.rcParams.update({"font.size": 10})
-    fig, axes = plt.subplots(len(targets), len(datasets), figsize=(3.8 * len(datasets), 2.9 * len(targets)), sharey=False)
-    if len(targets) == 1 and len(datasets) == 1:
-        axes = [[axes]]
-    elif len(targets) == 1:
+    plt.rcParams.update(
+        {
+            "font.size": 18,
+            "axes.titlesize": 20,
+            "axes.labelsize": 20,
+            "xtick.labelsize": 18,
+            "ytick.labelsize": 18,
+            "legend.fontsize": 16,
+        }
+    )
+
+    fig, axes = plt.subplots(1, len(targets), figsize=(5.4 * len(targets), 4.2), sharey=True)
+    if len(targets) == 1:
         axes = [axes]
-    elif len(datasets) == 1:
-        axes = [[ax] for ax in axes]
 
-    for r, target in enumerate(targets):
-        for c, dataset in enumerate(datasets):
-            ax = axes[r][c]
-            group = [row for row in rows if row["dataset"] == dataset and float(row["recall_target"]) == target]
-            xs = list(range(len(variants)))
-            ys = [float(next(row for row in group if row["variant"] == variant)["timed_qps"]) for variant in variants]
-            ax.bar(xs, ys, color=[colors[v] for v in variants], width=0.65)
-            ax.set_xticks(xs, [labels[v] for v in variants], rotation=18, ha="right")
-            ax.set_title(f"{titles[dataset]}, R@100≈{target:.2f}")
-            ax.grid(axis="y", alpha=0.25)
-            if c == 0:
-                ax.set_ylabel("QPS")
+    for ax, target in zip(axes, targets):
+        target_rows = [row for row in rows if abs(float(row["recall_target"]) - target) < 1e-6]
+        x = list(range(len(datasets)))
+        width = 0.24
+        offsets = [-width, 0.0, width]
+        grouped: dict[str, dict[str, float]] = {}
+        for offset, variant in zip(offsets, variants):
+            ys = []
+            for dataset in datasets:
+                match = next(
+                    row
+                    for row in target_rows
+                    if row["dataset"] == dataset and row["variant"] == variant
+                )
+                qps = float(match["timed_qps"])
+                ys.append(qps)
+                grouped.setdefault(dataset, {})[variant] = qps
+            ax.bar(
+                [value + offset for value in x],
+                ys,
+                width=width,
+                color=colors[variant],
+                hatch=hatches[variant],
+                edgecolor="black",
+                linewidth=1.0,
+                label=labels[variant],
+            )
+
+        ax.set_xticks(x, [titles[dataset] for dataset in datasets])
+        ax.set_title(f"Recall@100 = {target:.2f}")
+        ax.grid(axis="y", alpha=0.3)
+        ymax = 0.0
+        for xi, dataset in zip(x, datasets):
+            lite_qps = grouped[dataset]["v6_lite"]
+            nolut_qps = grouped[dataset]["v6_nolut"]
+            nosum_qps = grouped[dataset]["v6_nolut_nosum"]
+            ymax = max(ymax, lite_qps, nolut_qps, nosum_qps)
+            ax.text(
+                xi - width,
+                lite_qps * 1.03,
+                f"{lite_qps / nosum_qps:.2f}x",
+                ha="center",
+                va="bottom",
+                fontweight="bold",
+                fontsize=16,
+            )
+            ax.text(
+                xi + width,
+                nosum_qps * 1.03,
+                "1x",
+                ha="center",
+                va="bottom",
+                fontsize=16,
+            )
+        ax.set_ylim(0, ymax * 1.85)
+    axes[0].set_ylabel("QPS")
+    axes[-1].legend(frameon=False)
     fig.tight_layout()
+
     for suffix in ("png", "pdf", "svg"):
-        fig.savefig(output_dir / f"v6_lite_lut_docscore_qps.{suffix}", bbox_inches="tight", dpi=200)
+        fig.savefig(output_dir / f"qps_lut_nolut_v6.{suffix}", bbox_inches="tight", dpi=200)
     plt.close(fig)
+
+
+def comparison_fieldnames() -> list[str]:
+    return [
+        "variant",
+        "variant_label",
+        "dataset",
+        "recall_target",
+        "operating_point",
+        "k",
+        "nq",
+        "warmup",
+        "nprobe",
+        "k_rank_cluster",
+        "k_rank_all_tokens",
+        "itopk_size",
+        "overlap_chunks",
+        "timed_qps",
+        "timed_avg_latency_ms",
+        "timed_recall_at_100",
+        *PROFILE_FIELDS.keys(),
+        "timed_log",
+        "profile_log",
+    ]
+
+
+def rows_from_existing_logs(args: argparse.Namespace) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for target in args.recall_targets:
+        for dataset in args.datasets:
+            point = OPERATING_POINTS[target][dataset]
+            for variant in ["v6_lite", "v6_nolut", "v6_nolut_nosum"]:
+                timed_log = args.output_dir / f"{log_prefix(variant, target, dataset)}_timed.log"
+                if not log_complete(timed_log, point):
+                    raise FileNotFoundError(
+                        f"missing complete timed log for plot-only mode: {timed_log}"
+                    )
+                qps, latency, recall, metrics = parse_log(timed_log)
+                row = {
+                    "variant": variant,
+                    "variant_label": VARIANTS[variant]["label"],
+                    "dataset": dataset,
+                    "recall_target": f"{target:.2f}",
+                    "operating_point": point["label"],
+                    "k": str(args.k),
+                    "nq": str(args.nq),
+                    "warmup": str(args.warmup),
+                    "nprobe": str(point["nprobe"]),
+                    "k_rank_cluster": str(point["k_rank_cluster"]),
+                    "k_rank_all_tokens": str(point["k_rank_all_tokens"]),
+                    "itopk_size": str(point["itopk_size"]),
+                    "overlap_chunks": str(point["overlap_chunks"]),
+                    "timed_qps": str(qps),
+                    "timed_avg_latency_ms": str(latency),
+                    "timed_recall_at_100": str(recall),
+                    "timed_log": str(timed_log),
+                    "profile_log": "",
+                }
+                row.update({name: "" if value is None else str(value) for name, value in metrics.items()})
+                rows.append(row)
+    return rows
 
 
 def main() -> None:
     args = parse_args()
-    binaries = binary_paths(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.plot_only:
+        csv_path = args.plot_input or (args.output_dir / "v6_lite_lut_docscore_comparison.csv")
+        if csv_path.exists():
+            rows = read_csv(csv_path)
+        else:
+            rows = rows_from_existing_logs(args)
+            write_csv(csv_path, rows, comparison_fieldnames())
+        render_qps_plot(rows, args.output_dir)
+        print(f"[out] {args.output_dir / 'qps_lut_nolut_v6.png'}", flush=True)
+        print(f"[out] {args.output_dir / 'qps_lut_nolut_v6.pdf'}", flush=True)
+        return
+
+    binaries = binary_paths(args)
     env = gpu_env(args.cuda_visible_devices)
 
     rows: list[dict[str, str]] = []
@@ -350,6 +523,7 @@ def main() -> None:
                     timed_log,
                     env,
                     args.reuse_existing,
+                    point,
                 )
                 qps, latency, recall, timed_metrics = parse_log(timed_log)
 
@@ -362,6 +536,7 @@ def main() -> None:
                         profile_log,
                         env,
                         args.reuse_existing,
+                        point,
                     )
                     _, _, _, profile_metrics = parse_log(profile_log)
 
@@ -394,28 +569,7 @@ def main() -> None:
                     flush=True,
                 )
 
-    fieldnames = [
-        "variant",
-        "variant_label",
-        "dataset",
-        "recall_target",
-        "operating_point",
-        "k",
-        "nq",
-        "warmup",
-        "nprobe",
-        "k_rank_cluster",
-        "k_rank_all_tokens",
-        "itopk_size",
-        "overlap_chunks",
-        "timed_qps",
-        "timed_avg_latency_ms",
-        "timed_recall_at_100",
-        *PROFILE_FIELDS.keys(),
-        "timed_log",
-        "profile_log",
-    ]
-    write_csv(args.output_dir / "v6_lite_lut_docscore_comparison.csv", rows, fieldnames)
+    write_csv(args.output_dir / "v6_lite_lut_docscore_comparison.csv", rows, comparison_fieldnames())
 
     summary_rows = []
     for target in sorted({row["recall_target"] for row in rows}):
