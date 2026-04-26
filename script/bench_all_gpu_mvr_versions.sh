@@ -26,7 +26,7 @@ Description:
 Options:
   --dataset <name>         Dataset to benchmark. Repeatable.
                            Accepts hotspot as an alias for hotpot.
-  --version <v0|v1|v2|v3|v4|v5|v6|v6_lite|v7|v8>  Version to benchmark. Repeatable.
+  --version <v0|v1|v2|v3|v4|v5|v6|v6_lite|v6_nolut_nosum|v7|v8>  Version to benchmark. Repeatable.
                            Default: v0 v1 v2 v3 v4 v5 v6 v7 v8
   --config-file <path>     Passed through to bench_gpu_mvr.sh.
                            Default: profiling/gpu_mvr_config.csv
@@ -102,10 +102,10 @@ while [[ $# -gt 0 ]]; do
         --version)
             [[ $# -ge 2 ]] || die "missing value for --version"
             case "$2" in
-                v0|v1|v2|v3|v4|v5|v6|v6_lite|v7|v8)
+                v0|v1|v2|v3|v4|v5|v6|v6_lite|v6_nolut_nosum|v7|v8)
                     ;;
                 *)
-                    die "--version must be one of: v0, v1, v2, v3, v4, v5, v6, v6_lite, v7, v8"
+                    die "--version must be one of: v0, v1, v2, v3, v4, v5, v6, v6_lite, v6_nolut_nosum, v7, v8"
                     ;;
             esac
             if [[ $version_set -eq 0 ]]; then
