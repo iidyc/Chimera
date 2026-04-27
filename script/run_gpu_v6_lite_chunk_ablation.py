@@ -29,8 +29,8 @@ DATASET_PATHS = {
 }
 
 
-# Fixed operating points chosen from the v6/v6_lite sweeps at overlap_chunks=5.
-# The ablation changes only overlap_chunks, so recall should remain stable.
+# Fixed operating points chosen from the v6/v6_lite sweeps. The chunk ablation
+# defaults to the Recall@100=0.95 target and changes only overlap_chunks.
 OPERATING_POINTS = {
     0.90: {
         "lotte": {
@@ -105,8 +105,8 @@ def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
         description=(
-            "Sweep v6_lite overlap_chunks=1..8 at fixed Recall@100 ≈ 0.90 "
-            "and ≈ 0.95 operating points for LoTTE/MSMARCO/HotpotQA."
+            "Sweep v6_lite overlap_chunks=1..8 at fixed Recall@100 ≈ 0.95 "
+            "operating points for LoTTE/HotpotQA by default."
         )
     )
     parser.add_argument("--repo-root", type=Path, default=repo_root)
@@ -121,14 +121,14 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         choices=["lotte", "msmarco", "hotpot"],
-        default=["lotte", "msmarco", "hotpot"],
+        default=["lotte", "hotpot"],
     )
     parser.add_argument(
         "--recall-targets",
         nargs="+",
         type=float,
         choices=[0.90, 0.95],
-        default=[0.90, 0.95],
+        default=[0.95],
     )
     parser.add_argument(
         "--chunks",
@@ -159,8 +159,14 @@ def quote_arg(text: str) -> str:
     return subprocess.list2cmdline([text])
 
 
-def run_logged(cmd: list[str], log_path: Path, env: dict[str, str], reuse: bool) -> None:
-    if reuse and log_complete(log_path):
+def run_logged(
+    cmd: list[str],
+    log_path: Path,
+    env: dict[str, str],
+    reuse: bool,
+    expected_labels: list[str] | None = None,
+) -> None:
+    if reuse and log_complete(log_path, expected_labels):
         print(f"[reuse] {log_path}", flush=True)
         return
 
@@ -183,15 +189,18 @@ def read_text(path: Path) -> str:
     return path.read_text()
 
 
-def log_complete(path: Path) -> bool:
+def log_complete(path: Path, expected_labels: list[str] | None = None) -> bool:
     if not path.exists():
         return False
     text = read_text(path)
-    return (
-        re.search(r"Throughput:\s+([0-9.]+)\s+qps", text, re.MULTILINE) is not None
-        and re.search(r"Average latency per query:\s+([0-9.]+)\s+ms", text, re.MULTILINE) is not None
-        and re.search(r"Recall@\d+:\s+([0-9.]+)", text, re.MULTILINE) is not None
-    )
+    labels = expected_labels or ["single"]
+    return all(
+        re.search(rf"\[RUN\] Starting config label={re.escape(label)}\b", text, re.MULTILINE) is not None
+        and re.search(rf"\[CONFIG\] label={re.escape(label)}\b", text, re.MULTILINE) is not None
+        for label in labels
+    ) and len(re.findall(r"Throughput:\s+([0-9.]+)\s+qps", text, re.MULTILINE)) >= len(labels) \
+        and len(re.findall(r"Average latency per query:\s+([0-9.]+)\s+ms", text, re.MULTILINE)) >= len(labels) \
+        and len(re.findall(r"Recall@\d+:\s+([0-9.]+)", text, re.MULTILINE)) >= len(labels)
 
 
 def parse_float(pattern: str, text: str, label: str) -> float:
@@ -211,27 +220,53 @@ def log_prefix(target: float, dataset: str, chunk: int) -> str:
     return f"v6_lite_{dataset}_r{target_text}_c{chunk}"
 
 
-def command_for(
+def multi_config_log_prefix(target: float, dataset: str) -> str:
+    target_text = str(target).replace(".", "")
+    return f"v6_lite_{dataset}_r{target_text}_chunks"
+
+
+def chunk_label(chunk: int) -> str:
+    return f"c{chunk}"
+
+
+def write_runtime_config_csv(path: Path, point: dict[str, int | str], chunks: list[int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "label",
+            "nprobe",
+            "k_rank_cluster",
+            "k_rank_all_tokens",
+            "itopk_size",
+            "overlap_chunks",
+        ])
+        for chunk in chunks:
+            writer.writerow([
+                chunk_label(chunk),
+                point["nprobe"],
+                point["k_rank_cluster"],
+                point["k_rank_all_tokens"],
+                point["itopk_size"],
+                chunk,
+            ])
+
+
+def command_for_config(
     args: argparse.Namespace,
     binary: Path,
     dataset: str,
-    target: float,
-    chunk: int,
+    config_file: Path,
     profile: bool,
 ) -> list[str]:
     paths = DATASET_PATHS[dataset]
-    point = OPERATING_POINTS[target][dataset]
     cmd = [
         str(binary),
         "--query", str(args.repo_root / paths["query"]),
         "--gt", str(args.repo_root / paths["gt"]),
         "--index", str(args.repo_root / paths["index"]),
+        "--config-file", str(config_file),
         "--k", str(args.k),
-        "--nprobe", str(point["nprobe"]),
-        "--k-rank-cluster", str(point["k_rank_cluster"]),
-        "--k-rank-all-tokens", str(point["k_rank_all_tokens"]),
-        "--itopk-size", str(point["itopk_size"]),
-        "--overlap-chunks", str(chunk),
         "--warmup", str(args.warmup),
     ]
     if args.nq >= 0:
@@ -241,13 +276,26 @@ def command_for(
     return cmd
 
 
-def parse_log(log_path: Path) -> tuple[float, float, float, dict[str, float | None]]:
-    text = read_text(log_path)
+def parse_log_text(text: str) -> tuple[float, float, float, dict[str, float | None]]:
     qps = parse_float(r"Throughput:\s+([0-9.]+)\s+qps", text, "qps")
     latency = parse_float(r"Average latency per query:\s+([0-9.]+)\s+ms", text, "latency")
     recall = parse_float(r"Recall@\d+:\s+([0-9.]+)", text, "recall")
     metrics = {name: maybe_parse_float(pattern, text) for name, pattern in PROFILE_FIELDS.items()}
     return qps, latency, recall, metrics
+
+
+def parse_multi_config_log(log_path: Path) -> dict[str, tuple[float, float, float, dict[str, float | None]]]:
+    text = read_text(log_path)
+    matches = list(re.finditer(r"\[RUN\] Starting config label=([^\s]+)\b", text))
+    if not matches:
+        return {"single": parse_log_text(text)}
+
+    parsed = {}
+    for index, match in enumerate(matches):
+        label = match.group(1)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        parsed[label] = parse_log_text(text[match.start():end])
+    return parsed
 
 
 def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
@@ -312,18 +360,40 @@ def main() -> None:
     for target in args.recall_targets:
         for dataset in args.datasets:
             point = OPERATING_POINTS[target][dataset]
-            for chunk in args.chunks:
-                prefix = log_prefix(target, dataset, chunk)
-                timed_log = args.output_dir / f"{prefix}_timed.log"
-                run_logged(command_for(args, binary, dataset, target, chunk, False), timed_log, env, args.reuse_existing)
-                qps, latency, recall, timed_metrics = parse_log(timed_log)
+            prefix = multi_config_log_prefix(target, dataset)
+            config_file = args.output_dir / f"{prefix}_config.csv"
+            write_runtime_config_csv(config_file, point, args.chunks)
+            labels = [chunk_label(chunk) for chunk in args.chunks]
 
-                profile_log = Path()
+            timed_log = args.output_dir / f"{prefix}_timed.log"
+            run_logged(
+                command_for_config(args, binary, dataset, config_file, False),
+                timed_log,
+                env,
+                args.reuse_existing,
+                labels,
+            )
+            timed_by_label = parse_multi_config_log(timed_log)
+
+            profile_log = Path()
+            profile_by_label: dict[str, tuple[float, float, float, dict[str, float | None]]] = {}
+            if args.profile:
+                profile_log = args.output_dir / f"{prefix}_profile.log"
+                run_logged(
+                    command_for_config(args, binary, dataset, config_file, True),
+                    profile_log,
+                    env,
+                    args.reuse_existing,
+                    labels,
+                )
+                profile_by_label = parse_multi_config_log(profile_log)
+
+            for chunk in args.chunks:
+                label = chunk_label(chunk)
+                qps, latency, recall, timed_metrics = timed_by_label[label]
                 profile_metrics = {name: None for name in PROFILE_FIELDS}
-                if args.profile:
-                    profile_log = args.output_dir / f"{prefix}_profile.log"
-                    run_logged(command_for(args, binary, dataset, target, chunk, True), profile_log, env, args.reuse_existing)
-                    _, _, _, profile_metrics = parse_log(profile_log)
+                if args.profile and label in profile_by_label:
+                    _, _, _, profile_metrics = profile_by_label[label]
 
                 metrics = profile_metrics if args.profile else timed_metrics
                 row = {
