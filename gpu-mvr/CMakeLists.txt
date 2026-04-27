@@ -323,6 +323,30 @@ if(GPU_MVR_V6_GPU_INDICES_U32)
 endif()
 target_link_libraries(gpu_search_v6 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
+
+add_executable(gpu_search_v6_nosum
+    cpp/app/gpu_search_v6_nosum.cu
+    cpp/cuda/src/gpu_index_v6_nosum.cu
+    cpp/cuda/src/gpu_kernels_v6_lut.cu
+    cpp/cuda/src/gpu_kernels_v0.cu
+)
+target_include_directories(gpu_search_v6_nosum PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v6_nosum PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v6_nosum PRIVATE
+    GPU_MVR_IMPL_NAME=\"v6_nosum\"
+    GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
+    GPU_MVR_COMPACT_DOC_BUFFER=1
+)
+if(GPU_MVR_V6_GPU_INDICES_U32)
+    target_compile_definitions(gpu_search_v6_nosum PRIVATE
+        GPU_MVR_V6_GPU_INDICES_U32=1
+    )
+endif()
+target_link_libraries(gpu_search_v6_nosum PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+
 add_executable(gpu_search_v6_lite
     cpp/app/gpu_search_v6_lite.cu
     cpp/cuda/src/gpu_index_v6_lite.cu

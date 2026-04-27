@@ -96,6 +96,10 @@ VARIANTS = {
         "binary": "gpu_search_v6_lite",
         "label": "Chimera",
     },
+    "v6_nosum": {
+        "binary": "gpu_search_v6_nosum",
+        "label": "LUT + naive doc score",
+    },
     "v6_nolut": {
         "binary": "gpu_search_v6_nolut",
         "label": "No LUT + optimized doc score",
@@ -105,6 +109,8 @@ VARIANTS = {
         "label": "No LUT + naive doc score",
     },
 }
+
+VARIANT_ORDER = ["v6_lite", "v6_nosum", "v6_nolut", "v6_nolut_nosum"]
 
 
 PROFILE_FIELDS = {
@@ -132,13 +138,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Ablate LUT and Stage-2 doc-score optimization for v6_lite by "
-            "comparing v6_lite, v6_nolut, and v6_nolut_nosum at fixed "
+            "comparing v6_lite, v6_nosum, v6_nolut, and v6_nolut_nosum at fixed "
             "Recall@100 ≈ 0.90 and ≈ 0.95 operating points."
         )
     )
     parser.add_argument("--repo-root", type=Path, default=repo_root)
     parser.add_argument("--build-dir", type=Path, default=repo_root / "gpu-mvr" / "build")
     parser.add_argument("--binary-v6-lite", type=Path, default=None)
+    parser.add_argument("--binary-v6-nosum", type=Path, default=None)
     parser.add_argument("--binary-v6-nolut", type=Path, default=None)
     parser.add_argument("--binary-v6-nolut-nosum", type=Path, default=None)
     parser.add_argument(
@@ -178,6 +185,7 @@ def parse_args() -> argparse.Namespace:
 def binary_paths(args: argparse.Namespace) -> dict[str, Path]:
     paths = {
         "v6_lite": args.binary_v6_lite or (args.build_dir / "gpu_search_v6_lite"),
+        "v6_nosum": args.binary_v6_nosum or (args.build_dir / "gpu_search_v6_nosum"),
         "v6_nolut": args.binary_v6_nolut or (args.build_dir / "gpu_search_v6_nolut"),
         "v6_nolut_nosum": args.binary_v6_nolut_nosum or (args.build_dir / "gpu_search_v6_nolut_nosum"),
     }
@@ -340,18 +348,20 @@ def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
         return
 
     titles = {"lotte": "LoTTE", "msmarco": "MSMARCO", "hotpot": "HotpotQA"}
-    variants = ["v6_lite", "v6_nolut", "v6_nolut_nosum"]
+    variants = VARIANT_ORDER
     labels = {
         "v6_lite": "Chimera",
+        "v6_nosum": "LUT + naive sum",
         "v6_nolut": "w/o LUT",
         "v6_nolut_nosum": "w/o LUT + naive sum",
     }
     colors = {
         "v6_lite": "#d62728",
+        "v6_nosum": "#ff9896",
         "v6_nolut": "#1f77b4",
         "v6_nolut_nosum": "#7f7f7f",
     }
-    hatches = {"v6_lite": "", "v6_nolut": "//", "v6_nolut_nosum": "\\\\"}
+    hatches = {"v6_lite": "", "v6_nosum": "..", "v6_nolut": "//", "v6_nolut_nosum": "\\\\"}
 
     plt.rcParams.update(
         {
@@ -371,8 +381,11 @@ def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
     for ax, target in zip(axes, targets):
         target_rows = [row for row in rows if abs(float(row["recall_target"]) - target) < 1e-6]
         x = list(range(len(datasets)))
-        width = 0.24
-        offsets = [-width, 0.0, width]
+        width = 0.18
+        offsets = [
+            (idx - (len(variants) - 1) / 2.0) * width
+            for idx in range(len(variants))
+        ]
         grouped: dict[str, dict[str, float]] = {}
         for offset, variant in zip(offsets, variants):
             ys = []
@@ -402,11 +415,12 @@ def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
         ymax = 0.0
         for xi, dataset in zip(x, datasets):
             lite_qps = grouped[dataset]["v6_lite"]
+            lut_nosum_qps = grouped[dataset]["v6_nosum"]
             nolut_qps = grouped[dataset]["v6_nolut"]
             nosum_qps = grouped[dataset]["v6_nolut_nosum"]
-            ymax = max(ymax, lite_qps, nolut_qps, nosum_qps)
+            ymax = max(ymax, lite_qps, lut_nosum_qps, nolut_qps, nosum_qps)
             ax.text(
-                xi - width,
+                xi + offsets[0],
                 lite_qps * 1.03,
                 f"{lite_qps / nosum_qps:.2f}x",
                 ha="center",
@@ -415,7 +429,7 @@ def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
                 fontsize=16,
             )
             ax.text(
-                xi + width,
+                xi + offsets[-1],
                 nosum_qps * 1.03,
                 "1x",
                 ha="center",
@@ -461,7 +475,7 @@ def rows_from_existing_logs(args: argparse.Namespace) -> list[dict[str, str]]:
     for target in args.recall_targets:
         for dataset in args.datasets:
             point = OPERATING_POINTS[target][dataset]
-            for variant in ["v6_lite", "v6_nolut", "v6_nolut_nosum"]:
+            for variant in VARIANT_ORDER:
                 timed_log = args.output_dir / f"{log_prefix(variant, target, dataset)}_timed.log"
                 if not log_complete(timed_log, point):
                     raise FileNotFoundError(
@@ -515,7 +529,7 @@ def main() -> None:
     for target in args.recall_targets:
         for dataset in args.datasets:
             point = OPERATING_POINTS[target][dataset]
-            for variant in ["v6_lite", "v6_nolut", "v6_nolut_nosum"]:
+            for variant in VARIANT_ORDER:
                 prefix = log_prefix(variant, target, dataset)
                 timed_log = args.output_dir / f"{prefix}_timed.log"
                 run_logged(
@@ -579,6 +593,7 @@ def main() -> None:
                 continue
             by_variant = {row["variant"]: row for row in group}
             lite_qps = float(by_variant["v6_lite"]["timed_qps"])
+            lut_nosum_qps = float(by_variant["v6_nosum"]["timed_qps"])
             nolut_qps = float(by_variant["v6_nolut"]["timed_qps"])
             nosum_qps = float(by_variant["v6_nolut_nosum"]["timed_qps"])
             summary_rows.append({
@@ -586,12 +601,16 @@ def main() -> None:
                 "recall_target": target,
                 "operating_point": by_variant["v6_lite"]["operating_point"],
                 "v6_lite_qps": by_variant["v6_lite"]["timed_qps"],
+                "v6_nosum_qps": by_variant["v6_nosum"]["timed_qps"],
                 "v6_nolut_qps": by_variant["v6_nolut"]["timed_qps"],
                 "v6_nolut_nosum_qps": by_variant["v6_nolut_nosum"]["timed_qps"],
-                "lut_gain_pct": str(100.0 * (lite_qps / nolut_qps - 1.0)),
-                "docscore_opt_gain_pct": str(100.0 * (nolut_qps / nosum_qps - 1.0)),
+                "lut_gain_optimized_sum_pct": str(100.0 * (lite_qps / nolut_qps - 1.0)),
+                "lut_gain_naive_sum_pct": str(100.0 * (lut_nosum_qps / nosum_qps - 1.0)),
+                "docscore_opt_gain_lut_pct": str(100.0 * (lite_qps / lut_nosum_qps - 1.0)),
+                "docscore_opt_gain_nolut_pct": str(100.0 * (nolut_qps / nosum_qps - 1.0)),
                 "combined_gain_pct": str(100.0 * (lite_qps / nosum_qps - 1.0)),
                 "v6_lite_recall_at_100": by_variant["v6_lite"]["timed_recall_at_100"],
+                "v6_nosum_recall_at_100": by_variant["v6_nosum"]["timed_recall_at_100"],
                 "v6_nolut_recall_at_100": by_variant["v6_nolut"]["timed_recall_at_100"],
                 "v6_nolut_nosum_recall_at_100": by_variant["v6_nolut_nosum"]["timed_recall_at_100"],
             })
@@ -603,12 +622,16 @@ def main() -> None:
             "recall_target",
             "operating_point",
             "v6_lite_qps",
+            "v6_nosum_qps",
             "v6_nolut_qps",
             "v6_nolut_nosum_qps",
-            "lut_gain_pct",
-            "docscore_opt_gain_pct",
+            "lut_gain_optimized_sum_pct",
+            "lut_gain_naive_sum_pct",
+            "docscore_opt_gain_lut_pct",
+            "docscore_opt_gain_nolut_pct",
             "combined_gain_pct",
             "v6_lite_recall_at_100",
+            "v6_nosum_recall_at_100",
             "v6_nolut_recall_at_100",
             "v6_nolut_nosum_recall_at_100",
         ],
