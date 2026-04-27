@@ -99,13 +99,6 @@ if (NOT spdlog_FOUND)
     FetchContent_MakeAvailable(spdlog)
 endif ()
 
-if (NOT DEFINED TBB_DIR AND CONDA_ENV_PATH AND EXISTS "${CONDA_ENV_PATH}/lib/cmake/TBB")
-    set(TBB_DIR "${CONDA_ENV_PATH}/lib/cmake/TBB")
-elseif (NOT DEFINED TBB_DIR AND EXISTS "/usr/lib/x86_64-linux-gnu/cmake/TBB")
-    set(TBB_DIR "/usr/lib/x86_64-linux-gnu/cmake/TBB")
-endif ()
-find_package(TBB REQUIRED)
-
 # Source dependencies
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 if (NOT DEFINED pybind11_DIR)
@@ -140,6 +133,13 @@ option(USE_CUDA "Build CUDA-enabled targets" ON)
 
 if (USE_CUDA)
     message("${Green}use CUDA${ColourReset}")
+
+    if (NOT DEFINED TBB_DIR AND CONDA_ENV_PATH AND EXISTS "${CONDA_ENV_PATH}/lib/cmake/TBB")
+        set(TBB_DIR "${CONDA_ENV_PATH}/lib/cmake/TBB")
+    elseif (NOT DEFINED TBB_DIR AND EXISTS "/usr/lib/x86_64-linux-gnu/cmake/TBB")
+        set(TBB_DIR "/usr/lib/x86_64-linux-gnu/cmake/TBB")
+    endif ()
+    find_package(TBB REQUIRED)
 
     #    set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD 17)
