@@ -26,7 +26,7 @@ Description:
 
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
-  --version <v0|v1|v2|v3|v4|v5|v6|v6_nosum|v6_lite|v6_nolut_nosum|v7|v8>  GPU-MVR search version. Default: v3
+  --version <v0|v1|v2|v3|v4|v5|v6|v6_nosum|v6_lite|v6_turbo|v6_nolut_nosum|v7|v7_lite|v7_unalign|v8|v8_nosum|v8_nolut|v8_nolut_nosum|v9>  GPU-MVR search version. Default: v3
   --implementation-label <label>
                            Output folder label. Default: gpu_search_<version>
   --config-file <path>     Config CSV. Default: profiling/gpu_mvr_config.csv
@@ -39,6 +39,9 @@ Options:
   --k <top_k>              Final retrieval depth / recall depth. Default: 100
   --nq <count>             Evaluation queries timed after warmup; evaluation restarts from query 0. Default: -1
   --warmup <count>         Warmup query count before timed evaluation restarts from query 0. Default: 5
+  --concurrent-queries <count>
+                           Pass --concurrent-queries to implementations that support query slots.
+  --stage3-threads <count> Pass --stage3-threads to implementations that support it.
   --dry-run                Print planned commands without executing them.
   -h, --help               Show this help message.
 EOF
@@ -287,6 +290,12 @@ benchmark_dataset() {
         --warmup "$warmup"
         --config-file "$config_file"
     )
+    if [[ -n "$concurrent_queries" ]]; then
+        command+=(--concurrent-queries "$concurrent_queries")
+    fi
+    if [[ -n "$stage3_threads" ]]; then
+        command+=(--stage3-threads "$stage3_threads")
+    fi
 
     log_line "[run] dataset=${dataset_name} batched_configs=${config_count}"
     log_line "[run] command=$(printf '%q ' "${command[@]}")"
@@ -334,6 +343,8 @@ implementation_label=""
 k=100
 nq=-1
 warmup=5
+concurrent_queries=""
+stage3_threads=""
 dry_run=0
 dataset_set=0
 binary_set=0
@@ -401,6 +412,16 @@ while [[ $# -gt 0 ]]; do
             warmup="$2"
             shift 2
             ;;
+        --concurrent-queries)
+            [[ $# -ge 2 ]] || die "missing value for --concurrent-queries"
+            concurrent_queries="$2"
+            shift 2
+            ;;
+        --stage3-threads)
+            [[ $# -ge 2 ]] || die "missing value for --stage3-threads"
+            stage3_threads="$2"
+            shift 2
+            ;;
         --dry-run)
             dry_run=1
             shift
@@ -424,11 +445,12 @@ if [[ $dataset_set -eq 0 ]]; then
     datasets=(hotpot lotte msmarco)
 fi
 
+valid_versions="v0, v1, v2, v3, v4, v5, v6, v6_nosum, v6_lite, v6_turbo, v6_nolut_nosum, v7, v7_lite, v7_unalign, v8, v8_nosum, v8_nolut, v8_nolut_nosum, v9"
 case "$version" in
-    v0|v1|v2|v3|v4|v5|v6|v6_nosum|v6_lite|v6_nolut_nosum|v7|v8)
+    v0|v1|v2|v3|v4|v5|v6|v6_nosum|v6_lite|v6_turbo|v6_nolut_nosum|v7|v7_lite|v7_unalign|v8|v8_nosum|v8_nolut|v8_nolut_nosum|v9)
         ;;
     *)
-        die "--version must be one of: v0, v1, v2, v3, v4, v5, v6, v6_nosum, v6_lite, v6_nolut_nosum, v7, v8"
+        die "--version must be one of: ${valid_versions}"
         ;;
 esac
 
@@ -445,6 +467,13 @@ fi
 require_positive_int "--k" "$k"
 [[ "$nq" =~ ^-?[0-9]+$ ]] || die "--nq must be an integer"
 require_positive_int "--warmup" "$warmup"
+if [[ -n "$concurrent_queries" ]]; then
+    require_positive_int "--concurrent-queries" "$concurrent_queries"
+    (( concurrent_queries > 0 )) || die "--concurrent-queries must be > 0"
+fi
+if [[ -n "$stage3_threads" ]]; then
+    require_positive_int "--stage3-threads" "$stage3_threads"
+fi
 (( k > 0 )) || die "--k must be > 0"
 (( warmup >= 0 )) || die "--warmup must be >= 0"
 (( nq >= -1 )) || die "--nq must be >= -1"

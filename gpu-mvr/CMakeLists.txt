@@ -225,6 +225,45 @@ target_compile_definitions(gpu_search_v7 PRIVATE
 )
 target_link_libraries(gpu_search_v7 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
+add_executable(gpu_search_v7_lite
+    cpp/app/gpu_search_v7_lite.cu
+    cpp/cuda/src/gpu_index_v7_lite.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v7_lite.cu
+)
+target_include_directories(gpu_search_v7_lite PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v7_lite PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v7_lite PRIVATE
+    GPU_MVR_IMPL_NAME=\"v7_lite\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+    GPU_MVR_USE_LUT=1
+)
+target_link_libraries(gpu_search_v7_lite PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v7_lite DEPENDS gpu_search_v7_lite)
+
+add_executable(gpu_search_v7_unalign
+    cpp/app/gpu_search_v7_lite.cu
+    cpp/cuda/src/gpu_index_v7_lite.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v7_lite.cu
+)
+target_include_directories(gpu_search_v7_unalign PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v7_unalign PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v7_unalign PRIVATE
+    GPU_MVR_IMPL_NAME=\"v7_unalign\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+    GPU_MVR_USE_LUT=1
+    GPU_MVR_V7_DISABLE_STAGE1_SHIFT=1
+)
+target_link_libraries(gpu_search_v7_unalign PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v7_unalign DEPENDS gpu_search_v7_unalign)
+
 add_executable(gpu_search_v8
     cpp/app/gpu_search_v8.cu
     cpp/cuda/src/gpu_index_v8.cu
@@ -243,6 +282,47 @@ target_compile_definitions(gpu_search_v8 PRIVATE
 )
 target_link_libraries(gpu_search_v8 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
+add_executable(gpu_search_v8_nosum
+    cpp/app/gpu_search_v8.cu
+    cpp/cuda/src/gpu_index_v8.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v8.cu
+    cpp/cuda/src/gpu_kernels_v0.cu
+)
+target_include_directories(gpu_search_v8_nosum PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v8_nosum PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v8_nosum PRIVATE
+    GPU_MVR_IMPL_NAME=\"v8_nosum\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+    GPU_MVR_USE_LUT=1
+    GPU_MVR_STAGE2_USE_V0_DOC_SCORE=1
+)
+target_link_libraries(gpu_search_v8_nosum PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v8_nosum DEPENDS gpu_search_v8_nosum)
+
+add_executable(gpu_search_v9
+    cpp/app/gpu_search_v8.cu
+    cpp/cuda/src/gpu_index_v8.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v8.cu
+)
+target_include_directories(gpu_search_v9 PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v9 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v9 PRIVATE
+    GPU_MVR_IMPL_NAME=\"v9\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+    GPU_MVR_USE_LUT=1
+    GPU_MVR_STAGE2_DOC_LAYOUT=1
+)
+target_link_libraries(gpu_search_v9 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v9 DEPENDS gpu_search_v9)
+
 add_executable(gpu_search_v8_nolut
     cpp/app/gpu_search_v8.cu
     cpp/cuda/src/gpu_index_v8.cu
@@ -259,6 +339,48 @@ target_compile_definitions(gpu_search_v8_nolut PRIVATE
     GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
 )
 target_link_libraries(gpu_search_v8_nolut PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v8_nolut DEPENDS gpu_search_v8_nolut)
+add_custom_target(v8s8_nolut DEPENDS gpu_search_v8_nolut)
+
+add_executable(gpu_search_v8_nolut_nosum
+    cpp/app/gpu_search_v8.cu
+    cpp/cuda/src/gpu_index_v8.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v8.cu
+    cpp/cuda/src/gpu_kernels_v0.cu
+)
+target_include_directories(gpu_search_v8_nolut_nosum PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v8_nolut_nosum PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v8_nolut_nosum PRIVATE
+    GPU_MVR_IMPL_NAME=\"v8_nolut_nosum\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+    GPU_MVR_STAGE2_USE_V0_DOC_SCORE=1
+)
+target_link_libraries(gpu_search_v8_nolut_nosum PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v8_nolut_nosum DEPENDS gpu_search_v8_nolut_nosum)
+add_custom_target(v8s8_nolut_nosum DEPENDS gpu_search_v8_nolut_nosum)
+
+add_executable(gpu_search_v8_profile
+    cpp/app/gpu_search_v8.cu
+    cpp/cuda/src/gpu_index_v8.cu
+    cpp/cuda/src/gpu_kernels_v3.cu
+    cpp/cuda/src/gpu_kernels_v8.cu
+)
+target_include_directories(gpu_search_v8_profile PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v8_profile PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v8_profile PRIVATE
+    GPU_MVR_IMPL_NAME=\"v8_profile\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+    GPU_MVR_USE_LUT=1
+    GPU_MVR_V8_PROFILE_APP=1
+)
+target_link_libraries(gpu_search_v8_profile PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
 function(add_gpu_search_v4_nonclustered_target target_name impl_name)
     add_executable(${target_name}
@@ -301,6 +423,30 @@ target_compile_definitions(gpu_search_v5 PRIVATE
 )
 target_link_libraries(gpu_search_v5 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 
+add_executable(gpu_search_v5_lite
+    cpp/app/gpu_search_v6_lut.cu
+    cpp/cuda/src/gpu_index_v6_lut.cu
+    cpp/cuda/src/gpu_kernels_v6_lut.cu
+)
+target_include_directories(gpu_search_v5_lite PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v5_lite PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v5_lite PRIVATE
+    GPU_MVR_IMPL_NAME=\"v5_lite\"
+    GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
+    GPU_MVR_USE_LUT=1
+    GPU_MVR_COMPACT_DOC_BUFFER=1
+)
+if(GPU_MVR_V6_GPU_INDICES_U32)
+    target_compile_definitions(gpu_search_v5_lite PRIVATE
+        GPU_MVR_V6_GPU_INDICES_U32=1
+    )
+endif()
+target_link_libraries(gpu_search_v5_lite PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v5_lite DEPENDS gpu_search_v5_lite)
+
 add_executable(gpu_search_v6
     cpp/app/gpu_search_v6_lut.cu
     cpp/cuda/src/gpu_index_v6_lut.cu
@@ -322,7 +468,6 @@ if(GPU_MVR_V6_GPU_INDICES_U32)
     )
 endif()
 target_link_libraries(gpu_search_v6 PRIVATE gpu_mvr_core gpu_mvr_app_utils)
-
 
 add_executable(gpu_search_v6_nosum
     cpp/app/gpu_search_v6_nosum.cu
@@ -371,6 +516,30 @@ endif()
 target_link_libraries(gpu_search_v6_lite PRIVATE gpu_mvr_core gpu_mvr_app_utils)
 add_custom_target(v6_lite DEPENDS gpu_search_v6_lite)
 
+add_executable(gpu_search_v6_turbo
+    cpp/app/gpu_search_v6_turbo.cu
+    cpp/cuda/src/gpu_index_v6_turbo.cu
+    cpp/cuda/src/gpu_kernels_v6_lite.cu
+)
+target_include_directories(gpu_search_v6_turbo PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(gpu_search_v6_turbo PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search_v6_turbo PRIVATE
+    GPU_MVR_IMPL_NAME=\"v6_turbo\"
+    GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
+    GPU_MVR_COMPACT_DOC_BUFFER=1
+    GPU_MVR_V6_FORCE_DOCPTRS=1
+)
+if(GPU_MVR_V6_GPU_INDICES_U32)
+    target_compile_definitions(gpu_search_v6_turbo PRIVATE
+        GPU_MVR_V6_GPU_INDICES_U32=1
+    )
+endif()
+target_link_libraries(gpu_search_v6_turbo PRIVATE gpu_mvr_core gpu_mvr_app_utils)
+add_custom_target(v6_turbo DEPENDS gpu_search_v6_turbo)
+
 add_executable(gpu_search_v6_nolut
     cpp/app/gpu_search_v6_nolut.cu
     cpp/cuda/src/gpu_index_v6_nolut.cu
@@ -384,6 +553,7 @@ set_target_properties(gpu_search_v6_nolut PROPERTIES CUDA_SEPARABLE_COMPILATION 
 target_compile_definitions(gpu_search_v6_nolut PRIVATE
     GPU_MVR_IMPL_NAME=\"v6_nolut\"
     GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
+    GPU_MVR_COMPACT_DOC_BUFFER=1
 )
 if(GPU_MVR_V6_GPU_INDICES_U32)
     target_compile_definitions(gpu_search_v6_nolut PRIVATE
@@ -406,6 +576,7 @@ set_target_properties(gpu_search_v6_nolut_nosum PROPERTIES CUDA_SEPARABLE_COMPIL
 target_compile_definitions(gpu_search_v6_nolut_nosum PRIVATE
     GPU_MVR_IMPL_NAME=\"v6_nolut_nosum\"
     GPU_MVR_CLUSTERED_LAYOUT_DISABLED=1
+    GPU_MVR_COMPACT_DOC_BUFFER=1
 )
 if(GPU_MVR_V6_GPU_INDICES_U32)
     target_compile_definitions(gpu_search_v6_nolut_nosum PRIVATE

@@ -10,6 +10,9 @@
 
 #include "clustered_stage1_file_format.hpp"
 #include "gpu_index_layout.hpp"
+#ifdef GPU_MVR_STAGE2_USE_V0_DOC_SCORE
+#include "gpu_kernels_v0.cuh"
+#endif
 #include "mvr_index_file_format.hpp"
 #include "startup_profile.hpp"
 
@@ -107,14 +110,31 @@ gpu_mvr_index::gpu_mvr_index(
     startup.mark("read_header_and_rotator");
 
     const size_t one_bit_bytes = n * (PADDED_DIM / 8);
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+    std::vector<char> one_bit_code(one_bit_bytes);
+    std::vector<float> one_bit_factor(n);
+#endif
     full_code_.resize(n * PADDED_DIM * (1 + ex_bits) / 8);
     ex_factor_.resize(n);
 
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+    inf.read(one_bit_code.data(), one_bit_bytes);
+    if (!inf) {
+        throw std::runtime_error(
+            "Failed to read one-bit code section in " + resolved_paths.quantized_data_path);
+    }
+    inf.read(reinterpret_cast<char*>(one_bit_factor.data()), n * sizeof(float));
+    if (!inf) {
+        throw std::runtime_error(
+            "Failed to read one-bit factor section in " + resolved_paths.quantized_data_path);
+    }
+#else
     inf.seekg(static_cast<std::streamoff>(one_bit_bytes + n * sizeof(float)), std::ios::cur);
     if (!inf) {
         throw std::runtime_error(
             "Failed to position ex_factor section in " + resolved_paths.quantized_data_path);
     }
+#endif
     inf.read((char*)ex_factor_.data(), n * sizeof(float));
     if (!inf) {
         throw std::runtime_error(
@@ -169,6 +189,16 @@ gpu_mvr_index::gpu_mvr_index(
 
     // Allocate persistent GPU data
     CUDA_CHECK(cudaMalloc(&d_doc_ptrs_, (num_docs + 1) * sizeof(int)));
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+    CUDA_CHECK(cudaMalloc(&d_one_bit_code_, one_bit_bytes));
+    CUDA_CHECK(cudaMalloc(&d_one_bit_factor_, n * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(
+        d_one_bit_code_, one_bit_code.data(),
+        one_bit_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        d_one_bit_factor_, one_bit_factor.data(),
+        n * sizeof(float), cudaMemcpyHostToDevice));
+#endif
 
     // Upload inverted list structures to GPU
     CUDA_CHECK(cudaMalloc(&d_cluster_pos_, (ivf->n_clusters + 1) * sizeof(size_t)));
@@ -501,7 +531,11 @@ void gpu_mvr_index::allocate_workspace() {
     CUDA_CHECK(cudaMalloc(&ws_.d_lut, LUT_TOTAL_FLOATS * sizeof(float)));
     size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
     CUDA_CHECK(cudaFuncSetAttribute(
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+        stage2_binary_ip_lut_doc_kernel,
+#else
         stage2_binary_ip_lut_kernel,
+#endif
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         stage2_lut_smem));
 #endif
@@ -1249,6 +1283,15 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
     auto t_cpu2 = std::chrono::high_resolution_clock::now();
 
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+    gather_doc_token_ids_kernel<<<num_candidates, 256, 0, stream>>>(
+        ws_.d_topk_doc_ids,
+        d_doc_ptrs_,
+        ws_.d_pst_candidate_offsets,
+        ws_.d_pst_clustered_pos,
+        num_candidates
+    );
+#else
     gather_clustered_positions_kernel<<<num_candidates, 256, 0, stream>>>(
         ws_.d_topk_doc_ids,
         d_doc_ptrs_,
@@ -1257,6 +1300,7 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
         ws_.d_pst_clustered_pos,
         num_candidates
     );
+#endif
     CUDA_CHECK(cudaGetLastError());
     if constexpr (kProfile) {
         CUDA_CHECK(cudaEventRecord(ws_.phase_a_token_ids_done_event, stream));
@@ -1360,6 +1404,15 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 #ifdef GPU_MVR_USE_LUT
             {
                 size_t stage2_lut_smem = STAGE2_LUT_SMEM_FLOATS * sizeof(float) + STAGE2_LUT_TILE_Q * sizeof(float);
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+                stage2_binary_ip_lut_doc_kernel<<<bip_blocks, 256, stage2_lut_smem, stream>>>(
+                    ws_.d_lut, d_one_bit_code_, d_one_bit_factor_,
+                    ws_.d_cb1_sumq,
+                    ws_.d_pst_clustered_pos + tok_start,
+                    ws_.d_token_dists + tok_start,
+                    total_tokens, tok_count
+                );
+#else
                 stage2_binary_ip_lut_kernel<<<bip_blocks, 256, stage2_lut_smem, stream>>>(
                     ws_.d_lut, d_clustered_code_, d_clustered_factor_,
                     ws_.d_cb1_sumq,
@@ -1367,9 +1420,19 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
                     ws_.d_token_dists + tok_start,
                     total_tokens, tok_count
                 );
+#endif
             }
 #else
             {
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+                stage2_binary_ip_doc_kernel_v2<<<bip_blocks, 256, 0, stream>>>(
+                    ws_.d_queries, d_one_bit_code_, d_one_bit_factor_,
+                    ws_.d_cb1_sumq,
+                    ws_.d_pst_clustered_pos + tok_start,
+                    ws_.d_token_dists + tok_start,
+                    total_tokens, tok_count
+                );
+#else
                 stage2_binary_ip_kernel_v2<<<bip_blocks, 256, 0, stream>>>(
                     ws_.d_queries, d_clustered_code_, d_clustered_factor_,
                     ws_.d_cb1_sumq,
@@ -1377,6 +1440,7 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
                     ws_.d_token_dists + tok_start,
                     total_tokens, tok_count
                 );
+#endif
             }
 #endif
 #ifdef GPU_MVR_PROFILE
@@ -1392,10 +1456,22 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
             CUDA_CHECK(cudaEventRecord(chunk_docscore_start[c], stream));
         }
 #endif
+#ifdef GPU_MVR_STAGE2_USE_V0_DOC_SCORE
+        int score_blocks = (c_count + score_threads - 1) / score_threads;
+        doc_score_v0_kernel<<<score_blocks, score_threads, 0, stream>>>(
+            ws_.d_token_dists,
+            ws_.d_pst_candidate_offsets + c_start,
+            ws_.d_doc_scores + c_start,
+            total_tokens,
+            c_count);
+#else
         doc_score_kernel<<<c_count, score_threads, 0, stream>>>(
-            ws_.d_token_dists, ws_.d_pst_candidate_offsets + c_start,
-            ws_.d_doc_scores + c_start, total_tokens, c_count
-        );
+            ws_.d_token_dists,
+            ws_.d_pst_candidate_offsets + c_start,
+            ws_.d_doc_scores + c_start,
+            total_tokens,
+            c_count);
+#endif
 #ifdef GPU_MVR_PROFILE
         if constexpr (kProfile) {
             CUDA_CHECK(cudaEventRecord(chunk_docscore_end[c], stream));
@@ -1605,7 +1681,15 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
 
         tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_start_event), tl_gpu_us(ws_.phase_a_gather_done_event), "gather_doc_lengths", "async"});
         tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_gather_done_event), tl_gpu_us(ws_.phase_a_prefix_done_event), "prefix_sum", "async"});
-        tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_prefix_done_event), tl_gpu_us(ws_.phase_a_token_ids_done_event), "gather_clustered_pos", "async"});
+        tl_gpu_compute.push_back({
+            tl_gpu_us(ws_.phase_a_prefix_done_event),
+            tl_gpu_us(ws_.phase_a_token_ids_done_event),
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+            "gather_doc_token_ids",
+#else
+            "gather_clustered_pos",
+#endif
+            "async"});
         tl_gpu_compute.push_back({tl_gpu_us(ws_.phase_a_token_ids_done_event), tl_gpu_us(ws_.phase_a_d2h_done_event), "d2h_metadata", "async"});
 
 #ifdef GPU_MVR_PROFILE
@@ -1694,7 +1778,13 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
             std::cout << "[PROFILE] Phase A (Data Preparation) wall: " << time_phase_a << " ms, GPU total: " << time_phase_a_gpu << " ms\n";
             std::cout << "[PROFILE]   1. Gather doc lengths      : " << time_phase_a_gather << " ms (CPU launch: " << cpu_ms(t_cpu0, t_cpu1) << " ms)\n";
             std::cout << "[PROFILE]   2. Prefix sum offsets      : " << time_phase_a_prefix << " ms (CPU launch: " << cpu_ms(t_cpu1, t_cpu2) << " ms)\n";
-            std::cout << "[PROFILE]   3. Gather clustered pos    : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
+            std::cout << "[PROFILE]   3. "
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+                      << "Gather doc token ids   "
+#else
+                      << "Gather clustered pos   "
+#endif
+                      << " : " << time_phase_a_token_ids << " ms (CPU launch: " << cpu_ms(t_cpu2, t_cpu3) << " ms)\n";
             std::cout << "[PROFILE]   4. D2H metadata + sync     : " << time_phase_a_d2h << " ms (CPU launch: " << cpu_ms(t_cpu3, t_cpu4) << " ms)\n";
             std::cout << "[PROFILE]   5. cudaStreamSynchronize   : " << cpu_ms(t_cpu4, t_cpu5) << " ms\n";
             std::cout << "[PROFILE]   6. cudaEventElapsedTime x5 : " << cpu_ms(t_cpu5, t_cpu6) << " ms\n";
@@ -1731,6 +1821,8 @@ void gpu_mvr_index::cpu_refine_scores(
     std::pair<float, int>* refined_scores
 ) {
     const size_t full_code_stride = PADDED_DIM * (1 + ex_bits) / 8;
+    const auto& full_code = *full_code_source_;
+    const auto& ex_factor = *ex_factor_source_;
     alignas(64) float cbex_sumq_arr[Q_DOCLEN];
     for (size_t j = 0; j < Q_DOCLEN; j++)
         cbex_sumq_arr[j] = queries[j].cbex_sumq;
@@ -1751,18 +1843,18 @@ void gpu_mvr_index::cpu_refine_scores(
         for (size_t t = 0; t < n_tok; t++) {
             size_t tid = doc_start + t;
             unpack_func_(
-                reinterpret_cast<const uint8_t*>(&full_code_[tid * full_code_stride]),
+                reinterpret_cast<const uint8_t*>(&full_code[tid * full_code_stride]),
                 decoded, PADDED_DIM);
             if (t + 1 < n_tok) {
-                __builtin_prefetch(&full_code_[(tid + 1) * full_code_stride], 0, 3);
-                __builtin_prefetch(&ex_factor_[tid + 1], 0, 1);
+                __builtin_prefetch(&full_code[(tid + 1) * full_code_stride], 0, 3);
+                __builtin_prefetch(&ex_factor[tid + 1], 0, 1);
             }
             rabitqlib::gemv_batch8_avx512(
                 queries_flat, decoded,
                 full_ip,
                 Q_DOCLEN, PADDED_DIM);
 
-            float tok_exf = ex_factor_[tid];
+            float tok_exf = ex_factor[tid];
             __m512 v_tok_exf = _mm512_set1_ps(tok_exf);
 
             for (size_t j = 0; j < Q_DOCLEN; j += 16) {
@@ -1804,6 +1896,10 @@ gpu_mvr_index::~gpu_mvr_index() {
     CUDA_CHECK(cudaFree(d_clustered_factor_));
     CUDA_CHECK(cudaFree(d_clustered_doc_ids_));
     CUDA_CHECK(cudaFree(d_token_to_cluster_pos_));
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+    CUDA_CHECK(cudaFree(d_one_bit_code_));
+    CUDA_CHECK(cudaFree(d_one_bit_factor_));
+#endif
 
     CUDA_CHECK(cudaFree(ws_.d_queries));
     CUDA_CHECK(cudaFree(ws_.d_cb1_sumq));

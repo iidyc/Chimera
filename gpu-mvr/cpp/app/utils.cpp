@@ -134,14 +134,21 @@ double compute_recall(
     const std::vector<std::vector<size_t>>& retrieved,
     int top_k)
 {
+    if (top_k <= 0) {
+        std::cout << "Recall@" + std::to_string(top_k) + ": 0" << std::endl;
+        return 0.0;
+    }
+
     int num_queries = retrieved.size();
     int total_recall = 0;
     for (int i = 0; i < num_queries; ++i) {
         const auto& gt = ground_truth[i];
         const auto& ret = retrieved[i];
-        std::unordered_set<size_t> ret_set(ret.begin(), ret.end());
+        const size_t retrieved_cutoff = std::min(ret.size(), static_cast<size_t>(top_k));
+        std::unordered_set<size_t> ret_set(ret.begin(), ret.begin() + retrieved_cutoff);
         int correct = 0;
-        for (int j = 0; j < top_k; ++j) {
+        const int gt_cutoff = std::min<int>(top_k, static_cast<int>(gt.size()));
+        for (int j = 0; j < gt_cutoff; ++j) {
             if (ret_set.find(gt[j]) != ret_set.end()) {
                 correct++;
             }

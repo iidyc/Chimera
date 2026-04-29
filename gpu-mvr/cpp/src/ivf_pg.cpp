@@ -114,7 +114,14 @@ void PG_CAGRA::search(const float* /*query*/, size_t /*k*/, std::vector<size_t>&
 void PG_CAGRA::search_batch_gpu(const float* d_queries, size_t n_queries, size_t k,
                                 float* d_dists, uint32_t* d_labels, cudaStream_t stream,
                                 size_t itopk_size) {
-    raft::resource::set_cuda_stream(res_, rmm::cuda_stream_view(stream));
+    search_batch_gpu(res_, d_queries, n_queries, k, d_dists, d_labels, stream, itopk_size);
+}
+
+void PG_CAGRA::search_batch_gpu(const raft::resources& res, const float* d_queries,
+                                size_t n_queries, size_t k, float* d_dists,
+                                uint32_t* d_labels, cudaStream_t stream,
+                                size_t itopk_size) {
+    raft::resource::set_cuda_stream(res, rmm::cuda_stream_view(stream));
 
     auto queries = raft::make_device_matrix_view(
         d_queries,
@@ -134,7 +141,7 @@ void PG_CAGRA::search_batch_gpu(const float* d_queries, size_t n_queries, size_t
 
     cuvs::neighbors::cagra::search_params search_params;
     search_params.itopk_size = itopk_size;
-    cuvs::neighbors::cagra::search(res_, search_params, *index_cagra, queries, labels, distances);
+    cuvs::neighbors::cagra::search(res, search_params, *index_cagra, queries, labels, distances);
 }
 
 void PG_CAGRA::save(const std::string& filename) const {
@@ -199,6 +206,21 @@ void IVF_PG::search_batch_gpu(const float* d_queries, size_t n_queries, size_t n
     throw std::runtime_error("search_batch_gpu requires GPU_MVR_HAVE_CUVS");
 #endif
 }
+
+#ifdef GPU_MVR_HAVE_CUVS
+void IVF_PG::search_batch_gpu(const raft::resources& res, const float* d_queries,
+                              size_t n_queries, size_t n_probe, float* d_dists,
+                              uint32_t* d_labels, cudaStream_t stream,
+                              size_t itopk_size) {
+    auto* cagra = dynamic_cast<PG_CAGRA*>(pg_index);
+    if (cagra) {
+        cagra->search_batch_gpu(
+            res, d_queries, n_queries, n_probe, d_dists, d_labels, stream, itopk_size);
+    } else {
+        throw std::runtime_error("search_batch_gpu requires PG_CAGRA");
+    }
+}
+#endif
 
 void IVF_PG::build_index(const float* /*data*/) {}
 

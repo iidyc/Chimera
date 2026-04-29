@@ -3,9 +3,6 @@
 #ifdef GPU_MVR_USE_LUT
 #undef GPU_MVR_USE_LUT
 #endif
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-#undef GPU_MVR_COMPACT_DOC_BUFFER
-#endif
 
 #include <cuda_runtime.h>
 #include <thrust/sort.h>

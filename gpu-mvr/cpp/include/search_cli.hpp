@@ -23,6 +23,8 @@ struct gpu_search_cli_args {
     int k = 100;
     int nq = -1;
     int warmup = 5;
+    int concurrent_queries = 1;
+    int stage3_threads = 0;
     bool profile_eval_all_queries = false;
     std::string query_file;
     std::string doclens_file;
@@ -239,6 +241,8 @@ inline void print_gpu_search_help(const char* program, const gpu_search_cli_args
         << "  [--k <top_k>]                   Final number of documents returned. Default: " << defaults.k << "\n"
         << "  [--nq <num_queries_to_run>]     Number of evaluation queries timed after warmup; evaluation restarts from query 0. -1 means all queries. Default: " << defaults.nq << "\n"
         << "  [--warmup <num_warmup_queries>] Warmup queries run before timing/recall; evaluation still restarts from query 0. Default: " << defaults.warmup << "\n"
+        << "  [--concurrent-queries <count>] Number of independent query slots to run concurrently when supported. Default: " << defaults.concurrent_queries << "\n"
+        << "  [--stage3-threads <count>] OpenMP threads per Stage 3 rerank worker. 0 keeps the OpenMP default. Default: " << defaults.stage3_threads << "\n"
         << "  [--profile-eval-all-queries]    Collect CPU stage timing on every evaluation query and print only averaged breakdowns at the end.\n"
         << "  [--nprobe <num_probes>]         Number of IVF clusters probed per query token. Default: " << defaults.runtime.nprobe << "\n"
         << "  [--k-rank-cluster <count>]      Stage-1 document candidates kept after cluster scoring. Default: " << defaults.runtime.k_rank_cluster << "\n"
@@ -276,6 +280,10 @@ inline gpu_search_cli_args parse_gpu_search_args(
             args.nq = std::stoi(require_gpu_search_arg_value(argc, argv, i, arg));
         } else if (arg == "--warmup") {
             args.warmup = std::stoi(require_gpu_search_arg_value(argc, argv, i, arg));
+        } else if (arg == "--concurrent-queries") {
+            args.concurrent_queries = std::stoi(require_gpu_search_arg_value(argc, argv, i, arg));
+        } else if (arg == "--stage3-threads") {
+            args.stage3_threads = std::stoi(require_gpu_search_arg_value(argc, argv, i, arg));
         } else if (arg == "--profile-eval-all-queries") {
             args.profile_eval_all_queries = true;
         } else if (arg == "--nprobe") {
@@ -311,6 +319,12 @@ inline gpu_search_cli_args parse_gpu_search_args(
     }
     if (args.warmup < 0) {
         throw std::runtime_error("--warmup must be >= 0");
+    }
+    if (args.concurrent_queries <= 0) {
+        throw std::runtime_error("--concurrent-queries must be > 0");
+    }
+    if (args.stage3_threads < 0) {
+        throw std::runtime_error("--stage3-threads must be >= 0");
     }
     validate_gpu_search_runtime_options(args.runtime);
 

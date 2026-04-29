@@ -1,4 +1,4 @@
-#include "gpu_kernels_v8.cuh"
+#include "gpu_kernels_v7_lite.cuh"
 
 #include <cub/cub.cuh>
 
@@ -94,6 +94,10 @@ __device__ __forceinline__ uint32_t cluster_virtual_to_actual_emb_pos(
     int cluster_size,
     int virtual_local_idx
 ) {
+#if defined(GPU_MVR_V7_DISABLE_STAGE1_SHIFT) && GPU_MVR_V7_DISABLE_STAGE1_SHIFT
+    (void) cluster_size;
+    return cluster_start + static_cast<uint32_t>(virtual_local_idx);
+#else
     const int misalign = static_cast<int>(cluster_start & (kStage1ClusterAlignTokens - 1));
     const int head = (misalign == 0)
         ? 0
@@ -107,11 +111,12 @@ __device__ __forceinline__ uint32_t cluster_virtual_to_actual_emb_pos(
         return cluster_start + static_cast<uint32_t>(head + virtual_local_idx);
     }
     return cluster_start + static_cast<uint32_t>(virtual_local_idx - aligned_run);
+#endif
 }
 
 }  // namespace
 
-__global__ void bitmap_offset_init_v8_kernel(
+__global__ void bitmap_offset_init_v7_lite_kernel(
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
     size_t num_buckets,
     doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets
@@ -136,7 +141,7 @@ __global__ void bitmap_offset_init_v8_kernel(
     }
 }
 
-__global__ void bitmap_unique_docs_v8_kernel(
+__global__ void bitmap_unique_docs_v7_lite_kernel(
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
     size_t num_buckets,
     const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
@@ -169,7 +174,7 @@ __global__ void bitmap_unique_docs_v8_kernel(
     }
 }
 
-__global__ void sum_doc_scores_compact_v8_kernel(
+__global__ void sum_doc_scores_compact_v7_lite_kernel(
     const float* __restrict__ d_doc_query_max,
     const int*   __restrict__ d_touched_doc_list,
     float*       d_scores_out,
@@ -200,7 +205,7 @@ __global__ void sum_doc_scores_compact_v8_kernel(
     }
 }
 
-__global__ void stage1_binary_ip_lut_flag_docs_v8_kernel(
+__global__ void stage1_binary_ip_lut_flag_docs_v7_lite_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
@@ -274,7 +279,7 @@ __global__ void stage1_binary_ip_lut_flag_docs_v8_kernel(
     }
 }
 
-__global__ void stage1_binary_ip_lut_v8_kernel(
+__global__ void stage1_binary_ip_lut_v7_lite_kernel(
     const float*    __restrict__ d_lut,
     const char*     __restrict__ d_clustered_code,
     const float*    __restrict__ d_clustered_factor,
@@ -368,127 +373,6 @@ __global__ void stage1_binary_ip_lut_v8_kernel(
         #pragma unroll
         for (int n = 0; n < 8; ++n)
             ip += smem_lut[(24 + n) * LUT_SIZE + ((code128.w >> (n * 4)) & 0xF)];
-
-        const float dist = (ip - cb1_sumq) * factor;
-        if (dist > 0.0f && static_cast<size_t>(doc_id) < num_docs) {
-            const unsigned int active_mask = __activemask();
-            const unsigned int doc_group = warp_matching_doc_mask(doc_id, active_mask);
-            const int lane = threadIdx.x & 31;
-            const int leader_lane = __ffs(doc_group) - 1;
-            const float group_max = warp_group_max(dist, doc_group, active_mask);
-
-            if (lane == leader_lane) {
-                const int cid = bitmap_compact_id(
-                    d_doc_bitmap,
-                    d_doc_bitmap_offsets,
-                    doc_id);
-                if (cid < 0 || cid >= max_touched_docs) {
-                    continue;
-                }
-                atomicMaxFloat(
-                    &d_doc_query_max[static_cast<size_t>(cid) * Q_DOCLEN + query_idx],
-                    group_max);
-            }
-        }
-    }
-}
-
-__global__ void stage1_binary_ip_nolut_v8_kernel(
-    const float*    __restrict__ d_queries,
-    const char*     __restrict__ d_clustered_code,
-    const float*    __restrict__ d_clustered_factor,
-    const float*    __restrict__ d_cb1_sumq,
-    const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
-    const int*      __restrict__ d_clustered_doc_ids,
-    float*          __restrict__ d_doc_query_max,
-    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
-    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
-    int             max_touched_docs,
-    size_t          num_docs,
-    int             nprobe,
-    size_t          n_clusters
-) {
-    __shared__ float smem_query[PADDED_DIM];
-    __shared__ uint32_t smem_cstart[kStage1MaxNprobe];
-    __shared__ int smem_prefix[kStage1MaxNprobe + 1];
-
-    const int query_idx = blockIdx.y;
-    if (query_idx >= Q_DOCLEN) {
-        return;
-    }
-
-    const float* q_ptr = d_queries + query_idx * PADDED_DIM;
-    for (int i = threadIdx.x; i < PADDED_DIM; i += blockDim.x) {
-        smem_query[i] = q_ptr[i];
-    }
-
-    const uint32_t* my_labels = d_cagra_labels + query_idx * nprobe;
-    for (int p = threadIdx.x; p < nprobe; p += blockDim.x) {
-        const uint32_t label = my_labels[p];
-        if (label < static_cast<uint32_t>(n_clusters)) {
-            const size_t start = d_cluster_pos[label];
-            smem_cstart[p] = static_cast<uint32_t>(start);
-            smem_prefix[p + 1] = static_cast<int>(d_cluster_pos[label + 1] - start);
-        } else {
-            smem_cstart[p] = 0;
-            smem_prefix[p + 1] = 0;
-        }
-    }
-    if (threadIdx.x == 0) {
-        smem_prefix[0] = 0;
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        for (int i = 1; i <= nprobe; ++i) {
-            smem_prefix[i] += smem_prefix[i - 1];
-        }
-    }
-    __syncthreads();
-
-    const int total_elements = smem_prefix[nprobe];
-    const float cb1_sumq = d_cb1_sumq[query_idx];
-
-    for (int flat_idx = threadIdx.x + blockIdx.x * blockDim.x;
-         flat_idx < total_elements;
-         flat_idx += blockDim.x * gridDim.x) {
-        int lo = 0;
-        int hi = nprobe;
-        while (lo < hi) {
-            const int mid = (lo + hi) >> 1;
-            if (smem_prefix[mid + 1] <= flat_idx) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        const int cluster_size = smem_prefix[lo + 1] - smem_prefix[lo];
-        const int cluster_local = flat_idx - smem_prefix[lo];
-        const uint32_t emb_pos = cluster_virtual_to_actual_emb_pos(
-            smem_cstart[lo], cluster_size, cluster_local);
-
-        const uint64_t* code_ptr = reinterpret_cast<const uint64_t*>(
-            d_clustered_code + static_cast<size_t>(emb_pos) * CODE_BYTES);
-        const uint64_t code0 = code_ptr[0];
-        const uint64_t code1 = code_ptr[1];
-        const float factor = d_clustered_factor[emb_pos];
-        const int doc_id = d_clustered_doc_ids[emb_pos];
-
-        float ip = 0.0f;
-        uint64_t bits = code0;
-        while (bits) {
-            const int pos = __ffsll(bits) - 1;
-            ip += smem_query[pos];
-            bits &= bits - 1;
-        }
-        bits = code1;
-        while (bits) {
-            const int pos = __ffsll(bits) - 1;
-            ip += smem_query[64 + pos];
-            bits &= bits - 1;
-        }
 
         const float dist = (ip - cb1_sumq) * factor;
         if (dist > 0.0f && static_cast<size_t>(doc_id) < num_docs) {

@@ -25,7 +25,7 @@ inline constexpr size_t doc_bitmap_num_offsets(size_t num_buckets) {
     return (num_buckets / kDocBitmapCompRatio) + 1;
 }
 
-__global__ void stage1_binary_ip_lut_v8_kernel(
+__global__ void stage1_binary_ip_lut_v7_lite_kernel(
     const float*    __restrict__ d_lut,
     const char*     __restrict__ d_clustered_code,
     const float*    __restrict__ d_clustered_factor,
@@ -42,24 +42,7 @@ __global__ void stage1_binary_ip_lut_v8_kernel(
     size_t          n_clusters
 );
 
-__global__ void stage1_binary_ip_nolut_v8_kernel(
-    const float*    __restrict__ d_queries,
-    const char*     __restrict__ d_clustered_code,
-    const float*    __restrict__ d_clustered_factor,
-    const float*    __restrict__ d_cb1_sumq,
-    const uint32_t* __restrict__ d_cagra_labels,
-    const size_t*   __restrict__ d_cluster_pos,
-    const int*      __restrict__ d_clustered_doc_ids,
-    float*          __restrict__ d_doc_query_max,
-    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
-    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
-    int             max_touched_docs,
-    size_t          num_docs,
-    int             nprobe,
-    size_t          n_clusters
-);
-
-__global__ void stage1_binary_ip_lut_flag_docs_v8_kernel(
+__global__ void stage1_binary_ip_lut_flag_docs_v7_lite_kernel(
     const uint32_t* __restrict__ d_cagra_labels,
     const size_t*   __restrict__ d_cluster_pos,
     const int*      __restrict__ d_clustered_doc_ids,
@@ -69,20 +52,20 @@ __global__ void stage1_binary_ip_lut_flag_docs_v8_kernel(
     size_t          n_clusters
 );
 
-__global__ void bitmap_offset_init_v8_kernel(
+__global__ void bitmap_offset_init_v7_lite_kernel(
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
     size_t num_buckets,
     doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets
 );
 
-__global__ void bitmap_unique_docs_v8_kernel(
+__global__ void bitmap_unique_docs_v7_lite_kernel(
     const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
     size_t num_buckets,
     const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
     int* __restrict__ d_out_doc_ids
 );
 
-__global__ void sum_doc_scores_compact_v8_kernel(
+__global__ void sum_doc_scores_compact_v7_lite_kernel(
     const float* __restrict__ d_doc_query_max,
     const int*   __restrict__ d_touched_doc_list,
     float*       d_scores_out,

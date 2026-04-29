@@ -64,6 +64,10 @@ struct PG_CAGRA : PG {
     void search_batch_gpu(const float* d_queries, size_t n_queries, size_t k,
                           float* d_dists, uint32_t* d_labels, cudaStream_t stream,
                           size_t itopk_size = 150);
+    void search_batch_gpu(const raft::resources& res, const float* d_queries,
+                          size_t n_queries, size_t k, float* d_dists,
+                          uint32_t* d_labels, cudaStream_t stream,
+                          size_t itopk_size = 150);
 
     void save(const std::string& filename) const override;
     void load(const std::string& filename) override;
@@ -89,6 +93,12 @@ struct IVF_PG {
     void search_batch_gpu(const float* d_queries, size_t n_queries, size_t n_probe,
                           float* d_dists, uint32_t* d_labels, cudaStream_t stream,
                           size_t itopk_size = 150);
+#ifdef GPU_MVR_HAVE_CUVS
+    void search_batch_gpu(const raft::resources& res, const float* d_queries,
+                          size_t n_queries, size_t n_probe, float* d_dists,
+                          uint32_t* d_labels, cudaStream_t stream,
+                          size_t itopk_size = 150);
+#endif
 
     void build_index(const float* data);
 

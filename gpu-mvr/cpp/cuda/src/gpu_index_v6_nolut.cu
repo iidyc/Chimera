@@ -364,8 +364,9 @@ gpu_mvr_index::gpu_mvr_index(
 
     use_docptr_remap_ = true;
     std::cout
-        << "[gpu_mvr][v6_nolut] Using doc_ptrs block remapping in "
-           "non-clustered stage 1 while keeping d_doc_ids_ allocated."
+        << "[gpu_mvr][v6_nolut] Using bitmap compression and doc_ptrs "
+           "block remapping in non-clustered stage 1 while keeping "
+           "d_doc_ids_ allocated."
         << std::endl;
 
     log_ctor_step(
@@ -1919,6 +1920,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
         dim3 grid(blocks_x, Q_DOCLEN);
 
+#ifndef GPU_MVR_COMPACT_DOC_BUFFER
         stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
@@ -1930,7 +1932,102 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
             CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
         }
+#endif
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_start, stream));
+        }
+
+        stage1_flag_docs_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_emb_ids,
+            ws_.d_pair_offsets,
+            nullptr,
+            d_doc_ptrs_,
+            d_doc_block_lut_,
+            ws_.d_doc_bitmap,
+            num_docs,
+            max_embs_per_query
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        bitmap_offset_init_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets);
+        CUDA_CHECK(cudaGetLastError());
+
+        size_t scan_temp = ws_.cub_temp_storage_bytes;
+        cub::DeviceScan::ExclusiveSum(
+            ws_.d_cub_temp_storage,
+            scan_temp,
+            ws_.d_doc_bitmap_offsets,
+            ws_.d_doc_bitmap_offsets,
+            ws_.doc_bitmap_offset_count,
+            stream);
+
+        doc_bitmap_offset_t h_num_touched_u32 = 0;
+        CUDA_CHECK(cudaMemcpyAsync(
+            &h_num_touched_u32,
+            ws_.d_doc_bitmap_offsets + ws_.doc_bitmap_offset_count - 1,
+            sizeof(doc_bitmap_offset_t),
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        h_num_touched = static_cast<int>(h_num_touched_u32);
+        if (h_num_touched == 0) {
+            actual_k_out = 0;
+            return;
+        }
+        ensure_compact_doc_capacity(static_cast<size_t>(h_num_touched));
+        CUDA_CHECK(cudaMemsetAsync(
+            ws_.d_doc_query_max, 0,
+            static_cast<size_t>(h_num_touched) * Q_DOCLEN * sizeof(float),
+            stream));
+
+        bitmap_unique_docs_kernel<<<
+            (ws_.doc_bitmap_bucket_count + threads_per_block - 1) / threads_per_block,
+            threads_per_block,
+            0,
+            stream>>>(
+                ws_.d_doc_bitmap,
+                ws_.doc_bitmap_bucket_count,
+                ws_.d_doc_bitmap_offsets,
+                ws_.d_unique_doc_ids);
+        CUDA_CHECK(cudaGetLastError());
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
+            CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_start, stream));
+        }
+
+        stage1_binary_ip_compact_kernel<<<grid, threads_per_block, 0, stream>>>(
+            ws_.d_queries,
+            d_one_bit_code_,
+            d_one_bit_factor_,
+            ws_.d_cb1_sumq,
+            ws_.d_emb_ids,
+            ws_.d_pair_offsets,
+            nullptr,
+            d_doc_ptrs_,
+            d_doc_block_lut_,
+            ws_.d_doc_query_max,
+            ws_.d_doc_bitmap,
+            ws_.d_doc_bitmap_offsets,
+            h_num_touched,
+            num_docs,
+            max_embs_per_query
+        );
+
+        if constexpr (kProfile) {
+            CUDA_CHECK(cudaEventRecord(ws_.s1_binary_ip_end, stream));
+        }
+#else
         aggregate_stage1_tracked_kernel<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_emb_ids,
             ws_.d_emb_dists,
@@ -1944,12 +2041,15 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
             ws_.max_stage1_pairs,
             max_embs_per_query
         );
+#endif
         CUDA_CHECK(cudaGetLastError());
 
+#ifdef GPU_MVR_COMPACT_DOC_BUFFER
+        actual_k_out = std::min((int)k, h_num_touched);
+#else
         if constexpr (kProfile) {
             CUDA_CHECK(cudaEventRecord(ws_.s1_atomic_agg_end, stream));
         }
-
         if constexpr (kProfile) {
             XFER_RECORD_BEGIN(stream);
         }
@@ -1966,6 +2066,7 @@ void gpu_mvr_index::rank_cluster_dists_gpu_impl(
         }
 
         actual_k_out = std::min((int)k, h_num_touched);
+#endif
     }
 #endif
     CUDA_CHECK(cudaGetLastError());

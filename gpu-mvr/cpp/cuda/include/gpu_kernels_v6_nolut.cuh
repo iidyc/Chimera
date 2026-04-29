@@ -3,9 +3,6 @@
 #ifdef GPU_MVR_USE_LUT
 #undef GPU_MVR_USE_LUT
 #endif
-#ifdef GPU_MVR_COMPACT_DOC_BUFFER
-#undef GPU_MVR_COMPACT_DOC_BUFFER
-#endif
 
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -57,6 +54,35 @@ __global__ void stage1_binary_ip_kernel_v2(
     const int*   __restrict__ d_pair_offsets,
     float* __restrict__ d_out_dists,
     size_t max_embs_per_query
+);
+
+__global__ void stage1_flag_docs_kernel(
+    const size_t* __restrict__ d_emb_ids,
+    const int*    __restrict__ d_pair_offsets,
+    const int*    __restrict__ d_doc_ids,
+    const int*    __restrict__ d_doc_ptrs,
+    const int*    __restrict__ d_doc_block_lut,
+    doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    size_t        num_docs,
+    size_t        max_embs_per_query_bound
+);
+
+__global__ void stage1_binary_ip_compact_kernel(
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_emb_ids,
+    const int*   __restrict__ d_pair_offsets,
+    const int*   __restrict__ d_doc_ids,
+    const int*   __restrict__ d_doc_ptrs,
+    const int*   __restrict__ d_doc_block_lut,
+    float*       d_doc_query_max,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
+    int          max_touched_docs,
+    size_t       num_docs,
+    size_t       max_embs_per_query_bound
 );
 
 __global__ void stage2_binary_ip_kernel_v2(
@@ -250,12 +276,9 @@ __global__ void aggregate_stage1_tracked_kernel(
     const int*    __restrict__ d_doc_ids,
     float*        d_doc_query_max,
 #ifdef GPU_MVR_COMPACT_DOC_BUFFER
-    int*          d_ht_keys,
-    int*          d_ht_vals,
-    int*          d_touched_doc_list,
-    int*          d_num_touched_docs,
+    const doc_bitmap_bucket_t* __restrict__ d_doc_bitmap,
+    const doc_bitmap_offset_t* __restrict__ d_doc_bitmap_offsets,
     int           max_touched_docs,
-    unsigned int  ht_mask,
 #else
     int*          d_doc_touched,
     int*          d_touched_doc_list,

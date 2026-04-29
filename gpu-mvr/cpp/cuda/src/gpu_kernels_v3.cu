@@ -127,6 +127,64 @@ __global__ void stage2_binary_ip_kernel_v2(
     }
 }
 
+__global__ void stage2_binary_ip_doc_kernel_v2(
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_token_ids,
+    float* __restrict__ d_out_dists,
+    size_t total_tokens,
+    size_t batch_tokens
+) {
+    __shared__ float smem_queries[Q_DOCLEN * PADDED_DIM];
+    __shared__ float smem_cb1_sumq[Q_DOCLEN];
+
+    const int total_query_floats = Q_DOCLEN * PADDED_DIM;
+    for (int i = threadIdx.x; i < total_query_floats; i += blockDim.x) {
+        smem_queries[i] = d_queries[i];
+    }
+    if (threadIdx.x < Q_DOCLEN) {
+        smem_cb1_sumq[threadIdx.x] = d_cb1_sumq[threadIdx.x];
+    }
+    __syncthreads();
+
+    for (size_t tok_idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+         tok_idx < batch_tokens;
+         tok_idx += (size_t)blockDim.x * gridDim.x)
+    {
+        const uint32_t token_id = d_token_ids[tok_idx];
+        const float factor = d_one_bit_factor[token_id];
+
+        const uint64_t* code_ptr =
+            (const uint64_t*)(d_one_bit_code + static_cast<size_t>(token_id) * CODE_BYTES);
+        uint64_t code_regs[NUM_U64];
+        code_regs[0] = code_ptr[0];
+        code_regs[1] = code_ptr[1];
+
+        #pragma unroll
+        for (int q = 0; q < Q_DOCLEN; q++) {
+            const float* q_smem = smem_queries + q * PADDED_DIM;
+            const float cb1_sumq = smem_cb1_sumq[q];
+
+            float ip = 0.0f;
+            #pragma unroll
+            for (int blk = 0; blk < NUM_U64; blk++) {
+                uint64_t bits = code_regs[blk];
+                int base = blk * 64;
+                #pragma unroll
+                for (int i = 0; i < 64; i++) {
+                    if ((bits >> i) & 1ULL)
+                        ip += q_smem[base + i];
+                }
+            }
+
+            d_out_dists[q * total_tokens + tok_idx] =
+                (ip - cb1_sumq) * factor;
+        }
+    }
+}
+
 __global__ void precompute_lut_kernel(
     const float* __restrict__ d_queries,
     float* __restrict__ d_lut
@@ -498,6 +556,87 @@ __global__ void stage2_binary_ip_lut_kernel(
     }
 }
 
+__global__ void stage2_binary_ip_lut_doc_kernel(
+    const float* __restrict__ d_lut,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_token_ids,
+    float* __restrict__ d_out_dists,
+    size_t total_tokens,
+    size_t batch_tokens
+) {
+    extern __shared__ float smem[];
+    float* smem_lut = smem;
+    float* smem_cb1_sumq = smem + STAGE2_LUT_SMEM_FLOATS;
+
+    size_t tok_base = (size_t)blockIdx.x * blockDim.x;
+
+    for (size_t tok_batch_start = tok_base;
+         tok_batch_start < batch_tokens;
+         tok_batch_start += (size_t)blockDim.x * gridDim.x)
+    {
+        size_t tok_idx = tok_batch_start + threadIdx.x;
+        bool valid = tok_idx < batch_tokens;
+
+        uint32_t token_id = 0;
+        float factor = 0.0f;
+        int nibbles[NUM_CHUNKS];
+
+        if (valid) {
+            token_id = d_token_ids[tok_idx];
+            factor = d_one_bit_factor[token_id];
+
+            const uint64_t* code_ptr =
+                (const uint64_t*)(d_one_bit_code + static_cast<size_t>(token_id) * CODE_BYTES);
+            uint64_t code_regs[NUM_U64];
+            code_regs[0] = code_ptr[0];
+            code_regs[1] = code_ptr[1];
+
+            #pragma unroll
+            for (int blk = 0; blk < NUM_U64; blk++) {
+                uint64_t code = code_regs[blk];
+                #pragma unroll
+                for (int n = 0; n < 16; n++) {
+                    nibbles[blk * 16 + n] = (code >> (n * 4)) & 0xF;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int tile = 0; tile < STAGE2_LUT_NUM_TILES; tile++) {
+            int q_start = tile * STAGE2_LUT_TILE_Q;
+
+            __syncthreads();
+            const float* tile_lut_src = d_lut + q_start * LUT_ENTRIES_PER_QUERY;
+            for (int i = threadIdx.x; i < STAGE2_LUT_SMEM_FLOATS; i += blockDim.x) {
+                smem_lut[i] = tile_lut_src[i];
+            }
+            if (threadIdx.x < STAGE2_LUT_TILE_Q) {
+                smem_cb1_sumq[threadIdx.x] = d_cb1_sumq[q_start + threadIdx.x];
+            }
+            __syncthreads();
+
+            if (valid) {
+                #pragma unroll
+                for (int tq = 0; tq < STAGE2_LUT_TILE_Q; tq++) {
+                    const float* q_lut = smem_lut + tq * LUT_ENTRIES_PER_QUERY;
+                    float ip = 0.0f;
+
+                    #pragma unroll
+                    for (int c = 0; c < NUM_CHUNKS; c++) {
+                        ip += q_lut[c * LUT_SIZE + nibbles[c]];
+                    }
+
+                    int q = q_start + tq;
+                    d_out_dists[q * total_tokens + tok_idx] =
+                        (ip - smem_cb1_sumq[tq]) * factor;
+                }
+            }
+        }
+    }
+}
+
 __global__ void doc_score_kernel(
     const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
@@ -647,6 +786,26 @@ __global__ void gather_clustered_positions_kernel(
     for (int t = threadIdx.x; t < (doc_end - doc_start); t += blockDim.x) {
         const size_t token_id = static_cast<size_t>(doc_start + t);
         d_out_clustered_pos[out_offset + t] = d_token_to_cluster_pos[token_id];
+    }
+}
+
+__global__ void gather_doc_token_ids_kernel(
+    const int*    __restrict__ d_candidate_doc_ids,
+    const int*    __restrict__ d_doc_ptrs,
+    const size_t* __restrict__ d_candidate_offsets,
+    uint32_t*     d_out_token_ids,
+    size_t num_candidates
+) {
+    size_t cand_idx = blockIdx.x;
+    if (cand_idx >= num_candidates) return;
+
+    int doc_id = d_candidate_doc_ids[cand_idx];
+    int doc_start = d_doc_ptrs[doc_id];
+    int doc_end = d_doc_ptrs[doc_id + 1];
+    size_t out_offset = d_candidate_offsets[cand_idx];
+
+    for (int t = threadIdx.x; t < (doc_end - doc_start); t += blockDim.x) {
+        d_out_token_ids[out_offset + t] = static_cast<uint32_t>(doc_start + t);
     }
 }
 

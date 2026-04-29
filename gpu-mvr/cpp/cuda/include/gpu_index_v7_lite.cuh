@@ -1,16 +1,14 @@
 #pragma once
 
-#include <memory>
-
-#define gpu_mvr_index gpu_mvr_index_v8_base
-#define cast_int_size_t cast_int_size_t_v8_base
+#define gpu_mvr_index gpu_mvr_index_v7_lite_base
+#define cast_int_size_t cast_int_size_t_v7_lite_base
 #include "gpu_index_v3.cuh"
 #undef cast_int_size_t
 #undef gpu_mvr_index
 
-#include "gpu_kernels_v8.cuh"
+#include "gpu_kernels_v7_lite.cuh"
 
-struct gpu_mvr_index : public gpu_mvr_index_v8_base {
+struct gpu_mvr_index : public gpu_mvr_index_v7_lite_base {
     size_t workspace_probe_unique_doc_bound_ = 0;
 
     doc_bitmap_bucket_t* d_doc_bitmap_ = nullptr;
@@ -28,15 +26,7 @@ struct gpu_mvr_index : public gpu_mvr_index_v8_base {
         const std::string& filename,
         const std::vector<int>& doc_lens,
         const gpu_search_runtime_options& runtime_options);
-    gpu_mvr_index(
-        gpu_mvr_index& owner,
-        const gpu_search_runtime_options& runtime_options);
     ~gpu_mvr_index();
-
-    bool is_query_slot_ = false;
-#ifdef GPU_MVR_HAVE_CUVS
-    raft::resources cagra_res_;
-#endif
 
     void compute_workspace_probe_bounds();
     void allocate_workspace();

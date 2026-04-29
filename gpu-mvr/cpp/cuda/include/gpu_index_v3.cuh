@@ -96,6 +96,8 @@ struct gpu_mvr_index {
     std::vector<char> full_code_;
     std::vector<float> ex_factor_;
     std::vector<int> doc_ptrs_;
+    const std::vector<char>* full_code_source_ = &full_code_;
+    const std::vector<float>* ex_factor_source_ = &ex_factor_;
     float (*ip_func_)(const float*, const uint8_t*, size_t);
     void (*unpack_func_)(const uint8_t*, float*, size_t);
 
@@ -113,6 +115,10 @@ struct gpu_mvr_index {
     float* d_clustered_factor_ = nullptr;
     int*   d_clustered_doc_ids_ = nullptr;
     uint32_t* d_token_to_cluster_pos_ = nullptr;
+#ifdef GPU_MVR_STAGE2_DOC_LAYOUT
+    char*  d_one_bit_code_ = nullptr;
+    float* d_one_bit_factor_ = nullptr;
+#endif
     bool   use_clustered_ = true;
 
     // Search parameters
@@ -260,6 +266,7 @@ struct gpu_mvr_index {
     } ws_{};
 
     // Constructor / destructor
+    gpu_mvr_index() = default;
     gpu_mvr_index(
         const std::string& filename,
         const std::vector<int>& doc_lens,

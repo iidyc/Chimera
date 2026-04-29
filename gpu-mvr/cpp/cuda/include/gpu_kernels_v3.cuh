@@ -33,6 +33,17 @@ __global__ void stage2_binary_ip_kernel_v2(
     size_t batch_tokens
 );
 
+__global__ void stage2_binary_ip_doc_kernel_v2(
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_token_ids,
+    float* __restrict__ d_out_dists,
+    size_t total_tokens,
+    size_t batch_tokens
+);
+
 __global__ void precompute_lut_kernel(
     const float* __restrict__ d_queries,
     float* __restrict__ d_lut
@@ -87,6 +98,17 @@ __global__ void stage2_binary_ip_lut_kernel(
     size_t batch_tokens
 );
 
+__global__ void stage2_binary_ip_lut_doc_kernel(
+    const float* __restrict__ d_lut,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const uint32_t* __restrict__ d_token_ids,
+    float* __restrict__ d_out_dists,
+    size_t total_tokens,
+    size_t batch_tokens
+);
+
 __global__ void doc_score_kernel(
     const float*  __restrict__ d_token_dists,
     const size_t* __restrict__ d_candidate_offsets,
@@ -121,6 +143,14 @@ __global__ void gather_clustered_positions_kernel(
     const uint32_t* __restrict__ d_token_to_cluster_pos,
     const size_t* __restrict__ d_candidate_offsets,
     uint32_t*     d_out_clustered_pos,
+    size_t num_candidates
+);
+
+__global__ void gather_doc_token_ids_kernel(
+    const int*    __restrict__ d_candidate_doc_ids,
+    const int*    __restrict__ d_doc_ptrs,
+    const size_t* __restrict__ d_candidate_offsets,
+    uint32_t*     d_out_token_ids,
     size_t num_candidates
 );
 

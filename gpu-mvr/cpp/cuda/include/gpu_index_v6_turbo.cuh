@@ -1,7 +1,7 @@
 #pragma once
 
-#ifdef GPU_MVR_USE_LUT
-#undef GPU_MVR_USE_LUT
+#ifndef GPU_MVR_USE_LUT
+#define GPU_MVR_USE_LUT 1
 #endif
 
 #include <cuda_runtime.h>
@@ -46,8 +46,7 @@
 #include "query.hpp"
 #include "ivf_pg.hpp"
 #include "gpu_config.cuh"
-#include "gpu_kernels_v6_nolut.cuh"
-#include "gpu_kernels_v0.cuh"
+#include "gpu_kernels_v6_lite.cuh"
 
 using namespace rabitqlib;
 
