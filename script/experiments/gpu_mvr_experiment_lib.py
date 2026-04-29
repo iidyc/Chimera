@@ -18,9 +18,9 @@ from typing import Iterable
 
 DATASETS = ("lotte", "msmarco", "hotpot")
 DATASET_CONFIG_CANDIDATES = {
-    "lotte": ("config/latte_config.csv", "profiling/lotte_config.csv", "profiling/latte_config.csv"),
-    "msmarco": ("config/msmarco_config.csv", "profiling/msmarco_config.csv"),
-    "hotpot": ("config/hotpot_config.csv", "profiling/hotpot_config.csv"),
+    "lotte": ("config/latte_config.csv",),
+    "msmarco": ("config/msmarco_config.csv",),
+    "hotpot": ("config/hotpot_config.csv",),
 }
 
 
@@ -120,7 +120,7 @@ GPU_LATENCY_RE = re.compile(r"^\[SEARCH\] Query latency distribution \(ms\): (.+
 
 
 def repo_root_from_script() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[2]
 
 
 def utc_run_id() -> str:
