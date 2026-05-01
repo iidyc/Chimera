@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-  datasets/chimera/build_all_indices.sh [--n-clusters <count>] [--dry-run]
+  data_curation/chimera/build_all_indices.sh [--n-clusters <count>] [--dry-run]
 
 Description:
   Build Chimera indices for the default dataset set:
@@ -13,7 +13,7 @@ Description:
     hotpot
     msmarco
 
-  This is a thin wrapper around datasets/chimera/build_index.sh and writes the
+  This is a thin wrapper around data_curation/chimera/build_index.sh and writes the
   default per-dataset index output under dataset/<name>/gpu_search_2m/ plus a
   unique raw build log under backup/log/build/<dataset>/<index_dir>/.
 

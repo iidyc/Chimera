@@ -13,8 +13,8 @@ Usage:
 
 import argparse
 import numpy as np
-import torch
 import time
+from pathlib import Path
 
 
 def load_queries(path):
@@ -83,6 +83,9 @@ def maxsim_batch(Q_sub, D_padded, mask):
 
 def compute_topk(emb_path, doclens_path, queries_path, output_path,
                  doc_batch_size=100000, topk=1000):
+    import torch
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Q_np = load_queries(queries_path)
     doclens = load_doclens(doclens_path)
     total_n, d, emb = mmap_embeddings(emb_path)

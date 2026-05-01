@@ -5,8 +5,8 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-  datasets/chimera/build_index.sh [dataset_name] [options]
-  datasets/chimera/build_index.sh --dataset <name> [options]
+  data_curation/chimera/build_index.sh [dataset_name] [options]
+  data_curation/chimera/build_index.sh --dataset <name> [options]
 
 Description:
   Build a Chimera index from raw dataset files using Chimera/build/gpu_build.
@@ -28,6 +28,8 @@ Outputs:
 Arguments:
   dataset_name           Dataset name under dataset/. Defaults to hotpot.
   --dataset <name>       Same as the positional dataset argument.
+  --dataset-root <path>  Root containing dataset directories.
+                         Default: <repo>/dataset.
   --n-clusters <count>   Number of IVF/CAGRA centroids.
                          Accepts 2M=2000000 and 1M=1000000. Default: 2000000.
   --copy-raw-to-tmp      Copy raw/data.bin and raw/doclens.bin into /tmp first.
@@ -88,6 +90,7 @@ make_run_id() {
 }
 
 dataset_name="hotpot"
+dataset_root=""
 n_clusters="2000000"
 copy_raw_to_tmp=0
 refresh_tmp_raw=0
@@ -107,6 +110,11 @@ while [[ $# -gt 0 ]]; do
         --n-clusters)
             [[ $# -ge 2 ]] || die "missing value for --n-clusters"
             n_clusters="$2"
+            shift 2
+            ;;
+        --dataset-root)
+            [[ $# -ge 2 ]] || die "missing value for --dataset-root"
+            dataset_root="$2"
             shift 2
             ;;
         --copy-raw-to-tmp)
@@ -162,6 +170,9 @@ esac
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
+if [[ -z "$dataset_root" ]]; then
+    dataset_root="${repo_root}/dataset"
+fi
 
 gpu_build_bin="${repo_root}/Chimera/build/gpu_build"
 use_micromamba="${CHIMERA_USE_MICROMAMBA:-${GPU_MVR_USE_MICROMAMBA:-1}}"
@@ -170,7 +181,7 @@ if [[ "$use_micromamba" != "0" ]]; then
     micromamba_bin="$(command -v micromamba || true)"
 fi
 builder_env_name="${CHIMERA_MICROMAMBA_ENV:-${GPU_MVR_MICROMAMBA_ENV:-chimera}}"
-dataset_dir="${repo_root}/dataset/${dataset_name}"
+dataset_dir="${dataset_root}/${dataset_name}"
 raw_dir="${dataset_dir}/raw"
 data_file="${raw_dir}/data.bin"
 doclens_file="${raw_dir}/doclens.bin"

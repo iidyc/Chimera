@@ -9,7 +9,7 @@ This repository separates source code from reproducible experiment, setup, and d
 - `ColBERT/`: ColBERT/PLAID source tree.
 - `experiment/`: benchmark, comparison, profiling, and ablation drivers.
 - `setup/`: environment creation and build entrypoints.
-- `datasets/`: raw data preparation, metadata generation, and index construction drivers.
+- `data_curation/`: raw data preparation, metadata generation, and index construction drivers.
 - `dataset/`: local dataset inputs and generated indexes.
 - `profiling/`: benchmark CSV outputs.
 - `backup/log/`: archived run logs.
@@ -32,26 +32,60 @@ setup/build_igp.sh
 setup/build_plaid.sh
 ```
 
-3. Prepare PLAID datasets and embeddings:
+3. Download raw text datasets:
 
 ```bash
-datasets/plaid/prep_dataset.sh
-python datasets/plaid/encode_dataset.py <dataset>
-python datasets/plaid/encode_queries.py <dataset>
+python data_curation/download/download_raw_text.py --dataset all
 ```
 
-4. Build indexes:
+This writes `dataset/<name>/text/collection.tsv`, `queries.tsv`, `qrels.tsv`,
+and `metadata.json` for `lotte`, `hotpot`, and `msmarco`. Use
+`--dataset lotte`, `--dataset hotpot`, or `--dataset msmarco` to download one
+dataset at a time.
+
+LoTTE uses the ColBERTv2 release (`colbertv2/lotte_passages`) and downloads the
+pooled `dev` search split, which matches the artifact's 2,931-query LoTTE
+Pooled setup. HotpotQA and MS MARCO are downloaded through the official-source
+scripts in `data_curation/plaid/`: HotpotQA uses the BEIR archive
+`hotpotqa.zip`, and MS MARCO uses Microsoft's `collectionandqueries.tar.gz`.
+Those scripts also write `query_id_map.tsv` because the benchmark files use
+local sequential query ids.
+
+4. Create experiment binary inputs:
 
 ```bash
-datasets/chimera/build_index.sh --dataset lotte
-datasets/chimera/build_all_indices.sh
-python datasets/igp/build_index.py --dataset lotte
-python datasets/plaid/build_colbert_index.py --dataset lotte
+data_curation/create_raw_binaries.sh --dataset all --gpus auto
+```
+
+This encodes `collection.tsv` into `raw/data.bin` and `raw/doclens.bin`,
+encodes `queries.tsv` into `raw/query.bin`, and generates the top-1000
+reference ranking `raw/gt.tsv`. Document encoding streams the collection in
+chunks and, when multiple GPUs are visible, encodes contiguous shards in
+parallel before streaming them back into one ordered `data.bin`/`doclens.bin`
+pair. Generating `gt.tsv` is a brute-force MaxSim pass and is usually the most
+expensive data-curation step.
+
+To run the entire data-preparation pipeline for one dataset:
+
+```bash
+data_curation/prepare_dataset.sh --dataset lotte --gpus auto
+```
+
+Use `--skip-gt` when you only need embeddings for index construction and do not
+need benchmark recall yet.
+
+5. Build indexes:
+
+```bash
+data_curation/chimera/build_index.sh --dataset lotte
+data_curation/chimera/build_all_indices.sh
+python data_curation/igp/build_index.py --dataset lotte
+python data_curation/plaid/build_colbert_index.py --dataset lotte
 ```
 
 Default outputs are under `dataset/<name>/gpu_search_2m/`, `dataset/<name>/igp/`, and the ColBERT experiment root configured by the PLAID scripts. Chimera experiment drivers also detect older generated index directories for compatibility.
 
-5. Run benchmarks:
+6. Run benchmarks:
 
 ```bash
 experiment/chimera/bench_gpu_search.sh --dataset lotte --version gpu_search --binary Chimera/build/gpu_search
@@ -60,7 +94,7 @@ experiment/plaid/bench_colbert.sh --dataset lotte
 experiment/plaid_plus/run_plaid_vs_gpu_search_main.sh --execute
 ```
 
-6. Run ablations:
+7. Run ablations:
 
 ```bash
 experiment/ablation/run_gpu_search_lut_ablation.py

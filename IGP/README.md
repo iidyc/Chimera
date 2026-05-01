@@ -19,7 +19,7 @@ Install the necessary library when the system reports an error
 
 ## Important scripts
 
-- `datasets/igp/build_index.py`, build the index of plaid, it also generates the embedding
+- `data_curation/igp/build_index.py`, build the index of plaid, it also generates the embedding
 - `IGP/script/data/build_index_by_sample.py`, if you want to test the program in a small dataset, use this one
 - `IGP/script/evaluation/eval_igp.py`, implementation of IGP. This implementation uses the single-threaded version from the GIGP+ paper, which is faster than the original IGP implementation while producing identical results.
 - `IGP/script/evaluation/eval_igp_gpu_pp.py`, implementation of GIGP+

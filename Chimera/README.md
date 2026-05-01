@@ -1,6 +1,6 @@
 # Chimera
 
-Chimera is the C++/CUDA source tree for building and searching the Chimera document-token retrieval index. Experiment launchers, dataset pipelines, and environment scripts live at the repository root in `experiment/`, `datasets/`, and `setup/`.
+Chimera is the C++/CUDA source tree for building and searching the Chimera document-token retrieval index. Experiment launchers, dataset pipelines, and environment scripts live at the repository root in `experiment/`, `data_curation/`, and `setup/`.
 
 ## Layout
 
@@ -98,7 +98,7 @@ The full GPU index directory also includes:
 Use the root dataset pipeline:
 
 ```bash
-datasets/chimera/build_index.sh --dataset lotte --n-clusters 2000000
+data_curation/chimera/build_index.sh --dataset lotte --n-clusters 2000000
 ```
 
 Direct binary example:
