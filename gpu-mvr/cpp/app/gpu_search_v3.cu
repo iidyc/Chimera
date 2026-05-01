@@ -85,7 +85,11 @@ int main(int argc, char** argv) {
         query_latencies_ms.reserve(run_queries);
         for (int i = 0; i < run_queries; ++i) {
             const auto query_start = std::chrono::high_resolution_clock::now();
-            results[i] = index.search(&Q[i * Q_DOCLEN * d], args.k);
+            if (args.profile_eval_all_queries) {
+                results[i] = index.search_profiled(&Q[i * Q_DOCLEN * d], args.k);
+            } else {
+                results[i] = index.search(&Q[i * Q_DOCLEN * d], args.k);
+            }
             const auto query_end = std::chrono::high_resolution_clock::now();
             query_latencies_ms.push_back(
                 std::chrono::duration<double, std::milli>(query_end - query_start).count());

@@ -359,20 +359,17 @@ class RerankPP {
     //     raft::identity_op()
     // );
 
-    raft::linalg::reduce(
+    raft::linalg::reduce<true, false>(
         score_l_gpu_,
         max_score_l_gpu_,
         probe_topk_,
         query_n_vec_,
         0.0f,
-        true,
-        false,
         resource_->stream_l_[threadID_],
         false,
         raft::identity_op(),
         raft::add_op(),
-        raft::identity_op()
-    );
+        raft::identity_op());
     CHECK(cudaStreamSynchronize(resource_->stream_l_[threadID_]));
     nvtxRangePop();
     resource_->ReleaseCompResource(threadID_);

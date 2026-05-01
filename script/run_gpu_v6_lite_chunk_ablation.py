@@ -7,7 +7,10 @@ import re
 import subprocess
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 
 DATASET_PATHS = {
@@ -307,6 +310,9 @@ def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> 
 
 
 def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
+    if plt is None:
+        print("[skip] matplotlib is not installed; skipping qps plot rendering", flush=True)
+        return
     if not rows:
         return
     titles = {"lotte": "LoTTE", "msmarco": "MSMARCO", "hotpot": "HotpotQA"}

@@ -9,6 +9,8 @@
 #include <raft/matrix/detail/select_k-inl.cuh>
 #include <thrust/unique.h>
 #include <thrust/binary_search.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
 #include <raft/linalg/reduce.cuh>
 
 #include <cooperative_groups.h>
@@ -362,20 +364,17 @@ class FilterPP
     //    spdlog::info("start filter-add_score");
     blockSize = 1024;
     gridSize = (n_item_cand_ + blockSize - 1) / blockSize;
-    raft::linalg::reduce(
+    raft::linalg::reduce<true, true>(
         item_score_l_gpu_,
         qvec_max_score_l_gpu_,
         query_n_vec_,
         n_item_cand_,
         0.0f,
-        true,
-        true,
         resource_->stream_l_[threadID_],
         false,
         raft::identity_op(),
         raft::add_op(),
-        raft::identity_op()
-    );
+        raft::identity_op());
     // add_score<<<gridSize, blockSize>>>(qvec_max_score_l_gpu_,
     // n_item_cand,
     // item_vec_info_.n_item_, query_n_vec_,

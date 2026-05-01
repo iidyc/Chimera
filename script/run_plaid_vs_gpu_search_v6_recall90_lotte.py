@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 
 @dataclass
 class SystemSummary:
+    dataset: str
     system: str
     config: str
     recall: float
@@ -21,6 +22,7 @@ class SystemSummary:
     raw_total_ms: float
     centroid_search_raw_ms: float
     ivf_data_transfer_raw_ms: float
+    ivf_data_transfer_raw_bytes: float
     ivf_scanning_raw_ms: float
     doc_score_aggregate_raw_ms: float
     reranking_raw_ms: float
@@ -35,6 +37,7 @@ class SystemSummary:
         scale = self.scale_to_latency
         return {
             "system": self.system,
+            "dataset": self.dataset,
             "config": self.config,
             "recall": self.recall,
             "qps": self.qps,
@@ -43,6 +46,8 @@ class SystemSummary:
             "scale_to_latency": scale,
             "centroid_search_ms": self.centroid_search_raw_ms * scale,
             "ivf_data_transfer_ms": self.ivf_data_transfer_raw_ms * scale,
+            "ivf_data_transfer_raw_bytes": self.ivf_data_transfer_raw_bytes,
+            "ivf_data_transfer_raw_mib": self.ivf_data_transfer_raw_bytes / (1024.0 * 1024.0),
             "ivf_scanning_ms": self.ivf_scanning_raw_ms * scale,
             "doc_score_aggregate_ms": self.doc_score_aggregate_raw_ms * scale,
             "reranking_ms": self.reranking_raw_ms * scale,
@@ -63,10 +68,22 @@ GPU_CONFIG = {
     "overlap_chunks": 4,
 }
 
-PLAID_CONFIG = {
-    "label": "c4m",
-    "ncells": 2,
-    "ndocs": 3000,
+DATASET_CONFIGS = {
+    "lotte": {
+        "plaid_label": "c4m",
+        "plaid_ncells": 2,
+        "plaid_ndocs": 3000,
+    },
+    "msmarco": {
+        "plaid_label": "c4",
+        "plaid_ncells": 2,
+        "plaid_ndocs": 2000,
+    },
+    "hotpot": {
+        "plaid_label": "k1",
+        "plaid_ncells": 2,
+        "plaid_ndocs": 2000,
+    },
 }
 
 PHASE_ORDER = [
@@ -80,7 +97,7 @@ PHASE_ORDER = [
 
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
-    default_output = repo_root / "profiling" / "lotte" / "plaid_vs_gpu_search_recall90_k100"
+    default_output = repo_root / "profiling" / "plaid_vs_gpu_search_recall90_k100"
     p = argparse.ArgumentParser(
         description=(
             "Reproduce the LoTTE recall~0.9 latency breakdown comparison between "
@@ -91,9 +108,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=default_output)
     p.add_argument("--build-dir", type=Path, default=repo_root / "gpu-mvr" / "build")
     p.add_argument("--colbert-python", type=Path, default=Path("/data/juelin/conda/envs/colbert/bin/python"))
+    p.add_argument("--datasets", nargs="+", choices=sorted(DATASET_CONFIGS), default=["lotte"])
     p.add_argument("--k", type=int, default=100)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--reuse-existing", action="store_true")
+    p.add_argument("--skip-missing-index", action="store_true")
     p.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", ""))
     p.add_argument(
         "--systems",
@@ -103,6 +122,17 @@ def parse_args() -> argparse.Namespace:
         help="Systems to include in the comparison.",
     )
     return p.parse_args()
+
+
+def dataset_paths(args: argparse.Namespace, dataset: str) -> dict[str, Path]:
+    dataset_root = args.repo_root / "dataset" / dataset
+    return {
+        "root": dataset_root,
+        "query": dataset_root / "raw" / "query.bin",
+        "gt": dataset_root / "raw" / "gt.tsv",
+        "colbert_index": dataset_root / "colbert" / "indexes" / "4bit",
+        "gpu_index": dataset_root / "gpu_mvr_2m",
+    }
 
 
 def run_logged(cmd: list[str], log_path: Path, env: dict[str, str] | None = None, reuse: bool = False) -> None:
@@ -144,17 +174,18 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def run_gpu_timed(args: argparse.Namespace, system: str) -> tuple[Path, float, float, float]:
+def run_gpu_timed(args: argparse.Namespace, dataset: str, system: str, output_dir: Path) -> tuple[Path, float, float, float]:
     binary = args.build_dir / system
     if not binary.exists():
         raise FileNotFoundError(f"missing {system} binary: {binary}")
 
-    log_path = args.output_dir / f"{system}_{GPU_CONFIG['label']}_timed.log"
+    paths = dataset_paths(args, dataset)
+    log_path = output_dir / f"{system}_{GPU_CONFIG['label']}_timed.log"
     cmd = [
         str(binary),
-        "--query", str(args.repo_root / "dataset" / "lotte" / "raw" / "query.bin"),
-        "--gt", str(args.repo_root / "dataset" / "lotte" / "raw" / "gt.tsv"),
-        "--index", str(args.repo_root / "dataset" / "lotte" / "gpu_mvr_2m"),
+        "--query", str(paths["query"]),
+        "--gt", str(paths["gt"]),
+        "--index", str(paths["gpu_index"]),
         "--k", str(args.k),
         "--nprobe", str(GPU_CONFIG["nprobe"]),
         "--k-rank-cluster", str(GPU_CONFIG["k_rank_cluster"]),
@@ -176,19 +207,42 @@ def run_gpu_timed(args: argparse.Namespace, system: str) -> tuple[Path, float, f
     return log_path, qps, latency, recall
 
 
-def run_gpu_profile(args: argparse.Namespace, system: str) -> tuple[Path, dict[str, float]]:
+def parse_gpu_transfer_metrics(text: str, prefix: str) -> dict[str, float]:
+    def parse_line(label: str) -> tuple[float, float]:
+        match = re.search(
+            prefix + r"\s+" + re.escape(label) + r":\s+([0-9.]+)\s+ms,\s+([0-9]+)\s+bytes",
+            text,
+        )
+        if not match:
+            return 0.0, 0.0
+        return float(match.group(1)), float(match.group(2))
+
+    h2d_ms, h2d_bytes = parse_line("H2D")
+    d2h_ms, d2h_bytes = parse_line("D2H")
+    total_ms, total_bytes = parse_line("Total transfer")
+    if total_ms == 0.0 and (h2d_ms or d2h_ms):
+        total_ms = h2d_ms + d2h_ms
+        total_bytes = h2d_bytes + d2h_bytes
+    return {
+        "ivf_data_transfer_raw_ms": total_ms,
+        "ivf_data_transfer_raw_bytes": total_bytes,
+    }
+
+
+def run_gpu_profile(args: argparse.Namespace, dataset: str, system: str, output_dir: Path) -> tuple[Path, dict[str, float]]:
     binary = args.build_dir / system
     use_avg_profile = system in {"gpu_search_v6", "gpu_search_v8"}
-    log_path = args.output_dir / (
+    paths = dataset_paths(args, dataset)
+    log_path = output_dir / (
         f"{system}_{GPU_CONFIG['label']}_profile_avg.log"
         if use_avg_profile else
         f"{system}_{GPU_CONFIG['label']}_profile.log"
     )
     cmd = [
         str(binary),
-        "--query", str(args.repo_root / "dataset" / "lotte" / "raw" / "query.bin"),
-        "--gt", str(args.repo_root / "dataset" / "lotte" / "raw" / "gt.tsv"),
-        "--index", str(args.repo_root / "dataset" / "lotte" / "gpu_mvr_2m"),
+        "--query", str(paths["query"]),
+        "--gt", str(paths["gt"]),
+        "--index", str(paths["gpu_index"]),
         "--k", str(args.k),
         "--nprobe", str(GPU_CONFIG["nprobe"]),
         "--k-rank-cluster", str(GPU_CONFIG["k_rank_cluster"]),
@@ -217,20 +271,33 @@ def run_gpu_profile(args: argparse.Namespace, system: str) -> tuple[Path, dict[s
     ivf_scanning = expansion + binary_ip
     doc_score_aggregate = max(stage1 - centroid - ivf_scanning, 0.0)
     reranking = max(total - stage1, 0.0)
+    transfer = parse_gpu_transfer_metrics(text, prefix)
     return log_path, {
         "raw_total_ms": total,
         "centroid_search_raw_ms": centroid,
-        "ivf_data_transfer_raw_ms": 0.0,
         "ivf_scanning_raw_ms": ivf_scanning,
         "doc_score_aggregate_raw_ms": doc_score_aggregate,
         "reranking_raw_ms": reranking,
+        **transfer,
     }
 
 
-def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float, float, float, dict[str, float]]:
-    timed_csv = args.output_dir / "plaid_c4m_timed.csv"
-    profile_csv = args.output_dir / "plaid_c4m_profile.csv"
-    log_path = args.output_dir / "plaid_c4m.log"
+def run_plaid_search(
+    args: argparse.Namespace,
+    dataset: str,
+    output_dir: Path,
+) -> tuple[Path, Path, Path, float, float, float, dict[str, float]]:
+    config = DATASET_CONFIGS[dataset]
+    label = config["plaid_label"]
+    ncells = int(config["plaid_ncells"])
+    ndocs = int(config["plaid_ndocs"])
+    paths = dataset_paths(args, dataset)
+    if not paths["colbert_index"].exists():
+        raise FileNotFoundError(f"missing ColBERT index for {dataset}: {paths['colbert_index']}")
+
+    timed_csv = output_dir / f"plaid_{label}_timed.csv"
+    profile_csv = output_dir / f"plaid_{label}_profile.csv"
+    log_path = output_dir / f"plaid_{label}.log"
 
     if not (args.reuse_existing and timed_csv.exists() and profile_csv.exists() and log_path.exists()):
         ensure_parent(log_path)
@@ -240,21 +307,32 @@ def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float,
             profile_csv.unlink()
         env = os.environ.copy()
         env["PYTHONPATH"] = str(args.repo_root / "ColBERT")
+        env["TORCH_EXTENSIONS_DIR"] = str(args.repo_root / ".cache" / "torch_extensions" / "colbert")
+        env["CUDA_HOME"] = str(args.colbert_python.parent.parent)
+        env["PATH"] = f"{args.colbert_python.parent}:{env.get('PATH', '')}"
+        env["LD_LIBRARY_PATH"] = ":".join([
+            str(args.colbert_python.parent.parent / "lib"),
+            str(args.colbert_python.parent.parent / "lib64"),
+            env.get("LD_LIBRARY_PATH", ""),
+        ])
+        env["CC"] = str(args.colbert_python.parent / "x86_64-conda-linux-gnu-cc")
+        env["CXX"] = str(args.colbert_python.parent / "x86_64-conda-linux-gnu-c++")
+        env["CUDAHOSTCXX"] = env["CXX"]
         if args.cuda_visible_devices:
             env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
         cmd = [
             str(args.colbert_python),
             str(args.repo_root / "ColBERT" / "experiment" / "search.py"),
-            "--root-path", str(args.repo_root / "dataset" / "lotte"),
+            "--root-path", str(paths["root"]),
             "--experiment-name", "colbert",
             "--index-name", "4bit",
-            "--query-path", str(args.repo_root / "dataset" / "lotte" / "raw" / "query.bin"),
-            "--ground-truth-path", str(args.repo_root / "dataset" / "lotte" / "raw" / "gt.tsv"),
+            "--query-path", str(paths["query"]),
+            "--ground-truth-path", str(paths["gt"]),
             "--output-csv", str(timed_csv),
-            "--pairs", f"{PLAID_CONFIG['ncells']},{PLAID_CONFIG['ndocs']}",
+            "--pairs", f"{ncells},{ndocs}",
             "--k", str(args.k),
             "--warmup", str(args.warmup),
-            "--dataset-name", "lotte",
+            "--dataset-name", dataset,
             "--implementation-label", "PLAID",
             "--profile-breakdown-csv", str(profile_csv),
         ]
@@ -274,7 +352,7 @@ def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float,
     profile_rows = []
     with profile_csv.open() as handle:
         for row in csv.DictReader(handle):
-            if int(row["ncells"]) != PLAID_CONFIG["ncells"] or int(row["ndocs"]) != PLAID_CONFIG["ndocs"]:
+            if int(row["ncells"]) != ncells or int(row["ndocs"]) != ndocs:
                 continue
             profile_rows.append(row)
     if not profile_rows:
@@ -290,10 +368,16 @@ def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float,
         for row in profile_rows
         if row["metric_type"] == "transfer_h2d"
     }
+    transfer_mib = {
+        row["metric_name"]: float(row["avg_mib"] or 0.0)
+        for row in profile_rows
+        if row["metric_type"] == "transfer_h2d"
+    }
 
     raw_total = stage_metrics["search.total"]
     centroid = stage_metrics["candidate.centroid_score"] + stage_metrics["candidate.cell_select"]
     ivf_transfer = sum(transfer_metrics.values())
+    ivf_transfer_bytes = sum(value * 1024.0 * 1024.0 for value in transfer_mib.values())
     ivf_scanning = stage_metrics["candidate.ivf_lookup"] + stage_metrics["candidate.pid_dedup"]
     doc_score_aggregate = max(raw_total - centroid - ivf_transfer - ivf_scanning, 0.0)
 
@@ -308,6 +392,7 @@ def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float,
             "raw_total_ms": raw_total,
             "centroid_search_raw_ms": centroid,
             "ivf_data_transfer_raw_ms": ivf_transfer,
+            "ivf_data_transfer_raw_bytes": ivf_transfer_bytes,
             "ivf_scanning_raw_ms": ivf_scanning,
             "doc_score_aggregate_raw_ms": doc_score_aggregate,
             "reranking_raw_ms": 0.0,
@@ -318,6 +403,7 @@ def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float,
 def write_comparison_csv(output_csv: Path, rows: list[dict]) -> None:
     ensure_parent(output_csv)
     fieldnames = [
+        "dataset",
         "system",
         "config",
         "recall",
@@ -327,6 +413,8 @@ def write_comparison_csv(output_csv: Path, rows: list[dict]) -> None:
         "scale_to_latency",
         "centroid_search_ms",
         "ivf_data_transfer_ms",
+        "ivf_data_transfer_raw_bytes",
+        "ivf_data_transfer_raw_mib",
         "ivf_scanning_ms",
         "doc_score_aggregate_ms",
         "reranking_ms",
@@ -342,7 +430,7 @@ def write_comparison_csv(output_csv: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def plot_latency_breakdown(output_root: Path, rows: list[dict]) -> None:
+def plot_latency_breakdown(output_root: Path, dataset: str, rows: list[dict]) -> None:
     fig, ax = plt.subplots(figsize=(5.6, 3.0))
     systems = [row["system"] for row in rows]
     x = list(range(len(rows)))
@@ -360,7 +448,7 @@ def plot_latency_breakdown(output_root: Path, rows: list[dict]) -> None:
         for row in rows
     ])
     compared = " vs ".join(row["system"] for row in rows)
-    ax.set_title(f"LoTTE: {compared} at Recall@100 ≈ 0.9")
+    ax.set_title(f"{dataset}: {compared} at Recall@100 ≈ 0.9")
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.28), ncol=3, frameon=False, fontsize=8)
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.set_axisbelow(True)
@@ -379,74 +467,99 @@ def main() -> int:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    summaries: list[SystemSummary] = []
+    all_rows: list[dict] = []
     extra_paths: list[str] = []
 
-    if "plaid" in args.systems:
-        plaid_log, plaid_timed_csv, plaid_profile_csv, plaid_qps, plaid_latency, plaid_recall, plaid_breakdown = run_plaid_search(args)
-        summaries.append(
-            SystemSummary(
-                system="PLAID",
-                config=f"{PLAID_CONFIG['label']} (ncells={PLAID_CONFIG['ncells']}, ndocs={PLAID_CONFIG['ndocs']})",
-                recall=plaid_recall,
-                qps=plaid_qps,
-                avg_latency_ms=plaid_latency,
-                **plaid_breakdown,
+    for dataset in args.datasets:
+        dataset_output_dir = args.output_dir / dataset if len(args.datasets) > 1 else args.output_dir
+        dataset_output_dir.mkdir(parents=True, exist_ok=True)
+        summaries: list[SystemSummary] = []
+        config = DATASET_CONFIGS[dataset]
+
+        if "plaid" in args.systems:
+            try:
+                plaid_log, plaid_timed_csv, plaid_profile_csv, plaid_qps, plaid_latency, plaid_recall, plaid_breakdown = run_plaid_search(args, dataset, dataset_output_dir)
+            except FileNotFoundError as exc:
+                if args.skip_missing_index:
+                    print(f"[skip] dataset={dataset} reason={exc}")
+                    continue
+                raise
+            summaries.append(
+                SystemSummary(
+                    dataset=dataset,
+                    system="PLAID",
+                    config=(
+                        f"{config['plaid_label']} "
+                        f"(ncells={config['plaid_ncells']}, ndocs={config['plaid_ndocs']})"
+                    ),
+                    recall=plaid_recall,
+                    qps=plaid_qps,
+                    avg_latency_ms=plaid_latency,
+                    **plaid_breakdown,
+                )
             )
-        )
-        extra_paths.extend([
-            f"[logs] plaid={plaid_log}",
-            f"[csv] plaid_timed={plaid_timed_csv}",
-            f"[csv] plaid_profile={plaid_profile_csv}",
-        ])
+            extra_paths.extend([
+                f"[logs] {dataset}_plaid={plaid_log}",
+                f"[csv] {dataset}_plaid_timed={plaid_timed_csv}",
+                f"[csv] {dataset}_plaid_profile={plaid_profile_csv}",
+            ])
 
-    for system in ("gpu_search_v6", "gpu_search_v8"):
-        if system not in args.systems:
-            continue
-        gpu_timed_log, gpu_qps, gpu_latency, gpu_recall = run_gpu_timed(args, system)
-        gpu_profile_log, gpu_breakdown = run_gpu_profile(args, system)
-        summaries.append(
-            SystemSummary(
-                system=system,
-                config=GPU_CONFIG["label"],
-                recall=gpu_recall,
-                qps=gpu_qps,
-                avg_latency_ms=gpu_latency,
-                **gpu_breakdown,
+        for system in ("gpu_search_v6", "gpu_search_v8"):
+            if system not in args.systems:
+                continue
+            gpu_timed_log, gpu_qps, gpu_latency, gpu_recall = run_gpu_timed(args, dataset, system, dataset_output_dir)
+            gpu_profile_log, gpu_breakdown = run_gpu_profile(args, dataset, system, dataset_output_dir)
+            summaries.append(
+                SystemSummary(
+                    dataset=dataset,
+                    system=system,
+                    config=GPU_CONFIG["label"],
+                    recall=gpu_recall,
+                    qps=gpu_qps,
+                    avg_latency_ms=gpu_latency,
+                    **gpu_breakdown,
+                )
             )
-        )
-        extra_paths.extend([
-            f"[logs] {system}_timed={gpu_timed_log}",
-            f"[logs] {system}_profile={gpu_profile_log}",
-        ])
+            extra_paths.extend([
+                f"[logs] {dataset}_{system}_timed={gpu_timed_log}",
+                f"[logs] {dataset}_{system}_profile={gpu_profile_log}",
+            ])
 
-    gpu_recalls = {
-        summary.system: summary.recall
-        for summary in summaries
-        if summary.system in {"gpu_search_v6", "gpu_search_v8"}
-    }
-    if len(gpu_recalls) == 2:
-        v6_recall = gpu_recalls["gpu_search_v6"]
-        v8_recall = gpu_recalls["gpu_search_v8"]
-        if abs(v6_recall - v8_recall) > 1e-9:
-            raise RuntimeError(
-                "gpu_search_v6 and gpu_search_v8 should have identical recall in this script, "
-                f"but got {v6_recall:.12f} vs {v8_recall:.12f}"
-            )
+        gpu_recalls = {
+            summary.system: summary.recall
+            for summary in summaries
+            if summary.system in {"gpu_search_v6", "gpu_search_v8"}
+        }
+        if len(gpu_recalls) == 2:
+            v6_recall = gpu_recalls["gpu_search_v6"]
+            v8_recall = gpu_recalls["gpu_search_v8"]
+            if abs(v6_recall - v8_recall) > 1e-9:
+                raise RuntimeError(
+                    "gpu_search_v6 and gpu_search_v8 should have identical recall in this script, "
+                    f"but got {v6_recall:.12f} vs {v8_recall:.12f}"
+                )
 
-    rows = [summary.scaled_row() for summary in summaries]
-    comparison_csv = args.output_dir / "comparison.csv"
-    write_comparison_csv(comparison_csv, rows)
-    plot_latency_breakdown(args.output_dir, rows)
+        rows = [summary.scaled_row() for summary in summaries]
+        all_rows.extend(rows)
+        comparison_csv = dataset_output_dir / "comparison.csv"
+        write_comparison_csv(comparison_csv, rows)
+        plot_latency_breakdown(dataset_output_dir, dataset, rows)
+        print(f"[done] {dataset}_comparison_csv={comparison_csv}")
+        print(f"[done] {dataset}_plot_png={dataset_output_dir / 'latency_breakdown.png'}")
 
-    print(f"[done] comparison_csv={comparison_csv}")
-    print(f"[done] plot_png={args.output_dir / 'latency_breakdown.png'}")
+    transfer_csv = args.output_dir / "transfer_summary.csv"
+    write_comparison_csv(transfer_csv, all_rows)
+
+    print(f"[done] transfer_summary_csv={transfer_csv}")
     for line in extra_paths:
         print(line)
-    for summary in summaries:
+    for row in all_rows:
         print(
-            f"[summary] system={summary.system} config={summary.config} "
-            f"recall={summary.recall:.6f} qps={summary.qps:.3f} latency_ms={summary.avg_latency_ms:.3f}"
+            f"[summary] dataset={row['dataset']} system={row['system']} config={row['config']} "
+            f"recall={float(row['recall']):.6f} qps={float(row['qps']):.3f} "
+            f"latency_ms={float(row['avg_latency_ms']):.3f} "
+            f"transfer_ms={float(row['ivf_data_transfer_raw_ms']):.6f} "
+            f"transfer_mib={float(row['ivf_data_transfer_raw_mib']):.6f}"
         )
     return 0
 

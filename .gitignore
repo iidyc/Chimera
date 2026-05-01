@@ -2,4 +2,5 @@
 .vscode
 .codex
 .cache
+backup
 *__pycache__

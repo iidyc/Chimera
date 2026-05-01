@@ -92,6 +92,13 @@ def parse_args() -> argparse.Namespace:
         help="Number of CPU threads for IGP search. Default: all visible CPU cores.",
     )
     parser.add_argument(
+        "--n-bit",
+        type=int,
+        default=4,
+        choices=[1, 2, 4, 8],
+        help="Residual scalar quantization bits for the IGP index. Default: 4.",
+    )
+    parser.add_argument(
         "--configs",
         nargs="+",
         type=parse_config_spec,
@@ -170,7 +177,7 @@ def compute_recall_at_k(
     return recall_values, float(np.mean(recall_values))
 
 
-def load_igp_index_for_dataset(dataset: str, compile_module: bool):
+def load_igp_index_for_dataset(dataset: str, compile_module: bool, n_bit: int):
     repo = repo_root()
     configure_igp_env(repo, dataset)
     configure_igp_imports(repo)
@@ -192,7 +199,6 @@ def load_igp_index_for_dataset(dataset: str, compile_module: bool):
     n_vecs = int(np.sum(item_n_vec_l, dtype=np.uint64))
     vec_dim = dataset_io.embedding_dim(username="juelin", dataset=dataset)
     n_centroid = util.paper_n_centroid(n_vecs)
-    n_bit = 2
 
     constructor_insert_item = {
         "item_n_vec_l": item_n_vec_l.tolist(),
@@ -351,10 +357,14 @@ def benchmark_config_set(
     val_count: int,
     output_dir: Path,
     n_thread: int,
+    n_bit: int,
     configs: list[tuple[int, int]],
     query_split: str,
 ) -> Path:
-    runtime = load_igp_index_for_dataset(dataset, compile_module=compile_module)
+    runtime = load_igp_index_for_dataset(
+        dataset,
+        compile_module=compile_module,
+        n_bit=n_bit)
     query_l = runtime["query_l"]
     query_ids = runtime["query_ids"]
     n_query = len(query_l)
@@ -446,8 +456,12 @@ def benchmark_dataset(
     val_count: int,
     output_dir: Path,
     n_thread: int,
+    n_bit: int,
 ) -> Path:
-    runtime = load_igp_index_for_dataset(dataset, compile_module=compile_module)
+    runtime = load_igp_index_for_dataset(
+        dataset,
+        compile_module=compile_module,
+        n_bit=n_bit)
     query_l = runtime["query_l"]
     query_ids = runtime["query_ids"]
     n_query = len(query_l)
@@ -573,7 +587,8 @@ def main() -> int:
         for topk in args.topks:
             print(
                 f"[RUN] dataset={dataset} topk={topk} "
-                f"val_count={args.val_count} seed={args.seed} n_thread={args.threads}",
+                f"val_count={args.val_count} seed={args.seed} "
+                f"n_thread={args.threads} n_bit={args.n_bit}",
                 flush=True,
             )
             if args.configs:
@@ -585,6 +600,7 @@ def main() -> int:
                     val_count=args.val_count,
                     output_dir=out_dir,
                     n_thread=args.threads,
+                    n_bit=args.n_bit,
                     configs=args.configs,
                     query_split=args.query_split,
                 )
@@ -597,6 +613,7 @@ def main() -> int:
                     val_count=args.val_count,
                     output_dir=out_dir,
                     n_thread=args.threads,
+                    n_bit=args.n_bit,
                 )
             print(f"[DONE] wrote {output_path}", flush=True)
             produced.append(str(output_path))

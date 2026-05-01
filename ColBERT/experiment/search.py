@@ -136,6 +136,12 @@ def parse_args():
     p.add_argument("--k", type=int, default=100)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument(
+        "--num-runs",
+        type=int,
+        default=3,
+        help="Number of timed full-query passes to average before optional profiling.",
+    )
+    p.add_argument(
         "--compressed-embeddings-storage",
         choices=("cpu", "gpu"),
         default="cpu",
@@ -197,6 +203,8 @@ def main():
     print(f"Loaded document embeddings: {query_emb.shape}")
     if args.warmup < 0:
         raise ValueError("--warmup must be >= 0")
+    if args.num_runs <= 0:
+        raise ValueError("--num-runs must be > 0")
 
     warmup_queries = min(int(args.warmup), int(n))
     run_queries = int(n)
@@ -230,7 +238,7 @@ def main():
                     gpu_index_resident=args.gpu_index_resident,
                 )
                 searcher = Searcher(index=args.index_name, checkpoint=None, config=config)
-                num_runs = 3
+                num_runs = int(args.num_runs)
                 run_times = []
                 results = []
                 gpu_monitor = ProcessGpuMemoryMonitor()

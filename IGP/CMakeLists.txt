@@ -233,7 +233,16 @@ if (USE_CUDA)
     add_executable(IGPGPUPP src/app/IGPGPUPP.cpp)
     #    target_include_directories(IGPGPUPP PRIVATE /home/bianzheng/software/anaconda3/envs/sim_search/include/python3.8)
     #    target_include_directories(IGPGPUPP PRIVATE /usr/include/python3.10/include)
-    target_link_libraries(IGPGPUPP PRIVATE cnpy OpenMP::OpenMP_CXX CUDA::cublas spdlog::spdlog ${OpenBLAS_LIB} CUDA::cublasLt TBB::tbb)
+    target_link_libraries(IGPGPUPP PRIVATE
+            cnpy
+            OpenMP::OpenMP_CXX
+            CUDA::cublas
+            CUDA::cublasLt
+            spdlog::spdlog
+            ${OpenBLAS_LIB}
+            TBB::tbb
+            raft::raft
+            rmm::rmm)
     target_include_directories(IGPGPUPP PRIVATE ${CUDA_ENV_INCLUDE_DIRS} ${OpenBLAS_INCLUDE_DIR})
     set_target_properties(IGPGPUPP PROPERTIES CXX_STANDARD 17
             CXX_STANDARD_REQUIRED ON
