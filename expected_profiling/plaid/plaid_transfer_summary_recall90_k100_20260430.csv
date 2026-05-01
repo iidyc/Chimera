@@ -1,0 +1,4 @@
+dataset,plaid_config,recall_at_100,avg_query_latency_ms,qps,h2d_time_ms_per_query,h2d_amount_mib_per_query,h2d_bytes_per_query,h2d_speed_mib_per_s,transfer_direction_note
+HotpotQA,"ncells=4, ndocs=3000",0.917680,22.723,44.009,7.758461,56.123370,58849619,7233.83,H2D only; D2H not recorded by current profiler
+MS MARCO,"ncells=2, ndocs=2000",0.914539,16.700,59.879,6.766203,28.153141,29520708,4160.84,H2D only; D2H not recorded by current profiler
+LoTTE,"ncells=2, ndocs=3000",0.910000,17.960,55.680,7.068911,30.456903,31936378,4308.57,H2D only; D2H not recorded by current profiler

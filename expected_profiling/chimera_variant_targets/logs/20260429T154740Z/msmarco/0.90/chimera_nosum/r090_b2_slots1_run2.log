@@ -1,0 +1,9 @@
+[driver] command=/scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/gpu-mvr/build/gpu_search_nosum --query /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/msmarco/raw/query.bin --gt /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/msmarco/raw/gt.tsv --index /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/msmarco/gpu_mvr_2m --k 100 --nq -1 --warmup 5 --nprobe 64 --k-rank-cluster 1800 --k-rank-all-tokens 180 --itopk-size 96 --overlap-chunks 4 --concurrent-queries 1
+[driver] dataset=msmarco
+[driver] system=chimera_nosum
+[driver] config_label=r090_b2
+>>> Loaded 6980 queries, each with 32 embeddings of dimension 128
+>>> Loaded 8841823 document lengths
+[RUN] Constructing shared chimera index with 1 query slot(s) from /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/msmarco/gpu_mvr_2m using max runtime config: nprobe=64 k_rank_cluster=1800 k_rank_all_tokens=180 itopk_size=96 overlap_chunks=4
+FhtKacRotator is selected
+FhtKacRotator is selected

@@ -1,0 +1,153 @@
+[driver] command=/scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/gpu-mvr/build/gpu_search_nolut --query /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/hotpot/raw/query.bin --gt /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/hotpot/raw/gt.tsv --index /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/hotpot/gpu_mvr_2m --k 100 --nq -1 --warmup 5 --concurrent-queries 1 --config-file /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/config/tmp/chimera_variant_targets/20260429T164347Z/hotpot/chimera_nolut/targets090_095_slots1_runs3.csv
+[driver] dataset=hotpot
+[driver] system=chimera_nolut
+[driver] config_file=/scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/config/tmp/chimera_variant_targets/20260429T164347Z/hotpot/chimera_nolut/targets090_095_slots1_runs3.csv
+>>> Loaded 1000 queries, each with 32 embeddings of dimension 128
+>>> Loaded 5233329 document lengths
+[RUN] Constructing shared chimera index with 1 query slot(s) from /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/hotpot/gpu_mvr_2m using max runtime config: nprobe=384 k_rank_cluster=28000 k_rank_all_tokens=1800 itopk_size=448 overlap_chunks=6
+FhtKacRotator is selected
+FhtKacRotator is selected
+max cluster size: 3062
+FhtKacRotator is selected
+[gpu_mvr] Using cluster-ordered layout (7559.76 MB)
+[chimera] Stage1 align mode: compact_align with shifted cluster loads
+max cluster size: 3062
+workspace_probe_cluster_bound: 384
+workspace_probe_token_bound_per_query: 599336
+workspace_probe_unique_doc_bound_per_query: 554917
+max_compact_docs: 5233329  (num_docs=5233329)
+initial_compact_doc_capacity: 262144
+preallocated_compact_doc_capacity: 589824
+workspace_stage2_candidate_token_bound: 4586282
+workspace_stage2_topk_token_bound: 305161
+Initial GPU memory required for chimera workspace: 79.5744 MB
+[workspace][chimera] Growing compact doc capacity from 0 to 589824 rows (required=589824)
+[CONFIG] label=r090_q4_run1 nprobe=160 k_rank_cluster=5000 k_rank_all_tokens=500 itopk_size=224 overlap_chunks=6
+[CONFIG] concurrent_queries=1 effective_concurrent_queries=1 stage3_threads=32
+[PROFILE] Phase A (Data Preparation) wall: 2.29664 ms, GPU total: 0.056992 ms
+[PROFILE]   1. Gather doc lengths      : 0.007168 ms (CPU launch: 0.004771 ms)
+[PROFILE]   2. Prefix sum offsets      : 0.013312 ms (CPU launch: 0.010917 ms)
+[PROFILE]   3. Gather clustered pos    : 0.017408 ms (CPU launch: 0.00479 ms)
+[PROFILE]   4. D2H metadata + sync     : 0.019104 ms (CPU launch: 0.011977 ms)
+[PROFILE]   5. cudaStreamSynchronize   : 2.25231 ms
+[PROFILE]   6. cudaEventElapsedTime x5 : 0.009894 ms
+[PROFILE]   GPU sum accounted           : 0.056992 ms
+[PROFILE] Phase B wall time: 0.12759 ms
+[PROFILE] Phase C: wait_d2h=0.467 ms, topk=0.082 ms, identify=0.045 ms, prepare=0.001 ms, cpu_refine=0.455 ms, combine=0.033 ms (total=1.094 ms, 500 docs)
+[PROFILE] Total wall time for Phase A + B + C: 3.51843 ms
+[SEARCH] Total wall-clock time: 4.41319 ms
+[4.09477 s] label=r090_q4_run1 GPU search time for 1000 queries.
+[SEARCH] End-to-end measured time: 4094.770 ms
+[SEARCH] Average latency per query: 4.092 ms
+[SEARCH] Throughput: 244.214 qps
+[SEARCH] Query latency distribution (ms): min=3.261, p50=3.934, p90=4.406, p95=4.603, p99=9.544, max=13.138, stddev=0.956
+Recall@100: 0.91393
+Recall@10: 0.9442
+[CONFIG] label=r090_q4_run2 nprobe=160 k_rank_cluster=5000 k_rank_all_tokens=500 itopk_size=224 overlap_chunks=6
+[CONFIG] concurrent_queries=1 effective_concurrent_queries=1 stage3_threads=32
+[PROFILE] Phase A (Data Preparation) wall: 1.95556 ms, GPU total: 0.053856 ms
+[PROFILE]   1. Gather doc lengths      : 0.007168 ms (CPU launch: 0.004817 ms)
+[PROFILE]   2. Prefix sum offsets      : 0.012288 ms (CPU launch: 0.00999 ms)
+[PROFILE]   3. Gather clustered pos    : 0.016384 ms (CPU launch: 0.004564 ms)
+[PROFILE]   4. D2H metadata + sync     : 0.018016 ms (CPU launch: 0.011803 ms)
+[PROFILE]   5. cudaStreamSynchronize   : 1.91314 ms
+[PROFILE]   6. cudaEventElapsedTime x5 : 0.009531 ms
+[PROFILE]   GPU sum accounted           : 0.053856 ms
+[PROFILE] Phase B wall time: 0.128048 ms
+[PROFILE] Phase C: wait_d2h=0.374 ms, topk=0.089 ms, identify=0.041 ms, prepare=0.001 ms, cpu_refine=0.448 ms, combine=0.010 ms (total=0.974 ms, 500 docs)
+[PROFILE] Total wall time for Phase A + B + C: 3.05772 ms
+[SEARCH] Total wall-clock time: 3.88197 ms
+[3.95722 s] label=r090_q4_run2 GPU search time for 1000 queries.
+[SEARCH] End-to-end measured time: 3957.218 ms
+[SEARCH] Average latency per query: 3.957 ms
+[SEARCH] Throughput: 252.703 qps
+[SEARCH] Query latency distribution (ms): min=3.149, p50=3.856, p90=4.323, p95=4.478, p99=7.250, max=12.370, stddev=0.702
+Recall@100: 0.91373
+Recall@10: 0.9443
+[CONFIG] label=r090_q4_run3 nprobe=160 k_rank_cluster=5000 k_rank_all_tokens=500 itopk_size=224 overlap_chunks=6
+[CONFIG] concurrent_queries=1 effective_concurrent_queries=1 stage3_threads=32
+[PROFILE] Phase A (Data Preparation) wall: 1.93575 ms, GPU total: 0.050592 ms
+[PROFILE]   1. Gather doc lengths      : 0.007168 ms (CPU launch: 0.004577 ms)
+[PROFILE]   2. Prefix sum offsets      : 0.011264 ms (CPU launch: 0.01039 ms)
+[PROFILE]   3. Gather clustered pos    : 0.017408 ms (CPU launch: 0.004069 ms)
+[PROFILE]   4. D2H metadata + sync     : 0.014752 ms (CPU launch: 0.011499 ms)
+[PROFILE]   5. cudaStreamSynchronize   : 1.89376 ms
+[PROFILE]   6. cudaEventElapsedTime x5 : 0.009796 ms
+[PROFILE]   GPU sum accounted           : 0.050592 ms
+[PROFILE] Phase B wall time: 0.137558 ms
+[PROFILE] Phase C: wait_d2h=0.365 ms, topk=0.083 ms, identify=0.047 ms, prepare=0.001 ms, cpu_refine=0.473 ms, combine=0.011 ms (total=0.991 ms, 500 docs)
+[PROFILE] Total wall time for Phase A + B + C: 3.06399 ms
+[SEARCH] Total wall-clock time: 3.88416 ms
+[3.92307 s] label=r090_q4_run3 GPU search time for 1000 queries.
+[SEARCH] End-to-end measured time: 3923.066 ms
+[SEARCH] Average latency per query: 3.923 ms
+[SEARCH] Throughput: 254.903 qps
+[SEARCH] Query latency distribution (ms): min=3.063, p50=3.786, p90=4.236, p95=4.378, p99=5.034, max=19.651, stddev=1.138
+Recall@100: 0.91385
+Recall@10: 0.9443
+[CONFIG] label=r095_q9_run1 nprobe=384 k_rank_cluster=28000 k_rank_all_tokens=1800 itopk_size=448 overlap_chunks=5
+[CONFIG] concurrent_queries=1 effective_concurrent_queries=1 stage3_threads=32
+[workspace][chimera] Growing compact doc capacity from 589824 to 786432 rows (required=716209)
+[workspace][chimera] Growing compact doc capacity from 786432 to 917504 rows (required=802167)
+[PROFILE] Phase A (Data Preparation) wall: 5.26657 ms, GPU total: 0.1368 ms
+[PROFILE]   1. Gather doc lengths      : 0.01024 ms (CPU launch: 0.004534 ms)
+[PROFILE]   2. Prefix sum offsets      : 0.012288 ms (CPU launch: 0.011167 ms)
+[PROFILE]   3. Gather clustered pos    : 0.074752 ms (CPU launch: 0.004985 ms)
+[PROFILE]   4. D2H metadata + sync     : 0.03952 ms (CPU launch: 0.013148 ms)
+[PROFILE]   5. cudaStreamSynchronize   : 5.22048 ms
+[PROFILE]   6. cudaEventElapsedTime x5 : 0.010178 ms
+[PROFILE]   GPU sum accounted           : 0.1368 ms
+[PROFILE] Phase B wall time: 0.115766 ms
+[PROFILE] Phase C: wait_d2h=2.436 ms, topk=0.383 ms, identify=0.147 ms, prepare=0.001 ms, cpu_refine=1.025 ms, combine=0.031 ms (total=4.064 ms, 1800 docs)
+[PROFILE] Total wall time for Phase A + B + C: 9.44667 ms
+[SEARCH] Total wall-clock time: 10.6395 ms
+[10.5274 s] label=r095_q9_run1 GPU search time for 1000 queries.
+[SEARCH] End-to-end measured time: 10527.377 ms
+[SEARCH] Average latency per query: 10.527 ms
+[SEARCH] Throughput: 94.990 qps
+[SEARCH] Query latency distribution (ms): min=8.575, p50=10.389, p90=11.446, p95=11.901, p99=14.890, max=25.275, stddev=1.112
+Recall@100: 0.95012
+Recall@10: 0.9495
+[CONFIG] label=r095_q9_run2 nprobe=384 k_rank_cluster=28000 k_rank_all_tokens=1800 itopk_size=448 overlap_chunks=5
+[CONFIG] concurrent_queries=1 effective_concurrent_queries=1 stage3_threads=32
+[PROFILE] Phase A (Data Preparation) wall: 5.27245 ms, GPU total: 0.137088 ms
+[PROFILE]   1. Gather doc lengths      : 0.011264 ms (CPU launch: 0.004682 ms)
+[PROFILE]   2. Prefix sum offsets      : 0.012288 ms (CPU launch: 0.010791 ms)
+[PROFILE]   3. Gather clustered pos    : 0.074752 ms (CPU launch: 0.004495 ms)
+[PROFILE]   4. D2H metadata + sync     : 0.038784 ms (CPU launch: 0.012942 ms)
+[PROFILE]   5. cudaStreamSynchronize   : 5.22797 ms
+[PROFILE]   6. cudaEventElapsedTime x5 : 0.009911 ms
+[PROFILE]   GPU sum accounted           : 0.137088 ms
+[PROFILE] Phase B wall time: 0.113794 ms
+[PROFILE] Phase C: wait_d2h=2.532 ms, topk=0.362 ms, identify=0.172 ms, prepare=0.001 ms, cpu_refine=0.974 ms, combine=0.029 ms (total=4.096 ms, 1800 docs)
+[PROFILE] Total wall time for Phase A + B + C: 9.48198 ms
+[SEARCH] Total wall-clock time: 10.6906 ms
+[10.3986 s] label=r095_q9_run2 GPU search time for 1000 queries.
+[SEARCH] End-to-end measured time: 10398.573 ms
+[SEARCH] Average latency per query: 10.398 ms
+[SEARCH] Throughput: 96.167 qps
+[SEARCH] Query latency distribution (ms): min=8.037, p50=10.296, p90=11.319, p95=11.605, p99=13.377, max=17.922, stddev=0.947
+Recall@100: 0.95005
+Recall@10: 0.9495
+[CONFIG] label=r095_q9_run3 nprobe=384 k_rank_cluster=28000 k_rank_all_tokens=1800 itopk_size=448 overlap_chunks=5
+[CONFIG] concurrent_queries=1 effective_concurrent_queries=1 stage3_threads=32
+[PROFILE] Phase A (Data Preparation) wall: 5.29788 ms, GPU total: 0.135808 ms
+[PROFILE]   1. Gather doc lengths      : 0.01024 ms (CPU launch: 0.004497 ms)
+[PROFILE]   2. Prefix sum offsets      : 0.012288 ms (CPU launch: 0.011289 ms)
+[PROFILE]   3. Gather clustered pos    : 0.074752 ms (CPU launch: 0.004685 ms)
+[PROFILE]   4. D2H metadata + sync     : 0.038528 ms (CPU launch: 0.012925 ms)
+[PROFILE]   5. cudaStreamSynchronize   : 5.25295 ms
+[PROFILE]   6. cudaEventElapsedTime x5 : 0.00993 ms
+[PROFILE]   GPU sum accounted           : 0.135808 ms
+[PROFILE] Phase B wall time: 0.112062 ms
+[PROFILE] Phase C: wait_d2h=2.628 ms, topk=0.234 ms, identify=0.168 ms, prepare=0.001 ms, cpu_refine=0.955 ms, combine=0.030 ms (total=4.046 ms, 1800 docs)
+[PROFILE] Total wall time for Phase A + B + C: 9.45627 ms
+[SEARCH] Total wall-clock time: 10.6453 ms
+[10.3675 s] label=r095_q9_run3 GPU search time for 1000 queries.
+[SEARCH] End-to-end measured time: 10367.529 ms
+[SEARCH] Average latency per query: 10.367 ms
+[SEARCH] Throughput: 96.455 qps
+[SEARCH] Query latency distribution (ms): min=7.916, p50=10.289, p90=11.281, p95=11.577, p99=12.916, max=17.249, stddev=0.889
+Recall@100: 0.95011
+Recall@10: 0.9495
+[GPU_MEM] current=10205.38 MiB, peak=10205.38 MiB, total=32494.12 MiB, samples=49, peak_label=config_end:r095_q9_run3

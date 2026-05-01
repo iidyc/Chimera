@@ -1,0 +1,46 @@
+[driver] command=/scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/gpu-mvr/build/gpu_search_v9 --query /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/lotte/raw/query.bin --gt /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/lotte/raw/gt.tsv --index /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/lotte/gpu_mvr_2m --k 100 --nq -1 --warmup 5 --nprobe 64 --k-rank-cluster 2400 --k-rank-all-tokens 240 --itopk-size 128 --overlap-chunks 5 --concurrent-queries 1
+[driver] dataset=lotte
+[driver] system=v9
+[driver] config_label=r090_c1
+>>> Loaded 2931 queries, each with 32 embeddings of dimension 128
+>>> Loaded 2428854 document lengths
+[RUN] Constructing shared chimera index with 1 query slot(s) from /scratch3/workspace/juelinliu_umass_edu-gpu-mvr/gpu-mvr/dataset/lotte/gpu_mvr_2m using max runtime config: nprobe=64 k_rank_cluster=2400 k_rank_all_tokens=240 itopk_size=128 overlap_chunks=5
+FhtKacRotator is selected
+FhtKacRotator is selected
+max cluster size: 5383
+FhtKacRotator is selected
+[gpu_mvr] Using cluster-ordered layout (7108.45 MB)
+[chimera] Stage1 align mode: compact_align with shifted cluster loads
+max cluster size: 5383
+workspace_probe_cluster_bound: 64
+workspace_probe_token_bound_per_query: 155969
+workspace_probe_unique_doc_bound_per_query: 127479
+max_compact_docs: 2428854  (num_docs=2428854)
+initial_compact_doc_capacity: 65536
+preallocated_compact_doc_capacity: 196608
+workspace_stage2_candidate_token_bound: 414348
+workspace_stage2_topk_token_bound: 42016
+Initial GPU memory required for chimera workspace: 26.6007 MB
+[workspace][chimera] Growing compact doc capacity from 0 to 196608 rows (required=196608)
+[CONFIG] label=single nprobe=64 k_rank_cluster=2400 k_rank_all_tokens=240 itopk_size=128 overlap_chunks=5
+[CONFIG] concurrent_queries=1 effective_concurrent_queries=1 stage3_threads=32
+[PROFILE] Phase A (Data Preparation) wall: 0.297729 ms, GPU total: 0.041632 ms
+[PROFILE]   1. Gather doc lengths      : 0.006144 ms (CPU launch: 0.005751 ms)
+[PROFILE]   2. Prefix sum offsets      : 0.011264 ms (CPU launch: 0.013454 ms)
+[PROFILE]   3. Gather doc token ids    : 0.01024 ms (CPU launch: 0.004955 ms)
+[PROFILE]   4. D2H metadata + sync     : 0.013984 ms (CPU launch: 0.026494 ms)
+[PROFILE]   5. cudaStreamSynchronize   : 0.23535 ms
+[PROFILE]   6. cudaEventElapsedTime x5 : 0.009716 ms
+[PROFILE]   GPU sum accounted           : 0.041632 ms
+[PROFILE] Phase B wall time: 0.112548 ms
+[PROFILE] Phase C: wait_d2h=0.136 ms, topk=0.044 ms, identify=0.022 ms, prepare=0.000 ms, cpu_refine=0.339 ms, combine=0.005 ms (total=0.617 ms, 240 docs)
+[PROFILE] Total wall time for Phase A + B + C: 1.02689 ms
+[SEARCH] Total wall-clock time: 1.77309 ms
+[5.67673 s] label=single GPU search time for 2931 queries.
+[SEARCH] End-to-end measured time: 5676.730 ms
+[SEARCH] Average latency per query: 1.936 ms
+[SEARCH] Throughput: 516.318 qps
+[SEARCH] Query latency distribution (ms): min=1.434, p50=1.883, p90=2.026, p95=2.100, p99=4.812, max=14.369, stddev=0.658
+Recall@100: 0.909284
+Recall@10: 0.957455
+[GPU_MEM] current=14165.38 MiB, peak=14165.38 MiB, total=32494.12 MiB, samples=9, peak_label=config_end:single

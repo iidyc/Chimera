@@ -1,0 +1,584 @@
+#include "index.hpp"
+
+#include <omp.h>
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <queue>
+#include <stdexcept>
+#include <unordered_map>
+
+#include "gpu_index_layout.hpp"
+#include "doc_format.hpp"
+#include "rabitqlib/quantization/rabitq_impl.hpp"
+#include "rabitqlib/utils/space.hpp"
+#include "quantization.hpp"
+
+namespace Chimera {
+
+using namespace rabitqlib;
+
+namespace {
+
+void validate_doc4ex_header_compatibility(
+    const doc_format::Header& base_header,
+    const doc_format::Header& ex_header,
+    const std::string& base_filename,
+    const std::string& ex_filename)
+{
+    if (base_header.n != ex_header.n ||
+        base_header.d != ex_header.d ||
+        base_header.n_clusters != ex_header.n_clusters ||
+        base_header.padded_dim != ex_header.padded_dim ||
+        base_header.rotator_type != ex_header.rotator_type) {
+        throw std::runtime_error(
+            "Quantized index metadata mismatch between " + base_filename +
+            " and " + ex_filename);
+    }
+    if (ex_header.ex_bits == 0) {
+        throw std::runtime_error(
+            "doc_4bit_ex sidecar must have ex_bits > 0: " + ex_filename);
+    }
+}
+
+}  // namespace
+
+cpu_mvr_index::cpu_mvr_index(
+    const std::string& filename,
+    cpu_quantized_payload_mode payload_mode)
+    : requested_payload_mode_(payload_mode) {
+    load(filename);
+    ip_func_ = select_excode_ipfunc(ex_bits);
+}
+
+cpu_mvr_index::cpu_mvr_index(
+    size_t n,
+    size_t d,
+    size_t n_clusters,
+    size_t ex_bits,
+    IVFType ivf_type
+)
+    : n(n), d(d), n_clusters(n_clusters), ex_bits(ex_bits), ivf_type_(ivf_type) {
+    rotator_ = choose_rotator<float>(d, RotatorType::FhtKacRotator, round_up_to_multiple(d, 64));
+    padded_dim_ = rotator_->size();
+
+    one_bit_code_.resize(n * padded_dim_ / 8);
+    ex_code_.resize(n * padded_dim_ * ex_bits / 8);
+    one_bit_factor_.resize(n);
+    ex_factor_.resize(n);
+
+    ip_func_ = select_excode_ipfunc(ex_bits);
+
+    if (ivf_type_ == IVFType::DocKMeans) {
+        std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+        exit(0);
+    } else {
+        ivf = new IVF_PG(n_clusters, d);
+    }
+}
+
+cpu_mvr_index::~cpu_mvr_index() {
+    delete rotator_;
+    delete ivf;
+}
+
+const char* cpu_mvr_index::quantized_payload_mode_name() const {
+    switch (loaded_payload_mode_) {
+    case cpu_quantized_payload_mode::DecodeDoc4:
+        return "doc_4bit_to_ex_decode";
+    case cpu_quantized_payload_mode::PreferDoc4ExSidecar:
+    case cpu_quantized_payload_mode::RequireDoc4ExSidecar:
+        return "doc_4bit_ex_sidecar";
+    }
+    return "unknown";
+}
+
+void cpu_mvr_index::build_index(const float* data, size_t /*max_kmeans_iter*/) {
+    quantize(data);
+    if (ivf_type_ == IVFType::DocKMeans) {
+        std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+        exit(0);
+    }
+}
+
+void cpu_mvr_index::quantize(const float* data) {
+    size_t batch_size = 10240;
+    for (size_t start = 0; start < n; start += batch_size) {
+        size_t end = std::min(start + batch_size, n);
+        size_t current_batch_size = end - start;
+
+        std::vector<float> rotated_data(current_batch_size * padded_dim_);
+#pragma omp parallel for
+        for (size_t i = 0; i < current_batch_size; ++i) {
+            rotator_->rotate(&data[(start + i) * d], &rotated_data[i * padded_dim_]);
+
+            encode_one_bit(
+                &rotated_data[i * padded_dim_],
+                padded_dim_,
+                reinterpret_cast<uint64_t*>(&one_bit_code_[(start + i) * padded_dim_ / 8]),
+                &one_bit_factor_[start + i]
+            );
+
+            encode_ex_bits(
+                &rotated_data[i * padded_dim_],
+                padded_dim_,
+                ex_bits,
+                reinterpret_cast<uint8_t*>(&ex_code_[(start + i) * padded_dim_ * ex_bits / 8]),
+                &ex_factor_[start + i]
+            );
+        }
+    }
+}
+
+void cpu_mvr_index::set_doc_mapping(const std::vector<int>& doc_lens) {
+    num_docs = doc_lens.size();
+    doc_ptrs_.resize(num_docs + 1);
+    for (size_t i = 0; i < num_docs; ++i) {
+        doc_ptrs_[i + 1] = doc_ptrs_[i] + doc_lens[i];
+    }
+    doc_ids_.resize(n);
+    for (size_t i = 0; i < num_docs; ++i) {
+        for (size_t j = 0; j < doc_lens[i]; ++j) {
+            doc_ids_[doc_ptrs_[i] + j] = i;
+        }
+    }
+    if (doc_ptrs_[num_docs] != n) {
+        throw std::runtime_error("Error in set_doc_mapping: total number of vectors does not match!");
+    }
+}
+
+size_t cpu_mvr_index::doc_len(size_t doc_id) const {
+    return doc_ptrs_[doc_id + 1] - doc_ptrs_[doc_id];
+}
+
+void cpu_mvr_index::gather_ids(const float* queries, size_t q_doclen, size_t nprobe, std::vector<size_t>& output_ids) {
+    std::vector<float> rotated_queries(q_doclen * padded_dim_);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+    }
+    std::vector<query_object> query_objs(q_doclen);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+    }
+
+    std::vector<bool> doc_found(num_docs, false);
+#pragma omp parallel for
+    for (int j = 0; j < (int)q_doclen; ++j) {
+        std::vector<size_t> ids;
+        ivf->search(query_objs[j].rotated_query, nprobe, ids);
+        for (size_t idx = 0; idx < ids.size(); ++idx) {
+            size_t emb_id = ids[idx];
+            int doc_id = doc_ids_[emb_id];
+            doc_found[doc_id] = true;
+        }
+    }
+    for (int doc_id = 0; doc_id < (int)num_docs; ++doc_id) {
+        if (doc_found[doc_id]) {
+            output_ids.push_back(doc_id);
+        }
+    }
+}
+
+void cpu_mvr_index::gather_ids_rank_dists(const float* queries, size_t q_doclen, size_t nprobe, std::vector<size_t>& output_ids, int k) {
+    std::vector<float> rotated_queries(q_doclen * padded_dim_);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+    }
+    std::vector<query_object> query_objs(q_doclen);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+    }
+
+    std::vector<bool> doc_found(num_docs, false);
+    std::vector<float> doc_dists(q_doclen * num_docs);
+#pragma omp parallel for
+    for (int j = 0; j < (int)q_doclen; ++j) {
+        std::vector<size_t> ids;
+        ivf->search(query_objs[j].rotated_query, nprobe, ids);
+        for (size_t idx = 0; idx < ids.size(); ++idx) {
+            size_t emb_id = ids[idx];
+            float dist = distance_one_bit(&query_objs[j], &one_bit_code_[emb_id * padded_dim_ / 8], one_bit_factor_[emb_id], padded_dim_);
+            int doc_id = doc_ids_[emb_id];
+            doc_found[doc_id] = true;
+            doc_dists[j * num_docs + doc_id] = std::max(doc_dists[j * num_docs + doc_id], dist);
+        }
+    }
+    std::priority_queue<std::pair<float, int>> max_heap;
+    for (int doc_id = 0; doc_id < (int)num_docs; ++doc_id) {
+        if (doc_found[doc_id]) {
+            float score = 0.0F;
+            for (int j = 0; j < (int)q_doclen; ++j) {
+                score += doc_dists[j * num_docs + doc_id];
+            }
+            max_heap.emplace(score, doc_id);
+        }
+    }
+    for (int i = 0; i < k && !max_heap.empty(); ++i) {
+        output_ids.push_back(max_heap.top().second);
+        max_heap.pop();
+    }
+}
+
+void cpu_mvr_index::gather_dists(const float* data, const float* queries, size_t q_doclen, size_t nprobe, std::vector<size_t>& output_ids, std::vector<float>& output_dists) {
+    std::vector<float> rotated_queries(q_doclen * padded_dim_);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+    }
+    std::vector<query_object> query_objs(q_doclen);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+    }
+
+    std::vector<bool> doc_found(num_docs, false);
+    std::vector<float> doc_dists(q_doclen * num_docs);
+#pragma omp parallel for
+    for (int j = 0; j < (int)q_doclen; ++j) {
+        std::vector<size_t> ids;
+        ivf->search(query_objs[j].rotated_query, nprobe, ids);
+        for (size_t idx = 0; idx < ids.size(); ++idx) {
+            size_t emb_id = ids[idx];
+            float dist = dot_product(data + emb_id * d, queries + j * d, d);
+            int doc_id = doc_ids_[emb_id];
+            doc_found[doc_id] = true;
+            doc_dists[j * num_docs + doc_id] = std::max(doc_dists[j * num_docs + doc_id], dist);
+        }
+    }
+    for (int doc_id = 0; doc_id < (int)num_docs; ++doc_id) {
+        if (doc_found[doc_id]) {
+            float score = 0.0F;
+            for (int j = 0; j < (int)q_doclen; ++j) {
+                score += doc_dists[j * num_docs + doc_id];
+            }
+            output_ids.push_back(doc_id);
+            output_dists.push_back(score);
+        }
+    }
+}
+
+std::vector<size_t> cpu_mvr_index::search(const float* queries, size_t q_doclen, size_t k, size_t nprobe) {
+    int k_rank_cluster = 1800;
+    int k_rank_all_tokens = 300;
+
+    std::vector<float> rotated_queries(q_doclen * padded_dim_);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        rotator_->rotate(&queries[i * d], &rotated_queries[i * padded_dim_]);
+    }
+    std::vector<query_object> query_objs(q_doclen);
+    for (size_t i = 0; i < q_doclen; ++i) {
+        query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
+    }
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<size_t> rank_cluster_doc_ids;
+    rank_cluster_dists(query_objs.data(), q_doclen, nprobe, k_rank_cluster, rank_cluster_doc_ids);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::vector<size_t> rank_all_tokens_ids;
+    std::vector<float> one_bit_dists;
+    rank_all_tokens_1bit(query_objs.data(), q_doclen, rank_cluster_doc_ids, k_rank_all_tokens, rank_all_tokens_ids, one_bit_dists);
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::vector<size_t> result;
+    rank_all_tokens_exbits(
+        query_objs.data(),
+        q_doclen,
+        rank_all_tokens_ids,
+        one_bit_dists,
+        k,
+        result
+    );
+    auto t3 = std::chrono::high_resolution_clock::now();
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::cout << "[search] stage1_cluster: " << ms(t0, t1) << " ms, "
+              << "stage2_1bit: " << ms(t1, t2) << " ms, "
+              << "stage3_exbits: " << ms(t2, t3) << " ms, "
+              << "total: " << ms(t0, t3) << " ms\n";
+    return result;
+}
+
+void cpu_mvr_index::rank_cluster_dists(query_object* queries, size_t q_doclen, size_t nprobe, size_t k, std::vector<size_t>& output_ids) {
+    std::vector<bool> doc_found(num_docs, false);
+    std::vector<float> doc_dists(q_doclen * num_docs);
+#pragma omp parallel for
+    for (int j = 0; j < (int)q_doclen; ++j) {
+        std::vector<size_t> ids;
+        ivf->search(queries[j].rotated_query, nprobe, ids);
+        for (size_t idx = 0; idx < ids.size(); ++idx) {
+            size_t emb_id = ids[idx];
+            float dist = distance_one_bit(queries + j, &one_bit_code_[emb_id * padded_dim_ / 8], one_bit_factor_[emb_id], padded_dim_);
+            int doc_id = doc_ids_[emb_id];
+            doc_found[doc_id] = true;
+            doc_dists[j * num_docs + doc_id] = std::max(doc_dists[j * num_docs + doc_id], dist);
+        }
+    }
+    std::priority_queue<std::pair<float, int>> max_heap;
+    for (int doc_id = 0; doc_id < (int)num_docs; ++doc_id) {
+        if (doc_found[doc_id]) {
+            float score = 0.0F;
+            for (int j = 0; j < (int)q_doclen; ++j) {
+                score += doc_dists[j * num_docs + doc_id];
+            }
+            max_heap.emplace(score, doc_id);
+        }
+    }
+    for (size_t i = 0; i < k && !max_heap.empty(); ++i) {
+        output_ids.push_back(max_heap.top().second);
+        max_heap.pop();
+    }
+}
+
+void cpu_mvr_index::rank_all_tokens_1bit(
+    query_object* queries,
+    size_t q_doclen,
+    std::vector<size_t>& input_ids,
+    size_t k,
+    std::vector<size_t>& output_ids,
+    std::vector<float>& one_bit_dists
+) {
+    std::unordered_map<size_t, size_t> doc_id_to_index;
+    std::priority_queue<std::pair<float, size_t>> max_heap;
+    size_t total_tokens = 0;
+    std::vector<size_t> candidate_doc_ptrs(input_ids.size() + 1);
+    for (size_t i = 0; i < input_ids.size(); ++i) {
+        doc_id_to_index[input_ids[i]] = i;
+        total_tokens += doc_len(input_ids[i]);
+        candidate_doc_ptrs[i + 1] = total_tokens;
+    }
+    std::vector<float> token_dists(total_tokens * q_doclen);
+#pragma omp parallel for
+    for (size_t idx = 0; idx < input_ids.size(); ++idx) {
+        size_t doc_id = input_ids[idx];
+        float doc_score = 0.0F;
+        for (int j = 0; j < (int)q_doclen; ++j) {
+            float max_token_score = -std::numeric_limits<float>::infinity();
+            for (size_t i = 0; i < doc_len(doc_id); ++i) {
+                size_t tid = doc_ptrs_[doc_id] + i;
+                float dist = distance_one_bit(queries + j, &one_bit_code_[tid * padded_dim_ / 8], one_bit_factor_[tid], padded_dim_);
+                token_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j] = dist;
+                max_token_score = std::max(max_token_score, dist);
+            }
+            doc_score += max_token_score;
+        }
+#pragma omp critical
+        max_heap.emplace(doc_score, doc_id);
+    }
+    for (size_t i = 0; i < k && !max_heap.empty(); ++i) {
+        size_t doc_id = max_heap.top().second;
+        output_ids.push_back(doc_id);
+        for (size_t t = 0; t < doc_len(doc_id); ++t) {
+            size_t doc_idx = doc_id_to_index[doc_id];
+            for (int j = 0; j < (int)q_doclen; ++j) {
+                one_bit_dists.push_back(token_dists[(candidate_doc_ptrs[doc_idx] + t) * q_doclen + j]);
+            }
+        }
+        max_heap.pop();
+    }
+}
+
+void cpu_mvr_index::rank_all_tokens_exbits(
+    query_object* queries,
+    size_t q_doclen,
+    std::vector<size_t>& input_ids,
+    std::vector<float>& one_bit_dists,
+    size_t k,
+    std::vector<size_t>& output_ids
+) {
+    std::vector<size_t> candidate_doc_ptrs(input_ids.size() + 1);
+    size_t total_tokens = 0;
+    for (size_t i = 0; i < input_ids.size(); ++i) {
+        total_tokens += doc_len(input_ids[i]);
+        candidate_doc_ptrs[i + 1] = total_tokens;
+    }
+    std::priority_queue<std::pair<float, size_t>> max_heap;
+#pragma omp parallel for
+    for (size_t idx = 0; idx < input_ids.size(); ++idx) {
+        size_t doc_id = input_ids[idx];
+        float doc_score = 0.0F;
+        for (int j = 0; j < (int)q_doclen; ++j) {
+            float max_token_score = -std::numeric_limits<float>::infinity();
+            for (size_t i = 0; i < doc_len(doc_id); ++i) {
+                size_t tid = doc_ptrs_[doc_id] + i;
+                const float dist = distance_ex_bits(
+                    queries + j,
+                    &ex_code_[tid * padded_dim_ * ex_bits / 8],
+                    ex_bits,
+                    ip_func_,
+                    one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j],
+                    one_bit_factor_[tid],
+                    ex_factor_[tid],
+                    padded_dim_);
+                max_token_score = std::max(max_token_score, dist);
+            }
+            doc_score += max_token_score;
+        }
+#pragma omp critical
+        max_heap.emplace(doc_score, doc_id);
+    }
+    for (size_t i = 0; i < k && !max_heap.empty(); ++i) {
+        output_ids.push_back(max_heap.top().second);
+        max_heap.pop();
+    }
+}
+
+void cpu_mvr_index::save(const std::string& filename) const {
+    std::ofstream of(filename, std::ios::binary);
+    doc_format::Header header;
+    header.n = n;
+    header.d = d;
+    header.n_clusters = n_clusters;
+    header.ex_bits = ex_bits;
+    header.padded_dim = padded_dim_;
+    header.rotator_type = RotatorType::FhtKacRotator;
+    doc_format::write_header(of, header, filename);
+    doc_format::save_rotator(of, *rotator_, filename);
+    of.write(one_bit_code_.data(), one_bit_code_.size());
+    of.write(ex_code_.data(), ex_code_.size());
+    of.write((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
+    of.write((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
+    of.close();
+    if (ivf_type_ == IVFType::DocKMeans) {
+        std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+        exit(0);
+    }
+}
+
+void cpu_mvr_index::load(const std::string& filename) {
+    const auto resolved_paths = gpu_index_layout::resolve_index_paths(filename);
+
+    std::ifstream inf(resolved_paths.quantized_data_path, std::ios::binary);
+    const auto header =
+        doc_format::read_header(inf, resolved_paths.quantized_data_path);
+    n = header.n;
+    d = header.d;
+    n_clusters = header.n_clusters;
+    ex_bits = header.ex_bits;
+    padded_dim_ = header.padded_dim;
+    rotator_ = doc_format::load_rotator(inf, header, filename);
+    one_bit_code_.resize(n * padded_dim_ / 8);
+    one_bit_factor_.resize(n);
+    inf.read(one_bit_code_.data(), one_bit_code_.size());
+    if (!inf) {
+        throw std::runtime_error(
+            "Failed to read one-bit codes from index file: " +
+            resolved_paths.quantized_data_path);
+    }
+
+    inf.read((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
+    if (!inf) {
+        throw std::runtime_error(
+            "Failed to read one-bit scaling factors from index file: " +
+            resolved_paths.quantized_data_path);
+    }
+
+    const bool wants_doc4ex =
+        requested_payload_mode_ != cpu_quantized_payload_mode::DecodeDoc4;
+    const bool has_doc4ex =
+        !resolved_paths.doc_4bit_ex_path.empty() &&
+        std::filesystem::exists(resolved_paths.doc_4bit_ex_path);
+    if (requested_payload_mode_ == cpu_quantized_payload_mode::RequireDoc4ExSidecar &&
+        !has_doc4ex) {
+        throw std::runtime_error(
+            "cpu_search requires doc_4bit_ex.bin for stage-3 reranking, but it was not found next to " +
+            resolved_paths.quantized_data_path);
+    }
+
+    const bool can_use_doc4ex = wants_doc4ex && has_doc4ex;
+    if (can_use_doc4ex) {
+        std::ifstream doc4ex(resolved_paths.doc_4bit_ex_path, std::ios::binary);
+        const auto doc4ex_header =
+            doc_format::read_header(doc4ex, resolved_paths.doc_4bit_ex_path);
+        validate_doc4ex_header_compatibility(
+            header,
+            doc4ex_header,
+            resolved_paths.quantized_data_path,
+            resolved_paths.doc_4bit_ex_path);
+        auto* doc4ex_rotator = doc_format::load_rotator(
+            doc4ex, doc4ex_header, resolved_paths.doc_4bit_ex_path);
+        delete doc4ex_rotator;
+
+        ex_bits = doc4ex_header.ex_bits;
+        ex_code_.resize(n * padded_dim_ * ex_bits / 8);
+        ex_factor_.resize(n);
+        doc4ex.read(ex_code_.data(), ex_code_.size());
+        doc4ex.read((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
+        if (!doc4ex) {
+            throw std::runtime_error(
+                "Failed to read doc_4bit_ex payload from index file: " +
+                resolved_paths.doc_4bit_ex_path);
+        }
+        loaded_payload_mode_ = requested_payload_mode_;
+    } else {
+        ex_code_.resize(n * padded_dim_ * ex_bits / 8);
+        ex_factor_.resize(n);
+        inf.read((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
+        if (!inf) {
+            throw std::runtime_error(
+                "Failed to read scaling factors from index file: " +
+                resolved_paths.quantized_data_path);
+        }
+
+        std::ifstream doc4(resolved_paths.doc_4bit_path, std::ios::binary);
+        const auto doc4_header =
+            doc_format::read_header(doc4, resolved_paths.doc_4bit_path);
+        doc_format::validate_matching_header(
+            header,
+            doc4_header,
+            resolved_paths.quantized_data_path,
+            resolved_paths.doc_4bit_path);
+        auto* doc4_rotator =
+            doc_format::load_rotator(doc4, doc4_header, resolved_paths.doc_4bit_path);
+        delete doc4_rotator;
+
+        const size_t full_code_stride = padded_dim_ * (1 + ex_bits) / 8;
+        const size_t ex_code_stride = padded_dim_ * ex_bits / 8;
+        auto full_unpack = select_excode_unpackfunc(1 + ex_bits);
+        const uint8_t ex_mask = static_cast<uint8_t>((1u << ex_bits) - 1u);
+        const size_t batch_vectors = 8192;
+        std::vector<char> full_batch(batch_vectors * full_code_stride);
+        std::vector<float> unpacked(padded_dim_);
+        std::vector<uint8_t> raw_ex(padded_dim_);
+
+        for (size_t start = 0; start < n; start += batch_vectors) {
+            const size_t batch_count = std::min(batch_vectors, n - start);
+            const size_t batch_bytes = batch_count * full_code_stride;
+            doc4.read(full_batch.data(), batch_bytes);
+            if (!doc4) {
+                throw std::runtime_error(
+                    "Failed to read doc_4bit payload from index file: " +
+                    resolved_paths.doc_4bit_path);
+            }
+
+            for (size_t i = 0; i < batch_count; ++i) {
+                full_unpack(
+                    reinterpret_cast<const uint8_t*>(full_batch.data() + i * full_code_stride),
+                    unpacked.data(),
+                    padded_dim_);
+                for (size_t dim_idx = 0; dim_idx < padded_dim_; ++dim_idx) {
+                    raw_ex[dim_idx] = static_cast<uint8_t>(unpacked[dim_idx]) & ex_mask;
+                }
+                quant::rabitq_impl::ex_bits::packing_rabitqplus_code(
+                    raw_ex.data(),
+                    reinterpret_cast<uint8_t*>(ex_code_.data() + (start + i) * ex_code_stride),
+                    padded_dim_,
+                    ex_bits);
+            }
+        }
+        loaded_payload_mode_ = cpu_quantized_payload_mode::DecodeDoc4;
+    }
+    inf.close();
+    ip_func_ = select_excode_ipfunc(ex_bits);
+    if (ivf_type_ == IVFType::DocKMeans) {
+        std::cout << "DocKMeans IVF type is not supported yet." << std::endl;
+        exit(0);
+    } else {
+        ivf = new IVF_PG(n_clusters, d);
+        std::string centroid_graph_path = resolved_paths.centroids_hnsw_path;
+        if (centroid_graph_path.empty() || !std::filesystem::exists(centroid_graph_path)) {
+            centroid_graph_path = resolved_paths.centroids_path;
+        }
+        ivf->load(resolved_paths.ivf_path, centroid_graph_path);
+    }
+}
+
+
+}  // namespace Chimera

@@ -1,0 +1,64 @@
+{
+    "mode": "config_set",
+    "dataset": "lotte",
+    "topk": 100,
+    "query_split": "test",
+    "metric_name": "recall@100",
+    "build_index_parameters": {
+      "n_centroid_formula": "16 * sqrt(N_v)",
+      "n_centroid": 261052,
+      "n_bit": 4,
+      "efConstruction": 200,
+      "M": 64
+    },
+    "retrieval_parameters_from_paper": {
+      "n_b": 8,
+      "b_s": 16,
+      "search_threads": 1,
+      "validation_query_count": 50,
+      "validation_seed": 0,
+      "note": "Explicit config-set mode for cluster/distributed execution. The current vendored CPU IGP Python API only exposes nprobe, probe_topk, and n_thread, so n_b/b_s are recorded but not set."
+    },
+    "index_path": "/mnt/nfs/work1/marco/juelinliu/gpu-mvr/dataset/lotte/igp/Index/lotte/IGP-n_centroid_261052-n_bit_4",
+    "query_count_total": 2931,
+    "query_count_val": 50,
+    "query_count_test": 2881,
+    "query_count_run": 2881,
+    "configs": [
+      {
+        "phi_pb": 64,
+        "phi_ref": 3000
+      }
+    ],
+    "results": [
+      {
+        "phi_pb": 64,
+        "phi_ref": 3000,
+        "retrieval_suffix": "nprobe_64-probe_topk_3000-n_thread_1",
+        "queries": 2881,
+        "avg_latency_ms": 193.71393370357515,
+        "qps": 5.1622228531605705,
+        "throughput_qps": 5.1622228531605705,
+        "service_qps_equivalent": 5.162251268565015,
+        "batch_time_per_query_ms": 193.715,
+        "wall_qps": 4.426234327825023,
+        "wall_sec": 650.8918838500977,
+        "recall_mean": 0.9214057618882333,
+        "recall_p50": 0.95,
+        "recall_p95": 0.99,
+        "search_time_m": {
+          "retrieval_time_query_p5(ms)": "164.858",
+          "retrieval_time_query_p50(ms)": "195.155",
+          "retrieval_time_query_p95(ms)": "216.538",
+          "retrieval_time_query_average(ms)": "193.714",
+          "retrieval_time_average(ms)": "193.715",
+          "filter_time_average(ms)": "37.715",
+          "decode_time_average(ms)": "94.945",
+          "refine_time_average(ms)": "61.051",
+          "n_seen_item_average": "321526.483",
+          "incremental_graph_n_compute_l_average": "40490.897",
+          "n_vq_score_linear_scan_average": "1688177.697"
+        }
+      }
+    ]
+  }
