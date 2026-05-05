@@ -17,7 +17,7 @@ Description:
 Options:
   --dataset <name>         Dataset. Repeatable. Default: lotte hotpot msmarco
   --k <top_k>              Repeatable. Default: 10 and 100
-  --config-file <path>     ColBERT config CSV. Default: profiling/colbert_config.csv
+  --config-file <path>     ColBERT config CSV. Default: config/colbert_config.csv
   --output-root <path>     Output profiling root.
                            Default: profiling/experiments/plaid_vs_gpu_search
   --log-root <path>        Output log root.
@@ -72,7 +72,7 @@ compare_script="${repo_root}/experiment/plaid_plus/compare_plaid_vs_gpu_search.p
 
 datasets=(lotte hotpot msmarco)
 k_values=(10 100)
-config_file="${repo_root}/profiling/colbert_config.csv"
+config_file="${repo_root}/config/colbert_config.csv"
 output_root="${repo_root}/profiling/experiments/plaid_vs_gpu_search"
 log_root="${repo_root}/log/bench/experiments/plaid_vs_gpu_search"
 warmup=5

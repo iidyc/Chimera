@@ -24,8 +24,8 @@ Options:
   --dataset <name>         Dataset. Repeatable. Default: lotte hotpot msmarco
   --k <top_k>              Repeatable. Default: 10 and 100
   --pair <ncells,ndocs>    ColBERT pair. Repeatable. Default: all pairs from
-                           profiling/colbert_config.csv
-  --colbert-config <path>  ColBERT config CSV. Default: profiling/colbert_config.csv
+                           config/colbert_config.csv
+  --colbert-config <path>  ColBERT config CSV. Default: config/colbert_config.csv
   --output-root <path>     Output profiling root.
                            Default: profiling/experiments/plaid_vs_gpu_search
   --execute                Execute supported ColBERT commands
@@ -73,7 +73,7 @@ profile_colbert="${script_dir}/profile_colbert_breakdown.sh"
 datasets=(lotte hotpot msmarco)
 k_values=(10 100)
 pairs=()
-colbert_config="${repo_root}/profiling/colbert_config.csv"
+colbert_config="${repo_root}/config/colbert_config.csv"
 output_root="${repo_root}/profiling/experiments/plaid_vs_gpu_search"
 execute=0
 

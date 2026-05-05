@@ -3,6 +3,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 base_script="${repo_root}/experiment/plaid/bench_all_colbert.sh"
 
 [[ -x "$base_script" ]] || {

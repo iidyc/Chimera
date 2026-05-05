@@ -117,7 +117,11 @@ inline size_t header_bytes() {
 
 inline size_t header_bytes(std::uint32_t version) {
     if (version == 2) {
-        return sizeof(kMagic) + sizeof(std::uint32_t) + 2 * sizeof(size_t);
+        // Version-2 clustered files in this artifact were written by
+        // write_header(), which emits the full header layout even when
+        // header.version is 2. Keep the reader's payload offset aligned with
+        // those persisted files.
+        return header_bytes();
     }
     return header_bytes();
 }

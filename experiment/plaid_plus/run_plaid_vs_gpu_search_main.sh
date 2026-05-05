@@ -20,7 +20,7 @@ Options:
   --dataset <name>         Dataset. Repeatable. Default: lotte hotpot msmarco
   --k <top_k>              Repeatable. Default: 10 and 100
   --gpu-config <path>      gpu_search config CSV. Default: profiling/gpu_search_config.csv
-  --colbert-config <path>  ColBERT config CSV. Default: profiling/colbert_config.csv
+  --colbert-config <path>  ColBERT config CSV. Default: config/colbert_config.csv
   --build-dir <path>       gpu_search build dir. Default: Chimera/build
   --output-root <path>     Output profiling root.
                            Default: profiling/experiments/plaid_vs_gpu_search
@@ -82,7 +82,7 @@ compare_script="${repo_root}/experiment/plaid_plus/compare_plaid_vs_gpu_search.p
 datasets=(lotte hotpot msmarco)
 k_values=(10 100)
 gpu_config="${repo_root}/profiling/gpu_search_config.csv"
-colbert_config="${repo_root}/profiling/colbert_config.csv"
+colbert_config="${repo_root}/config/colbert_config.csv"
 build_dir="${repo_root}/Chimera/build"
 output_root="${repo_root}/profiling/experiments/plaid_vs_gpu_search"
 log_root="${repo_root}/log/bench/experiments/plaid_vs_gpu_search"

@@ -110,6 +110,7 @@ run_in_env() {
     binary_path="$(resolve_env_binary "$env_prefix" "$binary_name")"
 
     run_cmd env \
+        "PYTHONNOUSERSITE=1" \
         "PATH=${env_prefix}/bin:${PATH}" \
         "$binary_path" \
         "$@"
@@ -128,6 +129,7 @@ run_in_env_with_cuda() {
     binary_path="$(resolve_env_binary "$env_prefix" "$binary_name")"
 
     run_cmd env \
+        "PYTHONNOUSERSITE=1" \
         "CUDA_HOME=${env_prefix}" \
         "PATH=${env_prefix}/bin:${PATH}" \
         "LD_LIBRARY_PATH=${ld_library_path}" \

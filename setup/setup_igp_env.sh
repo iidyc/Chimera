@@ -111,7 +111,7 @@ fi
 run_cmd conda create -n "$env_name" -y "python=${python_version}"
 run_cmd conda install -n "$env_name" -y -c conda-forge \
     cxx-compiler cmake ninja make \
-    pybind11 spdlog tbb openblas \
+    pybind11 spdlog tbb openblas eigen \
     numpy pandas scipy tqdm pip
 run_cmd conda install -n "$env_name" -y -c rapidsai -c conda-forge "libcuvs=26.04" "cuda-version=12.9"
 

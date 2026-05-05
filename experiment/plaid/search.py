@@ -5,6 +5,7 @@ import time
 import threading
 import subprocess
 import shutil
+import gc
 import numpy as np
 import torch
 
@@ -230,7 +231,15 @@ def main():
 
         with Run().context(RunConfig(experiment=args.experiment_name, root=args.root_path)):
             ColBERT.try_load_torch_extensions(False)
+            searcher = None
             for ncells, ndocs in args.pairs:
+                if searcher is not None:
+                    del searcher
+                    searcher = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                 config = ColBERTConfig(
                     ncells=ncells,
                     ndocs=ndocs,

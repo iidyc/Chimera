@@ -12,7 +12,8 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
     igp_root = repo_root / "IGP"
     sys.path.insert(0, str(igp_root / "script" / "evaluation"))
-    sys.path.insert(1, str(igp_root))
+    sys.path.insert(1, str(igp_root / "build"))
+    sys.path.insert(2, str(igp_root))
 
     from script.data import dataset_io, util
     from script.evaluation import eval_igp

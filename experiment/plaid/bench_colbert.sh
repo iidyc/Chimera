@@ -24,7 +24,7 @@ Description:
 
 Options:
   --dataset <name>         Dataset under dataset/. Repeatable.
-  --config-file <path>     Config CSV. Default: profiling/colbert_config.csv
+  --config-file <path>     Config CSV. Default: config/colbert_config.csv
   --env-name <name>        Conda/mamba env name. Default: colbert
   --search-script <path>   Search driver. Default: ColBERT/experiment/search.py
   --experiment-name <name> ColBERT experiment directory. Default: colbert
@@ -145,6 +145,7 @@ run_in_env_with_cuda() {
         "CUDA_HOME=${env_prefix}" \
         "PATH=${env_prefix}/bin:${PATH}" \
         "LD_LIBRARY_PATH=${ld_library_path}" \
+        "PYTHONNOUSERSITE=1" \
         "PYTHONPATH=${repo_root}/ColBERT" \
         "TORCH_EXTENSIONS_DIR=${torch_extensions_dir}" \
         "CC=${host_cc}" \
@@ -157,6 +158,7 @@ run_in_env_with_cuda() {
             "CUDA_HOME=${env_prefix}" \
             "PATH=${env_prefix}/bin:${PATH}" \
             "LD_LIBRARY_PATH=${ld_library_path}" \
+            "PYTHONNOUSERSITE=1" \
             "PYTHONPATH=${repo_root}/ColBERT" \
             "TORCH_EXTENSIONS_DIR=${torch_extensions_dir}" \
             "CC=${host_cc}" \
@@ -532,8 +534,8 @@ benchmark_dataset() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 
-config_file="${repo_root}/profiling/colbert_config.csv"
-search_script="${repo_root}/ColBERT/experiment/search.py"
+config_file="${repo_root}/config/colbert_config.csv"
+search_script="${repo_root}/experiment/plaid/search.py"
 experiment_name="colbert"
 index_name_override=""
 implementation_label="colbert"

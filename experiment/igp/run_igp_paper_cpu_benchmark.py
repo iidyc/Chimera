@@ -126,7 +126,8 @@ def repo_root() -> Path:
 def configure_igp_imports(repo: Path) -> None:
     igp_root = repo / "IGP"
     sys.path.insert(0, str(igp_root / "script" / "evaluation"))
-    sys.path.insert(1, str(igp_root))
+    sys.path.insert(1, str(igp_root / "build"))
+    sys.path.insert(2, str(igp_root))
 
 
 def configure_igp_env(repo: Path, dataset: str) -> None:

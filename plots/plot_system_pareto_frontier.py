@@ -29,7 +29,7 @@ SYSTEM_ORDER = ["plaid", "plaid_plus", "igp", "chimera"]
 SYSTEM_LABELS = {
     "plaid": "PLAID",
     "plaid_plus": "PLAID+ (GPU-resident Index)",
-    "igp": "IGP (32 threads)",
+    "igp": "IGP (48 threads)",
     "chimera": "Chimera",
 }
 COLORS = {
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot system Pareto frontiers over Recall@10 and Recall@100.")
     parser.add_argument("--plaid", type=Path, default=repo_root / "profiling" / "plaid" / "summary.csv")
     parser.add_argument("--plaid-plus", type=Path, default=repo_root / "profiling" / "plaid_plus" / "summary.csv")
-    parser.add_argument("--igp", type=Path, default=repo_root / "profiling" / "igp" / "summary_t32.csv")
+    parser.add_argument("--igp", type=Path, default=repo_root / "profiling" / "igp" / "summary.csv")
     parser.add_argument(
         "--chimera",
         type=Path,

@@ -16,6 +16,8 @@ import numpy as np
 import time
 from pathlib import Path
 
+import torch
+
 
 def load_queries(path):
     with open(path, "rb") as f:
@@ -82,11 +84,15 @@ def maxsim_batch(Q_sub, D_padded, mask):
 
 
 def compute_topk(emb_path, doclens_path, queries_path, output_path,
-                 doc_batch_size=100000, topk=1000):
-    import torch
-
+                 doc_batch_size=100000, topk=1000, query_start=0, query_end=None):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Q_np = load_queries(queries_path)
+    total_queries = Q_np.shape[0]
+    if query_end is None:
+        query_end = total_queries
+    if query_start < 0 or query_end < query_start or query_end > total_queries:
+        raise ValueError(f"invalid query range [{query_start}, {query_end}) for {total_queries} queries")
+    Q_np = Q_np[query_start:query_end]
     doclens = load_doclens(doclens_path)
     total_n, d, emb = mmap_embeddings(emb_path)
 
@@ -107,10 +113,10 @@ def compute_topk(emb_path, doclens_path, queries_path, output_path,
     top_ids = torch.full((num_queries, topk), -1, dtype=torch.int32, device=device)
 
     # ---- Memory budget for the 4D matmul tensor (float32) ----
-    # Target: ≤ 8 GB  =>  qb * dc * ql * max_dl ≤ 8GB / 4 = 2e9 elements
+    # Keep the temporary score tensor conservative enough for 24GB GPUs.
     max_dl_est = int(doclens.max())
-    budget_elements = 2e9  # float32 elements that fit in 8 GB
-    query_batch = min(32, num_queries)
+    budget_elements = 2e8  # float32 elements, about 0.75 GiB
+    query_batch = min(8, num_queries)
     doc_chunk = max(1, int(budget_elements / (query_batch * ql * max_dl_est)))
     print(f"query_batch={query_batch}, doc_chunk={doc_chunk}, max_doclen={max_dl_est}")
 
@@ -187,7 +193,7 @@ def compute_topk(emb_path, doclens_path, queries_path, output_path,
                 did = int(top_ids[qi, rank])
                 if did < 0:
                     break
-                f.write(f"{qi}\t{did}\t{rank + 1}\n")
+                f.write(f"{query_start + qi}\t{did}\t{rank + 1}\n")
 
     print(f"Wrote {output_path}  (total {time.time() - t0:.1f}s)")
 
@@ -201,7 +207,10 @@ if __name__ == "__main__":
     parser.add_argument("--doc_batch_size", type=int, default=50000,
                         help="Docs loaded from mmap per outer iteration")
     parser.add_argument("--topk", type=int, default=1000)
+    parser.add_argument("--query-start", type=int, default=0)
+    parser.add_argument("--query-end", type=int, default=None)
     args = parser.parse_args()
 
     compute_topk(args.emb_path, args.doclens_path, args.queries_path,
-                 args.output_path, args.doc_batch_size, args.topk)
+                 args.output_path, args.doc_batch_size, args.topk,
+                 args.query_start, args.query_end)
