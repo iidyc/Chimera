@@ -44,6 +44,7 @@ if(CHIMERA_ENABLE_GPU)
 endif()
 
 find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
 
 if(CHIMERA_ENABLE_GPU)
     find_package(cuvs REQUIRED)
@@ -95,12 +96,13 @@ add_library(chimera_core STATIC
     cpp/src/index.cpp
     cpp/src/io.cpp
     cpp/src/ivf_pg.cpp
+    cpp/src/numa_topology.cpp
     cpp/src/quantization.cpp
     cpp/src/query.cpp
 )
 target_include_directories(chimera_core PUBLIC cpp/include)
 target_include_directories(chimera_core PUBLIC cpp/dep)
-target_link_libraries(chimera_core PUBLIC OpenMP::OpenMP_CXX)
+target_link_libraries(chimera_core PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
 if(CHIMERA_ENABLE_GPU)
     target_compile_definitions(chimera_core PUBLIC CHIMERA_HAVE_CUVS=1)
     target_link_libraries(chimera_core PUBLIC cuvs::cuvs rmm::rmm)
@@ -640,6 +642,10 @@ endif()
 
 add_executable(gpu_build
     cpp/app/gpu_build.cpp
+    cpp/cuda/src/build_index/assignment.cu
+    cpp/cuda/src/build_index/build_utils.cu
+    cpp/cuda/src/build_index/centroid_sampling.cu
+    cpp/cuda/src/build_index/gpu_quantization.cu
     cpp/cuda/src/build_index.cu
 )
 target_include_directories(gpu_build PRIVATE
@@ -648,6 +654,17 @@ target_include_directories(gpu_build PRIVATE
 )
 set_target_properties(gpu_build PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(gpu_build PRIVATE chimera_core)
+
+add_executable(test_gpu_quantization EXCLUDE_FROM_ALL
+    cpp/test/test_gpu_quantization.cu
+    cpp/cuda/src/build_index/gpu_quantization.cu
+)
+target_include_directories(test_gpu_quantization PRIVATE
+    cpp/include
+    cpp/cuda/include
+)
+set_target_properties(test_gpu_quantization PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(test_gpu_quantization PRIVATE chimera_core)
 
 if(CHIMERA_ENABLE_LEGACY_TARGETS)
 add_executable(gpu_search_v0

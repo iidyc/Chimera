@@ -38,9 +38,11 @@ void print_input_help(const char* program) {
         << "Arguments:\n"
         << "  --index_dir   Output index directory.\n"
         << "                The builder writes the split index artifacts into this directory:\n"
-        << "                ivf.bin, doc_1bit.bin, doc_4bit.bin, doc_4bit_ex.bin,\n"
+        << "                ivf.bin, doc_1bit.bin, doc_4bit.bin,\n"
         << "                cluster_1bit.bin, index_metadata.json, centroids.carga,\n"
-        << "                and centroids.hnsw.\n"
+        << "                and centroids.hnsw in full mode. *_ex quantization modes\n"
+        << "                also write doc_4bit_ex.bin. gpu-search-minimal omits\n"
+        << "                index_metadata.json and centroids.hnsw.\n"
         << "  --doclens     Input doclens file.\n"
         << "                Each value is the length of one document, i.e. the number of\n"
         << "                token embeddings belonging to that document.\n"
@@ -48,7 +50,22 @@ void print_input_help(const char* program) {
         << "                The file is copied into <index_dir>/doclens.bin.\n"
         << "  --data        Input token embedding file.\n"
         << "                This contains the token embeddings used to build the index.\n"
-        << "  --n_clusters  Number of randomly sampled centroids used to build the CAGRA graph.\n";
+        << "  --n_clusters  Number of randomly sampled centroids used to build the CAGRA graph.\n"
+        << "  --centroid_sample_bucket_size <count>\n"
+        << "                Sample centroids from shuffled contiguous buckets of this many\n"
+        << "                token embeddings. Default: 256. Use 1 for fully random sampling.\n"
+        << "  --centroid_sample_seed <seed>\n"
+        << "                Seed used to shuffle centroid sample buckets. Default: 41.\n"
+        << "  --build_mode <full|gpu-search-minimal>\n"
+        << "                full writes all artifacts. gpu-search-minimal writes only\n"
+        << "                files required by the current GPU search loader. Default: full.\n"
+        << "  --quantization <4bit|4bit_ex|8bit|8bit_ex>\n"
+        << "                Select the full-code payload bit width and optional residual\n"
+        << "                sidecar. Default: 4bit.\n"
+        << "  --quantization_backend <cpu|gpu|gpu-merged>\n"
+        << "                Select encoder backend. gpu uses CPU rotation followed by\n"
+        << "                GPU quantization in Step 5. gpu-merged quantizes assignment\n"
+        << "                batches as they leave Step 2. Default: cpu.\n";
 }
 
 }  // namespace
@@ -58,6 +75,7 @@ int main(int argc, char* argv[]) {
     std::string data_filename;
     std::string doclens_filename;
     size_t n_clusters = 0;
+    BuildIndexOptions build_options;
 
     if (argc == 1) {
         print_input_help(argv[0]);
@@ -87,6 +105,33 @@ int main(int argc, char* argv[]) {
                 n_clusters = std::stoull(require_value(argc, argv, i, arg));
                 continue;
             }
+            if (arg == "--centroid_sample_bucket_size" ||
+                arg == "--centroid-sample-bucket-size") {
+                build_options.centroid_sample.bucket_size =
+                    std::stoull(require_value(argc, argv, i, arg));
+                continue;
+            }
+            if (arg == "--centroid_sample_seed" || arg == "--centroid-sample-seed") {
+                build_options.centroid_sample.seed =
+                    std::stoull(require_value(argc, argv, i, arg));
+                continue;
+            }
+            if (arg == "--build_mode" || arg == "--build-mode") {
+                build_options.output_mode =
+                    parse_build_output_mode(require_value(argc, argv, i, arg));
+                continue;
+            }
+            if (arg == "--quantization" || arg == "--quantization-mode") {
+                build_options.quantization_mode =
+                    parse_quantization_mode(require_value(argc, argv, i, arg));
+                continue;
+            }
+            if (arg == "--quantization_backend" ||
+                arg == "--quantization-backend") {
+                build_options.quantization_backend =
+                    parse_quantization_backend(require_value(argc, argv, i, arg));
+                continue;
+            }
 
             throw std::runtime_error("Unknown argument: " + arg);
         }
@@ -111,8 +156,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    size_t ex_bits = 3;
+    size_t ex_bits = quantization_full_ex_bits(build_options.quantization_mode);
     auto data = load_data_mmap(data_filename);
-    build_index(data, n_clusters, ex_bits, doc_lens, index_dir);
+    build_index(data, n_clusters, ex_bits, doc_lens, index_dir, build_options);
     return 0;
 }

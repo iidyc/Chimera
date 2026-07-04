@@ -32,12 +32,31 @@ Arguments:
                          Default: <repo>/dataset.
   --n-clusters <count>   Number of IVF/CAGRA centroids.
                          Accepts 2M=2000000 and 1M=1000000. Default: 2000000.
+  --centroid-sample-bucket-size <count>
+                         Sample centroids from shuffled contiguous buckets of this
+                         many token embeddings. Default: 256. Use 1 for the
+                         historical fully random per-token sampler.
+  --centroid-sample-seed <seed>
+                         Seed used to shuffle centroid sample buckets. Default: 41.
+  --build-mode <mode>    Index output mode: full or gpu-search-minimal.
+                         Default: full.
+  --quantization <mode>  Quantization mode: 4bit, 4bit_ex, 8bit, or 8bit_ex.
+                         Default: 4bit.
+  --quantization-backend <backend>
+                         Encoder backend: cpu, gpu, or gpu-merged. Default: cpu.
+  --index-suffix <text>  Append a suffix to the generated index directory name.
+                         Example: --index-suffix _4bit_gpu.
   --copy-raw-to-tmp      Copy raw/data.bin and raw/doclens.bin into /tmp first.
   --refresh-tmp-raw      Re-copy the /tmp raw files even if they already exist.
   --tmp-root <path>      Root directory for /tmp raw copies.
                          Default: /tmp/$USER/chimera_build
   --log-dir <path>       Root directory for raw build logs.
                          Default: backup/log/build
+  --numa-bind <mode>     Optional process-level NUMA binding mode for gpu_build:
+                         auto, off, or a NUMA node id.
+                         Default: ${CHIMERA_BUILD_NUMA_BIND:-off}.
+                         gpu_build applies per-GPU worker NUMA policy itself.
+  --no-numa-bind         Disable process-level NUMA binding.
   --dry-run              Print the resolved command and paths without running it.
   -h, --help             Show this help message.
 EOF
@@ -92,12 +111,19 @@ make_run_id() {
 dataset_name="hotpot"
 dataset_root=""
 n_clusters="2000000"
+centroid_sample_bucket_size="256"
+centroid_sample_seed="41"
+build_mode="full"
+quantization="4bit"
+quantization_backend="cpu"
+index_suffix=""
 copy_raw_to_tmp=0
 refresh_tmp_raw=0
 tmp_root="/tmp/${USER:-user}/chimera_build"
 log_dir=""
 dry_run=0
 dataset_set=0
+numa_bind="${CHIMERA_BUILD_NUMA_BIND:-off}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -110,6 +136,36 @@ while [[ $# -gt 0 ]]; do
         --n-clusters)
             [[ $# -ge 2 ]] || die "missing value for --n-clusters"
             n_clusters="$2"
+            shift 2
+            ;;
+        --centroid-sample-bucket-size|--centroid_sample_bucket_size)
+            [[ $# -ge 2 ]] || die "missing value for --centroid-sample-bucket-size"
+            centroid_sample_bucket_size="$2"
+            shift 2
+            ;;
+        --centroid-sample-seed|--centroid_sample_seed)
+            [[ $# -ge 2 ]] || die "missing value for --centroid-sample-seed"
+            centroid_sample_seed="$2"
+            shift 2
+            ;;
+        --build-mode|--build_mode)
+            [[ $# -ge 2 ]] || die "missing value for --build-mode"
+            build_mode="$2"
+            shift 2
+            ;;
+        --quantization)
+            [[ $# -ge 2 ]] || die "missing value for --quantization"
+            quantization="$2"
+            shift 2
+            ;;
+        --quantization-backend|--quantization_backend)
+            [[ $# -ge 2 ]] || die "missing value for --quantization-backend"
+            quantization_backend="$2"
+            shift 2
+            ;;
+        --index-suffix|--index_suffix)
+            [[ $# -ge 2 ]] || die "missing value for --index-suffix"
+            index_suffix="$2"
             shift 2
             ;;
         --dataset-root)
@@ -134,6 +190,15 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || die "missing value for --log-dir"
             log_dir="$2"
             shift 2
+            ;;
+        --numa-bind)
+            [[ $# -ge 2 ]] || die "missing value for --numa-bind"
+            numa_bind="$2"
+            shift 2
+            ;;
+        --no-numa-bind)
+            numa_bind="off"
+            shift
             ;;
         --dry-run)
             dry_run=1
@@ -161,6 +226,42 @@ done
 n_clusters="$(normalize_n_clusters "$n_clusters")"
 [[ "$n_clusters" =~ ^[0-9]+$ ]] || die "--n-clusters must be a positive integer"
 (( n_clusters > 0 )) || die "--n-clusters must be > 0"
+[[ "$centroid_sample_bucket_size" =~ ^[0-9]+$ ]] || die "--centroid-sample-bucket-size must be a positive integer"
+(( centroid_sample_bucket_size > 0 )) || die "--centroid-sample-bucket-size must be > 0"
+[[ "$centroid_sample_seed" =~ ^[0-9]+$ ]] || die "--centroid-sample-seed must be a non-negative integer"
+case "$build_mode" in
+    full|gpu-search-minimal|minimal|gpu-minimal)
+        ;;
+    *)
+        die "--build-mode must be full or gpu-search-minimal"
+        ;;
+esac
+case "$quantization" in
+    4bit|4bit_ex|8bit|8bit_ex)
+        ;;
+    *)
+        die "--quantization must be 4bit, 4bit_ex, 8bit, or 8bit_ex"
+        ;;
+esac
+case "$quantization_backend" in
+    cpu|gpu|gpu-merged|gpu_merged|merged-gpu|merged_gpu)
+        ;;
+    *)
+        die "--quantization-backend must be cpu, gpu, or gpu-merged"
+        ;;
+esac
+case "$index_suffix" in
+    *[!A-Za-z0-9._-]*)
+        die "--index-suffix may only contain letters, numbers, dot, underscore, and dash"
+        ;;
+esac
+case "$numa_bind" in
+    auto|off)
+        ;;
+    *)
+        [[ "$numa_bind" =~ ^[0-9]+$ ]] || die "--numa-bind must be auto, off, or a NUMA node id"
+        ;;
+esac
 
 case "$dataset_name" in
     ""|.|..|*/*)
@@ -170,6 +271,7 @@ esac
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
+numa_wrapper="${script_dir}/run_with_gpu_numa.sh"
 if [[ -z "$dataset_root" ]]; then
     dataset_root="${repo_root}/dataset"
 fi
@@ -185,7 +287,7 @@ dataset_dir="${dataset_root}/${dataset_name}"
 raw_dir="${dataset_dir}/raw"
 data_file="${raw_dir}/data.bin"
 doclens_file="${raw_dir}/doclens.bin"
-index_dir_name="$(index_dir_name_for_n_clusters "$n_clusters")"
+index_dir_name="$(index_dir_name_for_n_clusters "$n_clusters")${index_suffix}"
 index_dir="${dataset_dir}/${index_dir_name}"
 if [[ -z "$log_dir" ]]; then
     log_dir="${repo_root}/backup/log/build"
@@ -219,6 +321,9 @@ build_cmd=(
     --doclens "$doclens_file"
     --data "$data_file"
     --n_clusters "$n_clusters"
+    --centroid_sample_bucket_size "$centroid_sample_bucket_size"
+    --centroid_sample_seed "$centroid_sample_seed"
+    --build_mode "$build_mode"
 )
 
 if [[ -n "$micromamba_bin" ]]; then
@@ -335,9 +440,16 @@ print_run_plan() {
 [driver] run_id=${run_id}
 [driver] log_file=${full_log}
 [driver] n_clusters=${n_clusters}
+[driver] centroid_sample_bucket_size=${centroid_sample_bucket_size}
+[driver] centroid_sample_seed=${centroid_sample_seed}
+[driver] build_mode=${build_mode}
+[driver] quantization=${quantization}
+[driver] quantization_backend=${quantization_backend}
+[driver] index_suffix=${index_suffix}
 [driver] copy_raw_to_tmp=${copy_raw_to_tmp}
 [driver] refresh_tmp_raw=${refresh_tmp_raw}
 [driver] tmp_root=${tmp_root}
+[driver] numa_bind=${numa_bind}
 [driver] parser_hint=raw build log only; parse separately if needed
 [driver] command=$(printf '%q ' "${build_cmd[@]}")
 EOF
@@ -532,7 +644,28 @@ build_cmd=(
     --doclens "$doclens_file"
     --data "$data_file"
     --n_clusters "$n_clusters"
+    --centroid_sample_bucket_size "$centroid_sample_bucket_size"
+    --centroid_sample_seed "$centroid_sample_seed"
+    --build_mode "$build_mode"
+    --quantization "$quantization"
+    --quantization_backend "$quantization_backend"
 )
+
+if [[ "$numa_bind" != "off" ]]; then
+    if [[ ! -x "$numa_wrapper" ]]; then
+        if [[ $dry_run -eq 1 ]]; then
+            echo "[dry-run] warning: NUMA wrapper is not executable: ${numa_wrapper}" >&2
+        else
+            die "NUMA wrapper is not executable: ${numa_wrapper}"
+        fi
+    fi
+    build_cmd=(
+        "$numa_wrapper"
+        --mode "$numa_bind"
+        --
+        "${build_cmd[@]}"
+    )
+fi
 
 if [[ -n "$micromamba_bin" ]]; then
     build_cmd=(

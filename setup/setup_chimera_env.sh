@@ -107,7 +107,7 @@ fi
 
 run_cmd conda create -n "$env_name" -y "python=${python_version}"
 run_cmd conda install -n "$env_name" -y -c rapidsai -c conda-forge "libcuvs=26.04" "cuda-version=12.9"
-run_cmd conda install -n "$env_name" -y -c conda-forge cxx-compiler cmake ninja matplotlib
+run_cmd conda install -n "$env_name" -y -c conda-forge cxx-compiler cmake ninja matplotlib numactl
 
 if [[ $dry_run -eq 1 ]]; then
     env_prefix="<resolved-env-prefix>"
@@ -119,6 +119,7 @@ if [[ $verify -eq 1 ]]; then
     run_in_env "$env_prefix" python --version
     run_in_env "$env_prefix" cmake --version
     run_in_env "$env_prefix" nvcc --version
+    run_in_env "$env_prefix" numactl --hardware
 fi
 
 echo

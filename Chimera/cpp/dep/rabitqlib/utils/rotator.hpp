@@ -264,6 +264,14 @@ class FhtKacRotator : public Rotator<float> {
         return *this;
     }
 
+    [[nodiscard]] const uint8_t* flip_data() const {
+        return flip_.data();
+    }
+
+    [[nodiscard]] size_t flip_bytes() const {
+        return flip_.size();
+    }
+
     static void kacs_walk(float* data, size_t len) {
         // ! len % 32 == 0;
         for (size_t i = 0; i < len / 2; i += 16) {
