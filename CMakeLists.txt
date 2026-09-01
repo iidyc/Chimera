@@ -73,16 +73,23 @@ set_target_properties(chimera_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-add_executable(gpu_build
-    cpp/apps/build.cpp
-    cpp/apps/utils.cpp
-)
-target_include_directories(gpu_build PRIVATE
-    cpp/apps
-    cpp/src
-)
-set_target_properties(gpu_build PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_link_libraries(gpu_build PRIVATE chimera_core)
+function(add_chimera_gpu_build_target target_name)
+    add_executable(${target_name}
+        cpp/apps/build.cpp
+        cpp/apps/utils.cpp
+    )
+    target_include_directories(${target_name} PRIVATE
+        cpp/apps
+        cpp/src
+    )
+    set_target_properties(${target_name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    target_link_libraries(${target_name} PRIVATE chimera_core)
+endfunction()
+
+# gpu_build_v3 is the canonical optimized index-construction binary. Keep the
+# unversioned name as a compatibility entry point for existing scripts.
+add_chimera_gpu_build_target(gpu_build_v3)
+add_chimera_gpu_build_target(gpu_build)
 
 add_executable(gpu_search
     cpp/apps/search.cpp
@@ -93,6 +100,7 @@ target_include_directories(gpu_search PRIVATE
     cpp/src
 )
 set_target_properties(gpu_search PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_definitions(gpu_search PRIVATE CHIMERA_IMPL_NAME=\"v8\")
 target_link_libraries(gpu_search PRIVATE chimera_core)
 
 option(CHIMERA_BUILD_PYTHON "Build the Python extension module" ON)

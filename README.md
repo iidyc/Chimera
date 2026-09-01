@@ -33,8 +33,14 @@ The first script creates a Conda environment named `chimera`. The second
 script builds the project in `build/` and produces:
 
 - `build/gpu_build`
+- `build/gpu_build_v3` (canonical optimized index-construction binary)
 - `build/gpu_search`
 - `build/chimera*.so`
+
+`gpu_search` is the production v8 search pipeline. The development branch
+keeps this single LUT-enabled implementation and does not build the historical
+ablation variants. It executes one query slot by default. Detailed per-stage
+profiling is not compiled into this throughput-oriented target.
 
 To select a GPU, set `CUDA_VISIBLE_DEVICES` when running an executable or
 Python program.

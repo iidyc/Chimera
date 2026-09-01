@@ -11,6 +11,10 @@
 
 using namespace Chimera;
 
+#ifndef CHIMERA_IMPL_NAME
+#define CHIMERA_IMPL_NAME "v8"
+#endif
+
 namespace {
 
 void report_recalls(
@@ -58,6 +62,9 @@ int main(int argc, char** argv) {
         print_search_help(argv[0]);
         return 1;
     }
+
+    std::cout << "[SEARCH] implementation=" << CHIMERA_IMPL_NAME
+              << " concurrent_queries=1\n";
 
     size_t num_q = 0;
     size_t d = 0;
