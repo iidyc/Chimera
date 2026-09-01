@@ -77,6 +77,35 @@ struct cast_int_size_t {
     __host__ __device__ size_t operator()(int x) const { return (size_t)x; };
 };
 
+struct gpu_mvr_stage23_profile_snapshot {
+    double phase_a_wall_ms = 0.0;
+    double phase_a_gpu_total_ms = 0.0;
+    double phase_a_gather_ms = 0.0;
+    double phase_a_prefix_ms = 0.0;
+    double phase_a_token_ids_ms = 0.0;
+    double phase_a_d2h_ms = 0.0;
+    double phase_a_cpu_launch_gather_ms = 0.0;
+    double phase_a_cpu_launch_prefix_ms = 0.0;
+    double phase_a_cpu_launch_token_ids_ms = 0.0;
+    double phase_a_cpu_launch_d2h_ms = 0.0;
+    double phase_a_cpu_sync_ms = 0.0;
+    double phase_a_cpu_event_elapsed_ms = 0.0;
+    double phase_a_gpu_sum_accounted_ms = 0.0;
+    double phase_b_wall_ms = 0.0;
+    double phase_b_binary_ip_total_ms = 0.0;
+    double phase_b_doc_score_total_ms = 0.0;
+    double phase_b_total_kernel_ms = 0.0;
+    double phase_c_wait_d2h_ms = 0.0;
+    double phase_c_topk_ms = 0.0;
+    double phase_c_identify_ms = 0.0;
+    double phase_c_prepare_ms = 0.0;
+    double phase_c_cpu_refine_ms = 0.0;
+    double phase_c_combine_ms = 0.0;
+    double phase_c_total_ms = 0.0;
+    double phase_c_refined_docs = 0.0;
+    double phase_abc_total_wall_ms = 0.0;
+};
+
 struct gpu_mvr_index {
     // Scalar metadata
     size_t n = 0;
@@ -249,6 +278,7 @@ struct gpu_mvr_index {
         float s23_cpu_total_us   = 0;
         float s23_heap_total_us  = 0;
         int   s23_total_refined  = 0;
+        gpu_mvr_stage23_profile_snapshot last_stage23_profile;
 
         static constexpr int MAX_XFER_RECORDS = 48;
         struct XferRecord {

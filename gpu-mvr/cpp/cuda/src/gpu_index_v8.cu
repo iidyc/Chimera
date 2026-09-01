@@ -13,6 +13,7 @@
 #undef GPU_MVR_V3_SKIP_WORKSPACE_ALLOC
 
 #include <cub/cub.cuh>
+#include <iostream>
 
 namespace {
 
@@ -403,6 +404,151 @@ void gpu_mvr_index::ensure_compact_doc_capacity(size_t required_rows) {
     compact_topk_capacity_ = required_topk_capacity;
 }
 
+void accumulate_gpu_search_profile_v8(gpu_search_profile_v8& total, const gpu_search_profile_v8& sample) {
+    total.search_wall_ms += sample.search_wall_ms;
+    total.total_search_time_ms += sample.total_search_time_ms;
+    total.stage1_time_ms += sample.stage1_time_ms;
+    total.stage2_time_ms += sample.stage2_time_ms;
+    total.s1_cagra_ms += sample.s1_cagra_ms;
+    total.s1_expansion_ms += sample.s1_expansion_ms;
+    total.s1_binary_ip_ms += sample.s1_binary_ip_ms;
+    total.s1_atomic_agg_ms += sample.s1_atomic_agg_ms;
+    total.s1_sum_scores_ms += sample.s1_sum_scores_ms;
+    total.s1_topk_sort_ms += sample.s1_topk_sort_ms;
+    total.s1_d2d_ms += sample.s1_d2d_ms;
+    total.s1_memset_ms += sample.s1_memset_ms;
+    total.s1_sum_accounted_ms += sample.s1_sum_accounted_ms;
+    total.phase_a_wall_ms += sample.phase_a_wall_ms;
+    total.phase_a_gpu_total_ms += sample.phase_a_gpu_total_ms;
+    total.phase_a_gather_ms += sample.phase_a_gather_ms;
+    total.phase_a_prefix_ms += sample.phase_a_prefix_ms;
+    total.phase_a_token_ids_ms += sample.phase_a_token_ids_ms;
+    total.phase_a_d2h_ms += sample.phase_a_d2h_ms;
+    total.phase_a_cpu_launch_gather_ms += sample.phase_a_cpu_launch_gather_ms;
+    total.phase_a_cpu_launch_prefix_ms += sample.phase_a_cpu_launch_prefix_ms;
+    total.phase_a_cpu_launch_token_ids_ms += sample.phase_a_cpu_launch_token_ids_ms;
+    total.phase_a_cpu_launch_d2h_ms += sample.phase_a_cpu_launch_d2h_ms;
+    total.phase_a_cpu_sync_ms += sample.phase_a_cpu_sync_ms;
+    total.phase_a_cpu_event_elapsed_ms += sample.phase_a_cpu_event_elapsed_ms;
+    total.phase_a_gpu_sum_accounted_ms += sample.phase_a_gpu_sum_accounted_ms;
+    total.phase_b_wall_ms += sample.phase_b_wall_ms;
+    total.phase_b_binary_ip_total_ms += sample.phase_b_binary_ip_total_ms;
+    total.phase_b_doc_score_total_ms += sample.phase_b_doc_score_total_ms;
+    total.phase_b_total_kernel_ms += sample.phase_b_total_kernel_ms;
+    total.phase_c_wait_d2h_ms += sample.phase_c_wait_d2h_ms;
+    total.phase_c_topk_ms += sample.phase_c_topk_ms;
+    total.phase_c_identify_ms += sample.phase_c_identify_ms;
+    total.phase_c_prepare_ms += sample.phase_c_prepare_ms;
+    total.phase_c_cpu_refine_ms += sample.phase_c_cpu_refine_ms;
+    total.phase_c_combine_ms += sample.phase_c_combine_ms;
+    total.phase_c_total_ms += sample.phase_c_total_ms;
+    total.phase_c_refined_docs += sample.phase_c_refined_docs;
+    total.phase_abc_total_wall_ms += sample.phase_abc_total_wall_ms;
+    total.transfer_h2d_ms += sample.transfer_h2d_ms;
+    total.transfer_d2h_ms += sample.transfer_d2h_ms;
+    total.transfer_total_ms += sample.transfer_total_ms;
+    total.transfer_h2d_bytes += sample.transfer_h2d_bytes;
+    total.transfer_d2h_bytes += sample.transfer_d2h_bytes;
+    total.transfer_count += sample.transfer_count;
+}
+
+void average_gpu_search_profile_v8(gpu_search_profile_v8& profile, double count) {
+    if (count <= 0.0) return;
+    profile.search_wall_ms /= count;
+    profile.total_search_time_ms /= count;
+    profile.stage1_time_ms /= count;
+    profile.stage2_time_ms /= count;
+    profile.s1_cagra_ms /= count;
+    profile.s1_expansion_ms /= count;
+    profile.s1_binary_ip_ms /= count;
+    profile.s1_atomic_agg_ms /= count;
+    profile.s1_sum_scores_ms /= count;
+    profile.s1_topk_sort_ms /= count;
+    profile.s1_d2d_ms /= count;
+    profile.s1_memset_ms /= count;
+    profile.s1_sum_accounted_ms /= count;
+    profile.phase_a_wall_ms /= count;
+    profile.phase_a_gpu_total_ms /= count;
+    profile.phase_a_gather_ms /= count;
+    profile.phase_a_prefix_ms /= count;
+    profile.phase_a_token_ids_ms /= count;
+    profile.phase_a_d2h_ms /= count;
+    profile.phase_a_cpu_launch_gather_ms /= count;
+    profile.phase_a_cpu_launch_prefix_ms /= count;
+    profile.phase_a_cpu_launch_token_ids_ms /= count;
+    profile.phase_a_cpu_launch_d2h_ms /= count;
+    profile.phase_a_cpu_sync_ms /= count;
+    profile.phase_a_cpu_event_elapsed_ms /= count;
+    profile.phase_a_gpu_sum_accounted_ms /= count;
+    profile.phase_b_wall_ms /= count;
+    profile.phase_b_binary_ip_total_ms /= count;
+    profile.phase_b_doc_score_total_ms /= count;
+    profile.phase_b_total_kernel_ms /= count;
+    profile.phase_c_wait_d2h_ms /= count;
+    profile.phase_c_topk_ms /= count;
+    profile.phase_c_identify_ms /= count;
+    profile.phase_c_prepare_ms /= count;
+    profile.phase_c_cpu_refine_ms /= count;
+    profile.phase_c_combine_ms /= count;
+    profile.phase_c_total_ms /= count;
+    profile.phase_c_refined_docs /= count;
+    profile.phase_abc_total_wall_ms /= count;
+    profile.transfer_h2d_ms /= count;
+    profile.transfer_d2h_ms /= count;
+    profile.transfer_total_ms /= count;
+    profile.transfer_h2d_bytes /= count;
+    profile.transfer_d2h_bytes /= count;
+    profile.transfer_count /= count;
+}
+
+void print_gpu_search_profile_v8(const gpu_search_profile_v8& p, const char* prefix) {
+    std::cout << prefix << " Mode: V8 persistent Stage 2+3\n";
+    std::cout << prefix << " Search wall-clock time      : " << p.search_wall_ms << " ms\n";
+    std::cout << prefix << " Total GPU search time       : " << p.total_search_time_ms << " ms\n";
+    std::cout << prefix << " Stage 1 time                : " << p.stage1_time_ms << " ms\n";
+    std::cout << prefix << "   1. CAGRA search            : " << p.s1_cagra_ms << " ms\n";
+    std::cout << prefix << "   2. GPU IVF expansion       : " << p.s1_expansion_ms << " ms\n";
+    std::cout << prefix << "   3. Binary IP kernel        : " << p.s1_binary_ip_ms << " ms\n";
+    std::cout << prefix << "   4. Aggregation + tracking  : " << p.s1_atomic_agg_ms << " ms\n";
+    std::cout << prefix << "   5. Sum doc scores (sparse) : " << p.s1_sum_scores_ms << " ms\n";
+    std::cout << prefix << "   6. Top-k sort (sparse)     : " << p.s1_topk_sort_ms << " ms\n";
+    std::cout << prefix << "   7. D2D copy top-k doc IDs  : " << p.s1_d2d_ms << " ms\n";
+    std::cout << prefix << "   8. Memset (overlapped 1-3) : " << p.s1_memset_ms << " ms (not in critical path)\n";
+    std::cout << prefix << "   Sum accounted              : " << p.s1_sum_accounted_ms << " ms\n";
+    std::cout << prefix << " Stage 2+3 event time        : " << p.stage2_time_ms << " ms\n";
+    std::cout << prefix << " Phase A (Data Preparation) wall: " << p.phase_a_wall_ms
+              << " ms, GPU total: " << p.phase_a_gpu_total_ms << " ms\n";
+    std::cout << prefix << "   1. Gather doc lengths      : " << p.phase_a_gather_ms
+              << " ms (CPU launch: " << p.phase_a_cpu_launch_gather_ms << " ms)\n";
+    std::cout << prefix << "   2. Prefix sum offsets      : " << p.phase_a_prefix_ms
+              << " ms (CPU launch: " << p.phase_a_cpu_launch_prefix_ms << " ms)\n";
+    std::cout << prefix << "   3. Gather clustered pos    : " << p.phase_a_token_ids_ms
+              << " ms (CPU launch: " << p.phase_a_cpu_launch_token_ids_ms << " ms)\n";
+    std::cout << prefix << "   4. D2H metadata + sync     : " << p.phase_a_d2h_ms
+              << " ms (CPU launch: " << p.phase_a_cpu_launch_d2h_ms << " ms)\n";
+    std::cout << prefix << "   5. cudaStreamSynchronize   : " << p.phase_a_cpu_sync_ms << " ms\n";
+    std::cout << prefix << "   6. cudaEventElapsedTime x5 : " << p.phase_a_cpu_event_elapsed_ms << " ms\n";
+    std::cout << prefix << "   GPU sum accounted           : " << p.phase_a_gpu_sum_accounted_ms << " ms\n";
+    std::cout << prefix << " Phase B wall time           : " << p.phase_b_wall_ms << " ms\n";
+    std::cout << prefix << " Phase B binary_ip total     : " << p.phase_b_binary_ip_total_ms << " ms\n";
+    std::cout << prefix << " Phase B doc_score total     : " << p.phase_b_doc_score_total_ms << " ms\n";
+    std::cout << prefix << " Phase B total kernel time   : " << p.phase_b_total_kernel_ms << " ms\n";
+    std::cout << prefix << " Phase C: wait_d2h=" << p.phase_c_wait_d2h_ms
+              << " ms, topk=" << p.phase_c_topk_ms
+              << " ms, identify=" << p.phase_c_identify_ms
+              << " ms, prepare=" << p.phase_c_prepare_ms
+              << " ms, cpu_refine=" << p.phase_c_cpu_refine_ms
+              << " ms, combine=" << p.phase_c_combine_ms
+              << " ms (total=" << p.phase_c_total_ms
+              << " ms, docs=" << p.phase_c_refined_docs << ")\n";
+    std::cout << prefix << " Total wall time for Phase A + B + C: "
+              << p.phase_abc_total_wall_ms << " ms\n";
+    std::cout << prefix << " Data transfer summary       : H2D=" << p.transfer_h2d_ms
+              << " ms (" << p.transfer_h2d_bytes << " bytes), D2H=" << p.transfer_d2h_ms
+              << " ms (" << p.transfer_d2h_bytes << " bytes), total="
+              << p.transfer_total_ms << " ms, count=" << p.transfer_count << "\n";
+}
+
 void gpu_mvr_index::allocate_workspace() {
     ws_.max_q_doclen = Q_DOCLEN;
     ws_.max_stage1_pairs = workspace_probe_token_bound_ * Q_DOCLEN;
@@ -680,11 +826,23 @@ std::vector<size_t> gpu_mvr_index::search(const float* queries, size_t k) {
 }
 
 std::vector<size_t> gpu_mvr_index::search_profiled(const float* queries, size_t k) {
-    return search_impl<true>(queries, k);
+    return search_impl<true>(queries, k, nullptr, true);
+}
+
+std::vector<size_t> gpu_mvr_index::search_profiled(
+    const float* queries,
+    size_t k,
+    gpu_search_profile_v8* profile,
+    bool print_profile) {
+    return search_impl<true>(queries, k, profile, print_profile);
 }
 
 template <bool kProfile>
-std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
+std::vector<size_t> gpu_mvr_index::search_impl(
+    const float* queries,
+    size_t k,
+    gpu_search_profile_v8* profile,
+    bool print_profile) {
     auto search_start = std::chrono::high_resolution_clock::now();
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -754,7 +912,8 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
         k,
         k_rank_all_tokens,
         query_objs.data(),
-        result);
+        result,
+        print_profile);
 
 #ifdef GPU_MVR_PROFILE
     if constexpr (kProfile) {
@@ -768,7 +927,103 @@ std::vector<size_t> gpu_mvr_index::search_impl(const float* queries, size_t k) {
     if constexpr (kProfile) {
         const float search_wall_ms =
             std::chrono::duration<float, std::milli>(search_end - search_start).count();
-        std::cout << "[SEARCH] Total wall-clock time: " << search_wall_ms << " ms\n";
+#ifdef GPU_MVR_PROFILE
+        gpu_search_profile_v8 local_profile;
+        gpu_search_profile_v8& out_profile = profile ? *profile : local_profile;
+        out_profile = {};
+        out_profile.search_wall_ms = search_wall_ms;
+
+        float total_time = 0.0f;
+        float stage1_time = 0.0f;
+        float stage2_time = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&total_time, ws_.event_start, ws_.event_end));
+        CUDA_CHECK(cudaEventElapsedTime(&stage1_time, ws_.event_stage1_start, ws_.event_stage1_end));
+        CUDA_CHECK(cudaEventElapsedTime(&stage2_time, ws_.event_stage2_start, ws_.event_stage2_end));
+        out_profile.total_search_time_ms = total_time;
+        out_profile.stage1_time_ms = stage1_time;
+        out_profile.stage2_time_ms = stage2_time;
+
+        float s1_cagra = 0.0f;
+        float s1_expansion = 0.0f;
+        float s1_binary_ip = 0.0f;
+        float s1_memset = 0.0f;
+        float s1_atomic_agg = 0.0f;
+        float s1_sum_scores = 0.0f;
+        float s1_topk_sort = 0.0f;
+        float s1_d2d = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&s1_cagra, ws_.s1_cagra_start, ws_.s1_cagra_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_expansion, ws_.s1_expansion_start, ws_.s1_expansion_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_binary_ip, ws_.s1_binary_ip_start, ws_.s1_binary_ip_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_memset, ws_.s1_memset_start, ws_.s1_memset_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_atomic_agg, ws_.s1_atomic_agg_start, ws_.s1_atomic_agg_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_sum_scores, ws_.s1_sum_scores_start, ws_.s1_sum_scores_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_topk_sort, ws_.s1_topk_sort_start, ws_.s1_topk_sort_end));
+        CUDA_CHECK(cudaEventElapsedTime(&s1_d2d, ws_.s1_d2d_start, ws_.s1_d2d_end));
+        out_profile.s1_cagra_ms = s1_cagra;
+        out_profile.s1_expansion_ms = s1_expansion;
+        out_profile.s1_binary_ip_ms = s1_binary_ip;
+        out_profile.s1_atomic_agg_ms = s1_atomic_agg;
+        out_profile.s1_sum_scores_ms = s1_sum_scores;
+        out_profile.s1_topk_sort_ms = s1_topk_sort;
+        out_profile.s1_d2d_ms = s1_d2d;
+        out_profile.s1_memset_ms = s1_memset;
+        out_profile.s1_sum_accounted_ms =
+            s1_cagra + s1_expansion + s1_binary_ip + s1_atomic_agg +
+            s1_sum_scores + s1_topk_sort + s1_d2d;
+
+        const auto& stage23 = ws_.last_stage23_profile;
+        out_profile.phase_a_wall_ms = stage23.phase_a_wall_ms;
+        out_profile.phase_a_gpu_total_ms = stage23.phase_a_gpu_total_ms;
+        out_profile.phase_a_gather_ms = stage23.phase_a_gather_ms;
+        out_profile.phase_a_prefix_ms = stage23.phase_a_prefix_ms;
+        out_profile.phase_a_token_ids_ms = stage23.phase_a_token_ids_ms;
+        out_profile.phase_a_d2h_ms = stage23.phase_a_d2h_ms;
+        out_profile.phase_a_cpu_launch_gather_ms = stage23.phase_a_cpu_launch_gather_ms;
+        out_profile.phase_a_cpu_launch_prefix_ms = stage23.phase_a_cpu_launch_prefix_ms;
+        out_profile.phase_a_cpu_launch_token_ids_ms = stage23.phase_a_cpu_launch_token_ids_ms;
+        out_profile.phase_a_cpu_launch_d2h_ms = stage23.phase_a_cpu_launch_d2h_ms;
+        out_profile.phase_a_cpu_sync_ms = stage23.phase_a_cpu_sync_ms;
+        out_profile.phase_a_cpu_event_elapsed_ms = stage23.phase_a_cpu_event_elapsed_ms;
+        out_profile.phase_a_gpu_sum_accounted_ms = stage23.phase_a_gpu_sum_accounted_ms;
+        out_profile.phase_b_wall_ms = stage23.phase_b_wall_ms;
+        out_profile.phase_b_binary_ip_total_ms = stage23.phase_b_binary_ip_total_ms;
+        out_profile.phase_b_doc_score_total_ms = stage23.phase_b_doc_score_total_ms;
+        out_profile.phase_b_total_kernel_ms = stage23.phase_b_total_kernel_ms;
+        out_profile.phase_c_wait_d2h_ms = stage23.phase_c_wait_d2h_ms;
+        out_profile.phase_c_topk_ms = stage23.phase_c_topk_ms;
+        out_profile.phase_c_identify_ms = stage23.phase_c_identify_ms;
+        out_profile.phase_c_prepare_ms = stage23.phase_c_prepare_ms;
+        out_profile.phase_c_cpu_refine_ms = stage23.phase_c_cpu_refine_ms;
+        out_profile.phase_c_combine_ms = stage23.phase_c_combine_ms;
+        out_profile.phase_c_total_ms = stage23.phase_c_total_ms;
+        out_profile.phase_c_refined_docs = stage23.phase_c_refined_docs;
+        out_profile.phase_abc_total_wall_ms = stage23.phase_abc_total_wall_ms;
+
+        for (int xi = 0; xi < ws_.xfer_count; ++xi) {
+            float xfer_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(
+                &xfer_ms,
+                ws_.xfer_records[xi].start,
+                ws_.xfer_records[xi].end));
+            out_profile.transfer_total_ms += xfer_ms;
+            out_profile.transfer_count += 1.0;
+            if (ws_.xfer_records[xi].is_h2d) {
+                out_profile.transfer_h2d_ms += xfer_ms;
+                out_profile.transfer_h2d_bytes += ws_.xfer_records[xi].bytes;
+            } else {
+                out_profile.transfer_d2h_ms += xfer_ms;
+                out_profile.transfer_d2h_bytes += ws_.xfer_records[xi].bytes;
+            }
+        }
+
+        if (print_profile) {
+            print_gpu_search_profile_v8(out_profile, "[PROFILE]");
+        }
+#else
+        if (print_profile) {
+            std::cout << "[SEARCH] Total wall-clock time: " << search_wall_ms << " ms\n";
+        }
+#endif
     }
 
     return result;

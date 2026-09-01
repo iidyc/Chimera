@@ -1198,7 +1198,14 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
     std::vector<size_t>& result,
     bool print_profile
 ) {
-    if (num_candidates == 0) return;
+    if (num_candidates == 0) {
+#ifdef GPU_MVR_PROFILE
+        if constexpr (kProfile) {
+            ws_.last_stage23_profile = {};
+        }
+#endif
+        return;
+    }
 
     auto cpu_ms = [](auto a, auto b) { return std::chrono::duration<float, std::milli>(b - a).count(); };
 
@@ -1657,6 +1664,34 @@ void gpu_mvr_index::rank_stage23_persistent_impl(
             CUDA_CHECK(cudaEventElapsedTime(&chunk_docscore_ms, chunk_docscore_start[c], chunk_docscore_end[c]));
             ws_.s23_pst_docscore_ms += chunk_docscore_ms;
         }
+        auto& snapshot = ws_.last_stage23_profile;
+        snapshot.phase_a_wall_ms = time_phase_a;
+        snapshot.phase_a_gpu_total_ms = time_phase_a_gpu;
+        snapshot.phase_a_gather_ms = time_phase_a_gather;
+        snapshot.phase_a_prefix_ms = time_phase_a_prefix;
+        snapshot.phase_a_token_ids_ms = time_phase_a_token_ids;
+        snapshot.phase_a_d2h_ms = time_phase_a_d2h;
+        snapshot.phase_a_cpu_launch_gather_ms = cpu_ms(t_cpu0, t_cpu1);
+        snapshot.phase_a_cpu_launch_prefix_ms = cpu_ms(t_cpu1, t_cpu2);
+        snapshot.phase_a_cpu_launch_token_ids_ms = cpu_ms(t_cpu2, t_cpu3);
+        snapshot.phase_a_cpu_launch_d2h_ms = cpu_ms(t_cpu3, t_cpu4);
+        snapshot.phase_a_cpu_sync_ms = cpu_ms(t_cpu4, t_cpu5);
+        snapshot.phase_a_cpu_event_elapsed_ms = cpu_ms(t_cpu5, t_cpu6);
+        snapshot.phase_a_gpu_sum_accounted_ms =
+            time_phase_a_gather + time_phase_a_prefix + time_phase_a_token_ids + time_phase_a_d2h;
+        snapshot.phase_b_wall_ms = time_phase_b;
+        snapshot.phase_b_binary_ip_total_ms = ws_.s23_pst_bip_ms;
+        snapshot.phase_b_doc_score_total_ms = ws_.s23_pst_docscore_ms;
+        snapshot.phase_b_total_kernel_ms = ws_.s23_pst_kernel_ms;
+        snapshot.phase_c_wait_d2h_ms = time_wait_d2h;
+        snapshot.phase_c_topk_ms = time_running_topk;
+        snapshot.phase_c_identify_ms = time_identify_new;
+        snapshot.phase_c_prepare_ms = time_prepare_refine;
+        snapshot.phase_c_cpu_refine_ms = time_cpu_ip_ex;
+        snapshot.phase_c_combine_ms = time_combine;
+        snapshot.phase_c_total_ms = time_phase_c;
+        snapshot.phase_c_refined_docs = total_refined;
+        snapshot.phase_abc_total_wall_ms = total_wall_time;
     }
 #endif
 

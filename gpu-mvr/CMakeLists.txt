@@ -64,7 +64,13 @@ if(GPU_MVR_ENABLE_GPU)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations")
 endif()
 
-add_compile_definitions(GPU_MVR_PROFILE)
+option(GPU_MVR_ENABLE_DETAILED_PROFILING
+    "Compile detailed per-stage GPU profiling into regular search targets"
+    OFF)
+
+if(GPU_MVR_ENABLE_DETAILED_PROFILING)
+    add_compile_definitions(GPU_MVR_PROFILE)
+endif()
 # add_compile_definitions(GPU_MVR_TIMELINE)
 add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
 
@@ -378,6 +384,7 @@ target_compile_definitions(gpu_search_v8_profile PRIVATE
     GPU_MVR_IMPL_NAME=\"v8_profile\"
     GPU_MVR_CLUSTERED_LAYOUT_REQUIRED=1
     GPU_MVR_USE_LUT=1
+    GPU_MVR_PROFILE=1
     GPU_MVR_V8_PROFILE_APP=1
 )
 target_link_libraries(gpu_search_v8_profile PRIVATE gpu_mvr_core gpu_mvr_app_utils)

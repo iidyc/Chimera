@@ -282,6 +282,8 @@ int main(int argc, char** argv) {
 #endif
 
         if (args.profile_eval_all_queries) {
+            gpu_search_profile_v8 total_profile;
+            int profiled_queries = 0;
             for (int i = 0; i < run_queries; ++i) {
                 omp_set_num_threads(effective_stage3_threads);
 #ifdef GPU_MVR_V8_PROFILE_APP
@@ -290,7 +292,14 @@ int main(int argc, char** argv) {
 #else
                 const auto query_start = std::chrono::high_resolution_clock::now();
 #endif
-                results[i] = indices[0]->search_profiled(&Q[i * Q_DOCLEN * d], args.k);
+                gpu_search_profile_v8 query_profile;
+                results[i] = indices[0]->search_profiled(
+                    &Q[i * Q_DOCLEN * d],
+                    args.k,
+                    &query_profile,
+                    false);
+                accumulate_gpu_search_profile_v8(total_profile, query_profile);
+                ++profiled_queries;
                 const auto query_end =
 #ifdef GPU_MVR_V8_PROFILE_APP
                     std::chrono::steady_clock::now();
@@ -314,6 +323,14 @@ int main(int argc, char** argv) {
                     "eval:" + runtime_config.label,
                     static_cast<size_t>(i),
                     static_cast<size_t>(run_queries));
+            }
+            if (profiled_queries > 0) {
+                average_gpu_search_profile_v8(total_profile, profiled_queries);
+                std::cout
+                    << "[PROFILE_AVG] Averaged over " << profiled_queries
+                    << " evaluation queries for label=" << runtime_config.label
+                    << "\n";
+                print_gpu_search_profile_v8(total_profile, "[PROFILE_AVG]");
             }
         } else {
             std::atomic<int> next_query{0};
