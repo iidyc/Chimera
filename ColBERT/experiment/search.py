@@ -222,14 +222,13 @@ def main():
 
         with Run().context(RunConfig(experiment=args.experiment_name, root=args.root_path)):
             ColBERT.try_load_torch_extensions(False)
+            shared_search_config = ColBERTConfig(
+                compressed_embeddings_storage=args.compressed_embeddings_storage,
+                gpu_index_resident=args.gpu_index_resident,
+            )
+            searcher = Searcher(index=args.index_name, checkpoint=None, config=shared_search_config)
             for ncells, ndocs in args.pairs:
-                config = ColBERTConfig(
-                    ncells=ncells,
-                    ndocs=ndocs,
-                    compressed_embeddings_storage=args.compressed_embeddings_storage,
-                    gpu_index_resident=args.gpu_index_resident,
-                )
-                searcher = Searcher(index=args.index_name, checkpoint=None, config=config)
+                searcher.configure(ncells=ncells, ndocs=ndocs)
                 num_runs = 3
                 run_times = []
                 results = []
@@ -304,6 +303,12 @@ def main():
                     f"{torch_peak_reserved_mib:.2f}",
                 ])
                 csv_file.flush()
+
+                # Reusing one Searcher keeps the GPU-resident index alive across the
+                # full sweep. Empty the allocator cache between configs so transient
+                # per-config buffers do not accumulate across runs.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 if args.profile_breakdown_csv:
                     profiler = SearchBreakdownProfiler(use_cuda=torch.cuda.is_available())
