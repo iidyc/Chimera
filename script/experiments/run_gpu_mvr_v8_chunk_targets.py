@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 from gpu_mvr_experiment_lib import (
@@ -14,11 +16,14 @@ from gpu_mvr_experiment_lib import (
     ensure_binaries,
     normalize_datasets,
     normalize_targets,
+    parse_gpu_search_log_by_config,
+    quote_cmd,
     repo_root_from_script,
     reset_run_dir,
-    run_gpu_search_direct,
     selected_recall_target_configs,
     utc_run_id,
+    validate_dataset_inputs,
+    write_config_rows,
     write_rows,
     write_summary,
 )
@@ -37,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets", nargs="+", default=["0.90", "0.95"])
     parser.add_argument("--chunks", nargs="+", type=int, default=list(range(1, 13)))
     parser.add_argument("--slots", type=int, default=1)
-    parser.add_argument("-N", "--num-runs", type=int, default=1)
+    parser.add_argument("-N", "--num-runs", type=int, default=3)
     parser.add_argument("--k", type=int, default=100)
     parser.add_argument("--nq", type=int, default=-1)
     parser.add_argument("--warmup", type=int, default=5)
@@ -59,6 +64,9 @@ def main() -> int:
     datasets = normalize_datasets(args.datasets)
     targets = normalize_targets(args.targets)
     configs = selected_recall_target_configs(datasets, targets)
+    configs_by_dataset: dict[str, list] = defaultdict(list)
+    for cfg in configs:
+        configs_by_dataset[cfg.dataset].append(cfg)
     system = SYSTEMS["v8"]
 
     if args.num_runs < 1:
@@ -73,40 +81,107 @@ def main() -> int:
     reset_run_dir(log_dir, args.force)
 
     env = common_env(args.cuda_visible_devices, args.omp_num_threads)
+    config_root = repo_root / "config" / "tmp" / "gpu_mvr_v8_chunk_targets" / args.run_id
     rows = []
-    for run_index in range(1, args.num_runs + 1):
-        for cfg in configs:
+    for dataset in datasets:
+        dataset_configs = configs_by_dataset[dataset]
+        if not dataset_configs:
+            continue
+        validate_dataset_inputs(repo_root, dataset)
+        run_configs = []
+        config_meta = {}
+        for cfg in dataset_configs:
             for chunk in args.chunks:
-                config = cfg.as_row(
-                    label=f"r{cfg.target_recall.replace('.', '')}_{cfg.label}_c{chunk}",
-                    overlap_chunks=chunk,
+                base_label = f"r{cfg.target_recall.replace('.', '')}_{cfg.label}_c{chunk}"
+                for run_index in range(1, args.num_runs + 1):
+                    config = cfg.as_row(label=f"{base_label}_run{run_index}", overlap_chunks=chunk)
+                    run_configs.append(config)
+                    config_meta[config["label"]] = (cfg, chunk, run_index, base_label)
+
+        chunk_span = f"chunks{min(args.chunks)}-{max(args.chunks)}" if args.chunks else "chunks"
+        config_path = (
+            config_root / dataset / system.label /
+            f"targets{'_'.join(targets).replace('.', '')}_{chunk_span}_slots{args.slots}_runs{args.num_runs}.csv"
+        )
+        log_path = (
+            log_dir / dataset / system.label /
+            f"targets{'_'.join(targets).replace('.', '')}_{chunk_span}_slots{args.slots}_runs{args.num_runs}.log"
+        )
+        write_config_rows(config_path, run_configs)
+        cmd = [
+            str(build_dir / system.binary),
+            "--query", str(repo_root / "dataset" / dataset / "raw" / "query.bin"),
+            "--gt", str(repo_root / "dataset" / dataset / "raw" / "gt.tsv"),
+            "--index", str(repo_root / "dataset" / dataset / "gpu_mvr_2m"),
+            "--k", str(args.k),
+            "--nq", str(args.nq),
+            "--warmup", str(args.warmup),
+            "--concurrent-queries", str(args.slots),
+            "--config-file", str(config_path),
+        ]
+        if args.stage3_threads > 0:
+            cmd.extend(["--stage3-threads", str(args.stage3_threads)])
+
+        print(
+            f"[run] dataset={dataset} system={system.label} targets={','.join(targets)} "
+            f"chunks={min(args.chunks)}..{max(args.chunks)} rows={len(run_configs)} "
+            f"k={args.k} slots={args.slots}",
+            flush=True,
+        )
+        if args.dry_run:
+            print(f"[dry-run] {quote_cmd(cmd)}", flush=True)
+            parsed = {}
+            returncode = ""
+            error_tail = ""
+        else:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("w") as handle:
+                handle.write(f"[driver] command={quote_cmd(cmd)}\n")
+                handle.write(f"[driver] dataset={dataset}\n")
+                handle.write(f"[driver] system={system.label}\n")
+                handle.write(f"[driver] config_file={config_path}\n")
+                handle.flush()
+                proc = subprocess.run(
+                    cmd,
+                    cwd=repo_root,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    text=True,
+                    check=False,
                 )
-                log_path = (
-                    log_dir / cfg.dataset / cfg.target_recall /
-                    f"chunk{chunk}_slots{args.slots}_run{run_index}.log"
-                )
-                rows.append(run_gpu_search_direct(
-                    repo_root,
-                    build_dir,
-                    log_path,
-                    system,
-                    cfg.dataset,
-                    config,
-                    args.k,
-                    args.nq,
-                    args.warmup,
-                    run_index,
-                    args.dry_run,
-                    env,
-                    concurrent_queries=args.slots,
-                    stage3_threads=args.stage3_threads,
-                    extra_row={
-                        "experiment": "v8_chunk_targets",
-                        "target_recall": cfg.target_recall,
-                        "base_label": cfg.label,
-                        "chunks": str(chunk),
-                    },
-                ))
+            parsed = parse_gpu_search_log_by_config(log_path) if proc.returncode == 0 else {}
+            returncode = str(proc.returncode)
+            error_tail = "" if proc.returncode == 0 else "\n".join(log_path.read_text(errors="replace").splitlines()[-12:])
+
+        for config in run_configs:
+            cfg, chunk, run_index, _base_label = config_meta[config["label"]]
+            row = {
+                "experiment": "v8_chunk_targets",
+                "system": system.label,
+                "dataset": dataset,
+                "target_recall": cfg.target_recall,
+                "base_label": cfg.label,
+                "label": config["label"],
+                "chunks": str(chunk),
+                "slots": str(args.slots),
+                "k": str(args.k),
+                "nq": str(args.nq),
+                "warmup": str(args.warmup),
+                "run_index": str(run_index),
+                "nprobe": config["nprobe"],
+                "k_rank_cluster": config["k_rank_cluster"],
+                "k_rank_all_tokens": config["k_rank_all_tokens"],
+                "itopk_size": config["itopk_size"],
+                "overlap_chunks": config["overlap_chunks"],
+                "binary": system.binary,
+                "log": str(log_path),
+                "returncode": returncode,
+                "command": quote_cmd(cmd),
+                "error_tail": error_tail,
+            }
+            row.update(parsed.get(config["label"], {}))
+            rows.append(row)
 
     if args.dry_run:
         return 0

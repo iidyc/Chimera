@@ -543,8 +543,7 @@ def parse_key_value_payload(payload: str) -> dict[str, str]:
     return fields
 
 
-def parse_gpu_search_log(log_path: Path) -> dict[str, str]:
-    text = log_path.read_text(errors="replace")
+def parse_gpu_search_text(text: str) -> dict[str, str]:
     metrics: dict[str, str] = {}
     for name, pattern in GPU_DIRECT_PATTERNS.items():
         match = pattern.search(text)
@@ -570,6 +569,22 @@ def parse_gpu_search_log(log_path: Path) -> dict[str, str]:
             "stddev_ms": latency.get("stddev", ""),
         })
     return metrics
+
+
+def parse_gpu_search_log(log_path: Path) -> dict[str, str]:
+    return parse_gpu_search_text(log_path.read_text(errors="replace"))
+
+
+def parse_gpu_search_log_by_config(log_path: Path) -> dict[str, dict[str, str]]:
+    text = log_path.read_text(errors="replace")
+    config_re = re.compile(r"^\[CONFIG\] label=(\S+) .*$", re.MULTILINE)
+    matches = list(config_re.finditer(text))
+    parsed: dict[str, dict[str, str]] = {}
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        parsed[match.group(1)] = parse_gpu_search_text(text[start:end])
+    return parsed
 
 
 def gpu_search_direct_command(
