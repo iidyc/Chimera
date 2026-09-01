@@ -8,6 +8,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -76,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         help="overlap_chunks values to sweep.",
     )
     parser.add_argument("--k", type=int, default=100)
+    parser.add_argument(
+        "--nq",
+        type=int,
+        default=-1,
+        help="Evaluation queries timed after warmup; -1 means all queries.",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--reuse-existing", action="store_true")
     parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", ""))
@@ -154,7 +162,7 @@ def run_timed(
         "--k-rank-all-tokens", str(cfg["k_rank_all_tokens"]),
         "--itopk-size", str(cfg["itopk_size"]),
         "--overlap-chunks", str(chunk),
-        "--nq", "0",
+        "--nq", str(args.nq),
         "--warmup", str(args.warmup),
     ]
     run_logged(cmd, log_path, gpu_env(args.cuda_visible_devices), args.reuse_existing)
@@ -186,7 +194,7 @@ def run_profile(
         "--k-rank-all-tokens", str(cfg["k_rank_all_tokens"]),
         "--itopk-size", str(cfg["itopk_size"]),
         "--overlap-chunks", str(chunk),
-        "--nq", "0",
+        "--nq", str(args.nq),
         "--warmup", str(args.warmup),
         "--profile-eval-all-queries",
     ]
@@ -237,16 +245,21 @@ def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> 
         writer.writerows(rows)
 
 
-def render_plots(rows: list[dict[str, str]], output_dir: Path) -> None:
-    plt.rcParams.update({"font.size": 9})
+def qps_plot_stem(systems: list[str], k: int) -> str:
+    system_suffix = "_".join(system.replace("gpu_search_", "") for system in systems)
+    return f"qps_vs_overlap_chunks_{system_suffix}_topk{k}_recall0.95"
 
-    datasets = [dataset for dataset in ["lotte", "msmarco", "hotpot"] if any(r["dataset"] == dataset for r in rows)]
+
+def render_plots(rows: list[dict[str, str]], output_dir: Path) -> None:
+    plt.rcParams.update({"font.size": 14})
+
+    datasets = [dataset for dataset in ["lotte", "hotpot", "msmarco"] if any(r["dataset"] == dataset for r in rows)]
     systems = [system for system in ["gpu_search_v6", "gpu_search_v8"] if any(r["system"] == system for r in rows)]
     colors = {"gpu_search_v6": "#1f77b4", "gpu_search_v8": "#d62728"}
     labels = {"gpu_search_v6": "v6", "gpu_search_v8": "v8"}
     titles = {"lotte": "LoTTE", "msmarco": "MSMARCO", "hotpot": "HotpotQA"}
 
-    fig, axes = plt.subplots(1, len(datasets), figsize=(3.2 * len(datasets), 2.8), sharex=True)
+    fig, axes = plt.subplots(1, len(datasets), figsize=(4.3 * len(datasets), 3.9), sharex=True)
     if len(datasets) == 1:
         axes = [axes]
     for ax, dataset in zip(axes, datasets):
@@ -259,16 +272,28 @@ def render_plots(rows: list[dict[str, str]], output_dir: Path) -> None:
                 continue
             xs = [int(row["overlap_chunks"]) for row in series]
             ys = [float(row["timed_qps"]) for row in series]
-            ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=3.8, color=colors[system], label=labels[system])
-        ax.set_title(titles[dataset])
-        ax.set_xlabel("Overlap Chunks")
+            ax.plot(xs, ys, marker="o", linewidth=2.2, markersize=4.8, color=colors[system], label=labels[system])
+            best = best_row(series)
+            ax.scatter(
+                [int(best["overlap_chunks"])],
+                [float(best["timed_qps"])],
+                color="red",
+                edgecolors="black",
+                linewidths=0.6,
+                s=60,
+                zorder=5,
+            )
+        ax.set_title(titles[dataset], fontsize=24)
+        ax.set_xlabel("Overlap Chunks", fontsize=22)
+        ax.tick_params(axis="both", labelsize=19)
         ax.grid(True, alpha=0.25)
-    axes[0].set_ylabel("QPS")
-    if systems:
-        axes[0].legend(frameon=False, fontsize=8)
+    axes[0].set_ylabel("QPS", fontsize=22)
+    if len(systems) > 1:
+        axes[0].legend(frameon=False, fontsize=18)
     fig.tight_layout()
-    for ext in ("png", "pdf", "svg"):
-        fig.savefig(output_dir / f"qps_vs_overlap_chunks.{ext}", dpi=200, bbox_inches="tight")
+    qps_stem = qps_plot_stem(systems, int(rows[0]["k"]))
+    for ext in ("png", "pdf"):
+        fig.savefig(output_dir / f"{qps_stem}.{ext}", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     fig, axes = plt.subplots(1, len(datasets), figsize=(3.3 * len(datasets), 3.0), sharey=False)
@@ -334,7 +359,7 @@ def render_plots(rows: list[dict[str, str]], output_dir: Path) -> None:
     handles, handle_labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, handle_labels, loc="upper center", ncol=5, frameon=False, fontsize=8)
     fig.tight_layout(rect=[0, 0, 1, 0.88])
-    for ext in ("png", "pdf", "svg"):
+    for ext in ("png", "pdf"):
         fig.savefig(output_dir / f"best_chunk_breakdown.{ext}", dpi=200, bbox_inches="tight")
     plt.close(fig)
 

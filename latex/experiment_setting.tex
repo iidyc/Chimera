@@ -1,0 +1,43 @@
+% Suggested preamble:
+% \usepackage{booktabs}
+
+\subsection{Experimental Setting}
+\textbf{Hardware.} Unless otherwise stated, all experiments were conducted on the same machine, equipped with one NVIDIA Tesla V100-SXM2-32GB GPU, 32 CPU cores, 128\,GB of host memory, and an Intel Xeon Gold 6240 CPU at 2.60\,GHz. We used a single visible GPU (\texttt{CUDA\_VISIBLE\_DEVICES=0}) and set \texttt{OMP\_NUM\_THREADS=32} for both ColBERT and GPU-MVR.
+
+\textbf{Software.} The machine runs Ubuntu 24.04.3 LTS. GPU-MVR was evaluated with Python 3.11.15 and \texttt{libcuvs} 26.04.00, while ColBERT was evaluated with Python 3.10.20, PyTorch 1.13.1+cu117, and FAISS 1.7.2. All reported results were obtained under the same single-machine, single-GPU setting.
+
+\textbf{Datasets.} We evaluate on LoTTE, HotpotQA, and MS MARCO. For all datasets, both ColBERT and GPU-MVR operate on the same 128-dimensional token embeddings. Table~\ref{tab:datasets-and-indexes} summarizes the scale of the experimental data.
+
+\begin{table}[t]
+    \centering
+    \small
+    \begin{tabular}{lrrrr}
+        \toprule
+        Dataset & Queries & Documents & Token Embeddings & Raw Size (GB) \\
+        \midrule
+        LoTTE    & 2,931 & 2,428,854 & 266,205,513 & 136.46 \\
+        HotpotQA & 1,000 & 5,233,329 & 283,106,718 & 146.44 \\
+        MS MARCO & 6,980 & 8,841,823 & 596,847,412 & 308.91 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Dataset scale used in the experiments. The token-embedding counts are taken from the stored ColBERT and GPU-MVR index metadata.}
+    \label{tab:datasets-and-indexes}
+\end{table}
+
+\textbf{Indexes.} GPU-MVR uses 2,000,000 IVF clusters, 128-dimensional embeddings, \texttt{ex\_bits=3}, and a \texttt{FhtKacRotator}. The index consists of \texttt{doclens}, stage-1 binary codes, stage-2 4-bit codes, IVF postings, and a CAGRA graph. ColBERT uses 4-bit indexes (\texttt{nbits=4}) over the same 128-dimensional embeddings. The index metadata reports 98 chunks and 131,072 partitions for LoTTE, 210 chunks and 262,144 partitions for HotpotQA, and 354 chunks and 262,144 partitions for MS MARCO. Table~\ref{tab:index-sizes} reports the total ColBERT index size together with the persistent CPU- and GPU-resident index footprints of GPU-MVR.
+
+\begin{table}[t]
+    \centering
+    \small
+\begin{tabular}{lrrr}
+        \toprule
+        Dataset & ColBERT (GB) & CPU (GB) & GPU (GB) \\
+        \midrule
+        LoTTE    & 18.89 & 18.11 & 9.02 \\
+        HotpotQA & 20.22 & 19.27 & 9.50 \\
+        MS MARCO & 42.24 & 40.62 & 18.30 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Index sizes in GB for ColBERT and GPU-MVR. For GPU-MVR, `CPU' and `GPU' denote the persistent CPU-resident and GPU-resident index footprints, respectively. The GPU footprint includes the stage-1 binary codes, stage-1 scaling factors, IVF postings, the CAGRA graph, and document-mapping arrays, while the CPU footprint includes the stage-2 4-bit codes, residual scaling factors, and document lengths. Transient workspace is excluded.}
+    \label{tab:index-sizes}
+\end{table}

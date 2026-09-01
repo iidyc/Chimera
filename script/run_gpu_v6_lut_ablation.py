@@ -7,6 +7,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -108,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
         description=(
-            "Compare gpu_search_v6 with and without LUT at fixed operating "
+            "Compare gpu_search_v6_lut and gpu_search_v6_nolut at fixed operating "
             "points for Recall@100 ≈ 0.9 and ≈ 0.95 across LoTTE/MSMARCO/HotpotQA."
         )
     )
@@ -118,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         "--binary-lut",
         type=Path,
         default=None,
-        help="Path to the LUT-enabled v6 binary. Defaults to <build-dir>/gpu_search_v6.",
+        help="Path to the LUT-enabled v6 binary. Defaults to <build-dir>/gpu_search_v6_lut.",
     )
     parser.add_argument(
         "--binary-nolut",
@@ -296,7 +298,7 @@ def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> 
 
 
 def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
-    datasets = [dataset for dataset in ["lotte", "msmarco", "hotpot"] if any(r["dataset"] == dataset for r in rows)]
+    datasets = [dataset for dataset in ["lotte", "hotpot", "msmarco"] if any(r["dataset"] == dataset for r in rows)]
     targets = [target for target in [0.9, 0.95] if any(float(r["recall_target"]) == target for r in rows)]
     if not datasets or not targets:
         return
@@ -304,18 +306,19 @@ def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
     titles = {"lotte": "LoTTE", "msmarco": "MSMARCO", "hotpot": "HotpotQA"}
     labels = {"lut": "with LUT", "nolut": "w/o LUT"}
     colors = {"lut": "#d62728", "nolut": "#1f77b4"}
+    hatches = {"lut": "", "nolut": "//"}
 
     plt.rcParams.update(
         {
-            "font.size": 14,
-            "axes.titlesize": 15,
-            "axes.labelsize": 15,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
-            "legend.fontsize": 14,
+            "font.size": 18,
+            "axes.titlesize": 20,
+            "axes.labelsize": 20,
+            "xtick.labelsize": 18,
+            "ytick.labelsize": 18,
+            "legend.fontsize": 18,
         }
     )
-    fig, axes = plt.subplots(1, len(targets), figsize=(4.6 * len(targets), 3.4), sharey=True)
+    fig, axes = plt.subplots(1, len(targets), figsize=(5.4 * len(targets), 4.2), sharey=True)
     if len(targets) == 1:
         axes = [axes]
 
@@ -336,6 +339,9 @@ def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
                 ys,
                 width=width,
                 color=colors[variant],
+                hatch=hatches[variant],
+                edgecolor="black",
+                linewidth=1.0,
                 label=labels[variant],
             )
         ax.set_xticks(x, [titles[d] for d in datasets])
@@ -354,14 +360,15 @@ def render_qps_plot(rows: list[dict[str, str]], output_dir: Path) -> None:
                 ha="center",
                 va="bottom",
                 fontweight="bold",
+                fontsize=18,
             )
         ax.set_ylim(0, ymax * 1.42)
     axes[0].set_ylabel("QPS")
     axes[-1].legend(frameon=False)
     fig.tight_layout()
 
-    for suffix in ("png", "pdf", "svg"):
-        fig.savefig(output_dir / f"qps_compare.{suffix}", bbox_inches="tight")
+    for suffix in ("png", "pdf"):
+        fig.savefig(output_dir / f"qps_lut_nolut_v6.{suffix}", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -369,7 +376,7 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    binary_lut = args.binary_lut or (args.build_dir / "gpu_search_v6")
+    binary_lut = args.binary_lut or (args.build_dir / "gpu_search_v6_lut")
     binary_nolut = args.binary_nolut or (args.build_dir / "gpu_search_v6_nolut")
 
     if not binary_lut.exists():

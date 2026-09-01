@@ -1,0 +1,33 @@
+% Suggested preamble:
+% \usepackage{graphicx}
+% \usepackage{subcaption}
+
+\subsection{Comparison with ColBERT}
+\begin{figure*}[t]
+    \centering
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/colbert_vs_gpu_search_v4_lotte.pdf}
+        \caption{LoTTE}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/colbert_vs_gpu_search_v4_hotpot.pdf}
+        \caption{HotpotQA}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.32\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{figures/colbert_vs_gpu_search_v4_msmarco.pdf}
+        \caption{MS MARCO}
+    \end{subfigure}
+
+    \vspace{0.35em}
+    {\small Legend: ColBERT (circles), GPU-MVR (squares).}
+
+    \caption{Recall--throughput comparison between ColBERT and GPU-MVR on LoTTE, HotpotQA, and MS MARCO. Higher is better on both axes.}
+    \label{fig:colbert-vs-gpumvr}
+\end{figure*}
+
+Figure~\ref{fig:colbert-vs-gpumvr} compares the recall--throughput trade-off of ColBERT and GPU-MVR on the three datasets. GPU-MVR consistently achieves higher throughput than ColBERT in the high-recall regime. At $\mathrm{Recall}@100 \geq 0.9$, GPU-MVR is 9.8$\times$, 7.5$\times$, and 4.7$\times$ faster on LoTTE, HotpotQA, and MS MARCO, respectively. At $\mathrm{Recall}@100 \geq 0.95$, the advantage remains substantial on LoTTE and MS MARCO, where GPU-MVR is 11.3$\times$ and 6.9$\times$ faster, respectively. ColBERT reaches a higher maximum recall in some cases; however, this gap may partly reflect conservative parameter choices for GPU-MVR and will be revisited in subsequent tuning. Overall, these results indicate that GPU-MVR provides a more favorable efficiency--effectiveness trade-off than ColBERT on all three datasets.

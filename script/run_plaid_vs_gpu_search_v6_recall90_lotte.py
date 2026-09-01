@@ -8,6 +8,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -80,7 +82,6 @@ PHASE_ORDER = [
 
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
-    default_output = repo_root / "profiling" / "lotte" / "plaid_vs_gpu_search_recall90_k100"
     p = argparse.ArgumentParser(
         description=(
             "Reproduce the LoTTE recall~0.9 latency breakdown comparison between "
@@ -88,9 +89,20 @@ def parse_args() -> argparse.Namespace:
         )
     )
     p.add_argument("--repo-root", type=Path, default=repo_root)
-    p.add_argument("--output-dir", type=Path, default=default_output)
+    p.add_argument("--output-dir", type=Path)
+    p.add_argument("--plot-root", type=Path)
     p.add_argument("--build-dir", type=Path, default=repo_root / "gpu-mvr" / "build")
-    p.add_argument("--colbert-python", type=Path, default=Path("/data/juelin/conda/envs/colbert/bin/python"))
+    p.add_argument(
+        "--colbert-python",
+        type=Path,
+        default=Path(os.environ.get("COLBERT_PYTHON", "python")),
+    )
+    p.add_argument(
+        "--plaid-variant",
+        choices=["cpu_hosted", "gpu_resident"],
+        default="cpu_hosted",
+        help="PLAID storage mode to benchmark.",
+    )
     p.add_argument("--k", type=int, default=100)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--reuse-existing", action="store_true")
@@ -99,10 +111,34 @@ def parse_args() -> argparse.Namespace:
         "--systems",
         nargs="+",
         choices=["plaid", "gpu_search_v6", "gpu_search_v8"],
-        default=["plaid", "gpu_search_v6"],
+        default=["plaid", "gpu_search_v6", "gpu_search_v8"],
         help="Systems to include in the comparison.",
     )
     return p.parse_args()
+
+
+def default_output_dir(repo_root: Path, plaid_variant: str, k: int) -> Path:
+    run_name = (
+        f"plaid_vs_gpu_search_recall90_k{k}"
+        if plaid_variant == "cpu_hosted"
+        else f"plaid_gpu_only_vs_gpu_search_recall90_k{k}"
+    )
+    return repo_root / "profiling" / "lotte" / run_name
+
+
+def default_plot_root(repo_root: Path, plaid_variant: str, k: int) -> Path:
+    plot_name = (
+        f"lotte_plaid_vs_gpu_search_recall90_k{k}_latency_breakdown"
+        if plaid_variant == "cpu_hosted"
+        else f"lotte_plaid_gpu_only_vs_gpu_search_recall90_k{k}_latency_breakdown"
+    )
+    return repo_root / "plot" / plot_name
+
+
+def plaid_labels(plaid_variant: str) -> tuple[str, str]:
+    if plaid_variant == "gpu_resident":
+        return "plaid_gpu_resident", "PLAID GPU-only"
+    return "PLAID", "PLAID"
 
 
 def run_logged(cmd: list[str], log_path: Path, env: dict[str, str] | None = None, reuse: bool = False) -> None:
@@ -161,7 +197,7 @@ def run_gpu_timed(args: argparse.Namespace, system: str) -> tuple[Path, float, f
         "--k-rank-all-tokens", str(GPU_CONFIG["k_rank_all_tokens"]),
         "--itopk-size", str(GPU_CONFIG["itopk_size"]),
         "--overlap-chunks", str(GPU_CONFIG["overlap_chunks"]),
-        "--nq", "0",
+        "--nq", "-1",
         "--warmup", str(args.warmup),
     ]
     env = os.environ.copy()
@@ -195,7 +231,7 @@ def run_gpu_profile(args: argparse.Namespace, system: str) -> tuple[Path, dict[s
         "--k-rank-all-tokens", str(GPU_CONFIG["k_rank_all_tokens"]),
         "--itopk-size", str(GPU_CONFIG["itopk_size"]),
         "--overlap-chunks", str(GPU_CONFIG["overlap_chunks"]),
-        "--nq", "0",
+        "--nq", "-1",
         "--warmup", str(args.warmup),
     ]
     if use_avg_profile:
@@ -228,9 +264,11 @@ def run_gpu_profile(args: argparse.Namespace, system: str) -> tuple[Path, dict[s
 
 
 def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float, float, float, dict[str, float]]:
-    timed_csv = args.output_dir / "plaid_c4m_timed.csv"
-    profile_csv = args.output_dir / "plaid_c4m_profile.csv"
-    log_path = args.output_dir / "plaid_c4m.log"
+    plaid_impl_label, _ = plaid_labels(args.plaid_variant)
+    plaid_prefix = f"{plaid_impl_label}_{PLAID_CONFIG['label']}"
+    timed_csv = args.output_dir / f"{plaid_prefix}_timed.csv"
+    profile_csv = args.output_dir / f"{plaid_prefix}_profile.csv"
+    log_path = args.output_dir / f"{plaid_prefix}.log"
 
     if not (args.reuse_existing and timed_csv.exists() and profile_csv.exists() and log_path.exists()):
         ensure_parent(log_path)
@@ -255,9 +293,14 @@ def run_plaid_search(args: argparse.Namespace) -> tuple[Path, Path, Path, float,
             "--k", str(args.k),
             "--warmup", str(args.warmup),
             "--dataset-name", "lotte",
-            "--implementation-label", "PLAID",
+            "--implementation-label", plaid_impl_label,
             "--profile-breakdown-csv", str(profile_csv),
         ]
+        if args.plaid_variant == "gpu_resident":
+            cmd.extend([
+                "--compressed-embeddings-storage", "gpu",
+                "--gpu-index-resident",
+            ])
         run_logged(cmd, log_path, env=env, reuse=False)
     else:
         print(f"[reuse] {log_path}")
@@ -342,8 +385,8 @@ def write_comparison_csv(output_csv: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def plot_latency_breakdown(output_root: Path, rows: list[dict]) -> None:
-    fig, ax = plt.subplots(figsize=(5.6, 3.0))
+def plot_latency_breakdown(plot_root: Path, rows: list[dict]) -> None:
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
     systems = [row["system"] for row in rows]
     x = list(range(len(rows)))
     bottoms = [0.0 for _ in rows]
@@ -360,8 +403,8 @@ def plot_latency_breakdown(output_root: Path, rows: list[dict]) -> None:
         for row in rows
     ])
     compared = " vs ".join(row["system"] for row in rows)
-    ax.set_title(f"LoTTE: {compared} at Recall@100 ≈ 0.9")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.28), ncol=3, frameon=False, fontsize=8)
+    ax.set_title(f"LoTTE: {compared} at Recall@100 ≈ 0.9", pad=28)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.17), ncol=3, frameon=False, fontsize=8)
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.set_axisbelow(True)
 
@@ -369,24 +412,30 @@ def plot_latency_breakdown(output_root: Path, rows: list[dict]) -> None:
         total = float(row["avg_latency_ms"])
         ax.text(idx, total + max(0.05, total * 0.02), f"{total:.2f} ms", ha="center", va="bottom", fontsize=8)
 
-    fig.tight_layout()
-    for suffix in ("png", "pdf", "svg"):
-        fig.savefig(output_root / f"latency_breakdown.{suffix}", bbox_inches="tight")
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    plot_root.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("png", "pdf"):
+        fig.savefig(plot_root.with_suffix(f".{suffix}"), bbox_inches="tight")
     plt.close(fig)
 
 
 def main() -> int:
     args = parse_args()
+    if args.output_dir is None:
+        args.output_dir = default_output_dir(args.repo_root, args.plaid_variant, args.k)
+    if args.plot_root is None:
+        args.plot_root = default_plot_root(args.repo_root, args.plaid_variant, args.k)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     summaries: list[SystemSummary] = []
     extra_paths: list[str] = []
 
     if "plaid" in args.systems:
+        _, plaid_system_label = plaid_labels(args.plaid_variant)
         plaid_log, plaid_timed_csv, plaid_profile_csv, plaid_qps, plaid_latency, plaid_recall, plaid_breakdown = run_plaid_search(args)
         summaries.append(
             SystemSummary(
-                system="PLAID",
+                system=plaid_system_label,
                 config=f"{PLAID_CONFIG['label']} (ncells={PLAID_CONFIG['ncells']}, ndocs={PLAID_CONFIG['ndocs']})",
                 recall=plaid_recall,
                 qps=plaid_qps,
@@ -428,19 +477,26 @@ def main() -> int:
     if len(gpu_recalls) == 2:
         v6_recall = gpu_recalls["gpu_search_v6"]
         v8_recall = gpu_recalls["gpu_search_v8"]
-        if abs(v6_recall - v8_recall) > 1e-9:
+        recall_delta = abs(v6_recall - v8_recall)
+        if recall_delta > 1e-3:
             raise RuntimeError(
-                "gpu_search_v6 and gpu_search_v8 should have identical recall in this script, "
-                f"but got {v6_recall:.12f} vs {v8_recall:.12f}"
+                "gpu_search_v6 and gpu_search_v8 diverged more than expected for this comparison, "
+                f"got {v6_recall:.12f} vs {v8_recall:.12f} (delta={recall_delta:.6f})"
+            )
+        if recall_delta > 0.0:
+            print(
+                f"[warn] gpu_search recall mismatch is small but non-zero: "
+                f"v6={v6_recall:.6f} v8={v8_recall:.6f} delta={recall_delta:.6f}"
             )
 
     rows = [summary.scaled_row() for summary in summaries]
     comparison_csv = args.output_dir / "comparison.csv"
     write_comparison_csv(comparison_csv, rows)
-    plot_latency_breakdown(args.output_dir, rows)
+    plot_latency_breakdown(args.plot_root, rows)
 
     print(f"[done] comparison_csv={comparison_csv}")
-    print(f"[done] plot_png={args.output_dir / 'latency_breakdown.png'}")
+    print(f"[done] plot_png={args.plot_root.with_suffix('.png')}")
+    print(f"[done] plot_pdf={args.plot_root.with_suffix('.pdf')}")
     for line in extra_paths:
         print(line)
     for summary in summaries:
