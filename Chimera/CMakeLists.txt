@@ -68,7 +68,13 @@ if(CHIMERA_ENABLE_GPU)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations")
 endif()
 
-add_compile_definitions(CHIMERA_PROFILE)
+option(CHIMERA_ENABLE_DETAILED_PROFILING
+    "Compile detailed per-stage GPU profiling into regular search targets"
+    OFF)
+
+if(CHIMERA_ENABLE_DETAILED_PROFILING)
+    add_compile_definitions(CHIMERA_PROFILE)
+endif()
 # add_compile_definitions(CHIMERA_TIMELINE)
 add_compile_definitions(CHIMERA_OVERLAP_STAGE23)
 
@@ -391,6 +397,7 @@ target_compile_definitions(gpu_search_profile PRIVATE
     CHIMERA_IMPL_NAME=\"v8_profile\"
     CHIMERA_CLUSTERED_LAYOUT_REQUIRED=1
     CHIMERA_USE_LUT=1
+    CHIMERA_PROFILE=1
     CHIMERA_PROFILE_APP=1
 )
 target_link_libraries(gpu_search_profile PRIVATE chimera_core chimera_app_utils)
