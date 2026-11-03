@@ -1,0 +1,44 @@
+[
+  {
+    "dataset": "lotte",
+    "queries": 2931,
+    "query_vectors": 32,
+    "dimensions": 128,
+    "documents": 2428854,
+    "tokens": 266205513,
+    "query_sha256": "64edcb2108177657e94d231204f800dbfc97eb906b435da27ad0115cca0dd9ae",
+    "gt_sha256": "f63aae91ff73fd434a1c4bcfe07ef6417735b3f0e635b03690a7c283aa7add7b",
+    "query_order_matches": true,
+    "top100_ground_truth_valid": true,
+    "prepared_queries_identical": true,
+    "document_lengths_identical": true
+  },
+  {
+    "dataset": "hotpot",
+    "queries": 1000,
+    "query_vectors": 32,
+    "dimensions": 128,
+    "documents": 5233329,
+    "tokens": 283106718,
+    "query_sha256": "05d8dd6ba1116a8758bbb461009b50073cb1ad0ff6028e4d3822210ffc38be15",
+    "gt_sha256": "d52d4a7d8fe1335b70c1961627b501a08e080541d025cec52810a89085ee93d9",
+    "query_order_matches": true,
+    "top100_ground_truth_valid": true,
+    "prepared_queries_identical": true,
+    "document_lengths_identical": true
+  },
+  {
+    "dataset": "msmarco",
+    "queries": 6980,
+    "query_vectors": 32,
+    "dimensions": 128,
+    "documents": 8841823,
+    "tokens": 596847412,
+    "query_sha256": "0b5195abd5f78e86c9664e34c331f467652b81702cea2c501b9ad69b0cddef78",
+    "gt_sha256": "f7dbf4c1a2abbdac1844e3930a896685f5cd7b06b3b0cadaf272b1f436dc4e04",
+    "query_order_matches": true,
+    "top100_ground_truth_valid": true,
+    "prepared_queries_identical": true,
+    "document_lengths_identical": true
+  }
+]

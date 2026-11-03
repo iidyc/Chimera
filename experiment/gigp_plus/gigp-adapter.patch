@@ -1,0 +1,129 @@
+diff --git a/src/app/IGPGPUPP.cpp b/src/app/IGPGPUPP.cpp
+index 94b7914..63afcbc 100644
+--- a/src/app/IGPGPUPP.cpp
++++ b/src/app/IGPGPUPP.cpp
+@@ -5,6 +5,8 @@
+ typedef uint32_t __u32;
+ typedef uint64_t __u64;
+ #include <string>
++#include <cstdlib>
++#include <filesystem>
+ #include <parser.hpp>
+ #include <cnpy.h>
+ #include <spdlog/spdlog.h>
+@@ -49,6 +51,14 @@ std::map<std::string, std::string> getFilenameMap(
+           "/home/%s/Dataset/multi-vector-retrieval/Result/answer",
+           username.c_str());
+ 
++  if (const char* root = std::getenv("GIGP_DATA_ROOT")) {
++    std::snprintf(index_path, sizeof(index_path), "%s/Index/%s/%s-%s",
++                  root, dataset.c_str(), method_name.c_str(), build_index_suffix.c_str());
++    std::snprintf(embedding_path, sizeof(embedding_path), "%s/Embedding/%s", root, dataset.c_str());
++    std::snprintf(answer_path, sizeof(answer_path), "%s/Result/answer", root);
++  }
++  std::filesystem::create_directories(answer_path);
++
+   std::map<std::string, std::string> filename_m;
+ 
+   std::string centroid_l_fname = std::string(index_path) + "/centroid_l.npy";
+@@ -212,4 +222,4 @@ int main(int argc, char** argv) {
+   performance_single_result_out.close();
+ 
+   return 0;
+-}
+\ No newline at end of file
++}
+diff --git a/src/include/alg/igp_gpu_pp/FilterPP.hpp b/src/include/alg/igp_gpu_pp/FilterPP.hpp
+index d99f343..2f69e3e 100644
+--- a/src/include/alg/igp_gpu_pp/FilterPP.hpp
++++ b/src/include/alg/igp_gpu_pp/FilterPP.hpp
+@@ -10,7 +10,10 @@
+ #include <raft/matrix/detail/select_k-inl.cuh>
+ #include <thrust/unique.h>
+ #include <thrust/binary_search.h>
++#include <thrust/tuple.h>
++#include <thrust/iterator/zip_iterator.h>
+ #include <raft/linalg/reduce.cuh>
++#include "include/alg/igp_gpu_pp/RaftReductionCompat.hpp"
+ 
+ #include <cooperative_groups.h>
+ 
+@@ -365,19 +368,12 @@ class FilterPP
+     //    spdlog::info("start filter-add_score");
+     blockSize = 1024;
+     gridSize = (n_item_cand_ + blockSize - 1) / blockSize;
+-    raft::linalg::reduce(
++    reduceScoresCompat<true, true>(
+         item_score_l_gpu_,
+         qvec_max_score_l_gpu_,
+         query_n_vec_,
+         n_item_cand_,
+-        0.0f,
+-        true,
+-        true,
+-        resource_->stream_l_[threadID_],
+-        false,
+-        raft::identity_op(),
+-        raft::add_op(),
+-        raft::identity_op()
++        resource_->stream_l_[threadID_]
+     );
+     // add_score<<<gridSize, blockSize>>>(qvec_max_score_l_gpu_,
+     // n_item_cand,
+diff --git a/src/include/alg/igp_gpu_pp/RerankPP.hpp b/src/include/alg/igp_gpu_pp/RerankPP.hpp
+index 784d33b..c4e8369 100644
+--- a/src/include/alg/igp_gpu_pp/RerankPP.hpp
++++ b/src/include/alg/igp_gpu_pp/RerankPP.hpp
+@@ -11,6 +11,7 @@
+ #include <thrust/transform.h>
+ #include <thrust/iterator/counting_iterator.h>
+ #include <raft/linalg/reduce.cuh>
++#include "include/alg/igp_gpu_pp/RaftReductionCompat.hpp"
+ #include <execution>
+ 
+ namespace VectorSetSearch {
+@@ -359,19 +360,12 @@ class RerankPP {
+     //     raft::identity_op()
+     // );
+ 
+-    raft::linalg::reduce(
++    reduceScoresCompat<true, false>(
+         score_l_gpu_,
+         max_score_l_gpu_,
+         probe_topk_,
+         query_n_vec_,
+-        0.0f,
+-        true,
+-        false,
+-        resource_->stream_l_[threadID_],
+-        false,
+-        raft::identity_op(),
+-        raft::add_op(),
+-        raft::identity_op()
++        resource_->stream_l_[threadID_]
+     );
+     CHECK(cudaStreamSynchronize(resource_->stream_l_[threadID_]));
+     nvtxRangePop();
+diff --git a/src/include/util/CPPIOUtil.hpp b/src/include/util/CPPIOUtil.hpp
+index 2ccd7a2..1fea5fb 100644
+--- a/src/include/util/CPPIOUtil.hpp
++++ b/src/include/util/CPPIOUtil.hpp
+@@ -6,6 +6,7 @@
+ #define CPPIOUTIL_HPP
+ #include <vector>
+ #include <string>
++#include <cstdlib>
+ 
+ namespace VectorSetSearch {
+ std::vector<uint32_t> readQueryID(const std::string username, const std::string dataset) {
+@@ -13,6 +14,10 @@ std::vector<uint32_t> readQueryID(const std::string username, const std::string
+   sprintf(location, "/home/%s/Dataset/multi-vector-retrieval/RawData/%s/document/queries.dev.tsv",
+           username.c_str(), dataset.c_str());
+ 
++  if (const char* root = std::getenv("GIGP_DATA_ROOT")) {
++    std::snprintf(location, sizeof(location), "%s/RawData/%s/document/queries.dev.tsv", root, dataset.c_str());
++  }
++
+   std::vector<uint32_t> qID_l;
+   std::ifstream file(location);
+ 

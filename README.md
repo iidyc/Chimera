@@ -101,6 +101,11 @@ experiment/ablation/run_gpu_search_lut_ablation.py
 experiment/ablation/run_gpu_search_recall95_ablation.py --build
 ```
 
+## GIGP+ comparison (Table 4)
+
+See [the A100 reproduction package](experiment/gigp_plus/README.md) for the
+benchmark scripts, pinned source setup, and regeneration from saved results.
+
 ## Reproducing Paper Figures
 
 The figure scripts read normalized benchmark artifacts and do not rerun
